@@ -76,6 +76,7 @@ def fuse_selected_modalities(
     registry: nn.ModuleDict,
     batch: dict[str, torch.Tensor],
     enabled_modalities: Sequence[str],
+    modality_weights: Mapping[str, float],
 ) -> tuple[torch.Tensor, dict[str, object]]:
     outputs = []
     debug = {}
@@ -88,7 +89,22 @@ def fuse_selected_modalities(
         }
 
     tokens = torch.cat([output.tokens for output in outputs], dim=1)
-    fused = tokens.mean(dim=1)
+    modality_vectors = torch.stack([output.tokens.mean(dim=1) for output in outputs], dim=1)
+    raw_weights = torch.tensor(
+        [float(modality_weights[name]) for name in enabled_modalities],
+        dtype=modality_vectors.dtype,
+        device=modality_vectors.device,
+    )
+    normalized_weights = raw_weights / raw_weights.sum()
+    fused = (modality_vectors * normalized_weights.view(1, -1, 1)).sum(dim=1)
+
+    debug["modality_vectors_shape"] = tuple(modality_vectors.shape)
+    debug["raw_modality_weights"] = {
+        name: float(modality_weights[name]) for name in enabled_modalities
+    }
+    debug["normalized_modality_weights"] = {
+        name: float(weight) for name, weight in zip(enabled_modalities, normalized_weights.tolist())
+    }
     debug["fused_token_shape"] = tuple(tokens.shape)
     debug["fused_tensor_shape"] = tuple(fused.shape)
     return fused, debug
@@ -123,6 +139,39 @@ def require_modalities(config: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(item.strip() for item in value if item.strip())
 
 
+def require_modality_weights(
+    config: Mapping[str, Any],
+    enabled_modalities: Sequence[str],
+) -> dict[str, float]:
+    value = config.get("modality_weights")
+    if value is None:
+        return {name: 1.0 for name in enabled_modalities}
+    if not isinstance(value, Mapping):
+        raise ValueError("`modality_weights` must be a YAML mapping when provided.")
+
+    weights: dict[str, float] = {}
+    for name in enabled_modalities:
+        raw_weight = value.get(name, 1.0)
+        if not isinstance(raw_weight, (int, float)):
+            raise ValueError(f"`modality_weights.{name}` must be a number.")
+        weight = float(raw_weight)
+        if weight < 0.0:
+            raise ValueError(f"`modality_weights.{name}` must be non-negative.")
+        weights[name] = weight
+
+    if not any(weight > 0.0 for weight in weights.values()):
+        raise ValueError("At least one enabled modality weight must be greater than zero.")
+
+    extra_keys = [key for key in value.keys() if key not in enabled_modalities]
+    if extra_keys:
+        raise ValueError(
+            "Found weights for modalities that are not enabled: "
+            f"{sorted(str(key) for key in extra_keys)}"
+        )
+
+    return weights
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a plug-and-play registry fusion smoke test from YAML.")
     parser.add_argument(
@@ -141,12 +190,13 @@ def main() -> None:
     dim = require_int(config, "dim")
     seed = require_int(config, "seed")
 
-    unsupported = [m for m in enabled_modalities if m not in {"eye_gaze", "fau", "rppg"}]
+    unsupported = [m for m in enabled_modalities if m not in {"rgb", "eye_gaze", "fau", "rppg"}]
     if unsupported:
         raise ValueError(
-            "This smoke script currently supports only eye_gaze, fau, and rppg, "
+            "This smoke script currently supports only rgb, eye_gaze, fau, and rppg, "
             f"got unsupported modalities: {unsupported}"
         )
+    modality_weights = require_modality_weights(config, enabled_modalities)
 
     torch.manual_seed(seed)
 
@@ -161,7 +211,12 @@ def main() -> None:
             enabled_modalities,
         )
         with torch.inference_mode():
-            fused, debug = fuse_selected_modalities(registry, batch, enabled_modalities)
+            fused, debug = fuse_selected_modalities(
+                registry,
+                batch,
+                enabled_modalities,
+                modality_weights,
+            )
     finally:
         for extractor in extractor_result.extractors.values():
             extractor.close()
@@ -170,6 +225,8 @@ def main() -> None:
     print("video_path:", str(video_path))
     print("available_modalities:", CURRENT_MODALITIES)
     print("selected_modalities:", enabled_modalities)
+    print("modality_weights:", debug["raw_modality_weights"])
+    print("normalized_modality_weights:", debug["normalized_modality_weights"])
     print("video_tensor_shape:", tuple(raw_batch["video"].shape))
     for name in enabled_modalities:
         for key, shape in feature_debug[name].items():
@@ -178,6 +235,7 @@ def main() -> None:
         print("warning:", warning)
     for name in enabled_modalities:
         print(f"{name}_token_shape:", debug[name]["token_shape"])
+    print("modality_vectors_shape:", debug["modality_vectors_shape"])
     print("fused_token_shape:", debug["fused_token_shape"])
     print("fused_tensor_shape:", debug["fused_tensor_shape"])
     print("fused_tensor:")

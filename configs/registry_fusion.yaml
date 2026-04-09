@@ -1,14 +1,23 @@
 video: /home/comp/ablation_task/assets/92oIcJfqoxU_01_14_13-01_15_46part2_f_swapped.mp4
 modalities:
+  - rgb
   - fau
   - rppg
-  # - eye_gaze
+  - eye_gaze
 frames: 16
 image_size: 224
 dim: 128
 seed: 0
+modality_weights:
+  rgb: 1.0
+  fau: 0.5
+  rppg: 1.0
+  eye_gaze: 1.0
 eye_gaze:
   model_path: /home/comp/ablation_task/models/face_landmarker_v2_with_blendshapes.task
+rgb:
+  backbone: resnet18
+  checkpoint_path: /home/comp/ablation_task/checkpoints/resnet18-5c106cde.pth
 fau:
   backbone: swin_transformer_tiny
   num_classes: 12

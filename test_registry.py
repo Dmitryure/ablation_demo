@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 
 from branches import ModalityBranch, ModalityOutput
-from encoders import FAUEncoder, RPPGEncoder
-from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, RPPGExtractor
+from encoders import FAUEncoder, RGBEncoder, RPPGEncoder
+from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, RGBExtractor, RPPGExtractor
 from registry import CURRENT_MODALITIES, build_registry, registry_required_keys, validate_registry
 
 
@@ -52,16 +52,36 @@ class RegistryTest(unittest.TestCase):
     def test_registry_required_keys_for_video_modalities(self):
         registry = build_registry(dim=32)
 
-        keys = registry_required_keys(registry, ("fau", "rppg"))
+        keys = registry_required_keys(registry, ("rgb", "fau", "rppg"))
+        self.assertEqual(keys["rgb"], ("rgb_features",))
         self.assertEqual(keys["fau"], ("fau_features",))
         self.assertEqual(keys["rppg"], ("rppg_features",))
 
     def test_local_wrappers_instantiate(self):
+        rgb_encoder = RGBEncoder(backbone="resnet18")
         fau_encoder = FAUEncoder(backbone="swin_transformer_tiny", num_classes=4)
         rppg_encoder = RPPGEncoder(frames=4)
 
+        self.assertIsInstance(rgb_encoder, nn.Module)
         self.assertIsInstance(fau_encoder, nn.Module)
         self.assertIsInstance(rppg_encoder, nn.Module)
+
+    def test_rgb_extractor_output_contract(self):
+        extractor = RGBExtractor(RGBEncoder(backbone="resnet18"))
+        video = torch.randn(1, 3, 4, 224, 224)
+
+        output = extractor.extract({"video": video})
+
+        self.assertEqual(tuple(output["rgb_features"].shape), (1, 4, 512))
+
+    def test_rgb_branch_output_contract(self):
+        registry = build_registry(dim=16)
+        rgb_features = torch.randn(1, 4, 512)
+
+        output = registry["rgb"].encode({"rgb_features": rgb_features})
+
+        self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
+        self.assertEqual(tuple(output.time_ids.shape), (4,))
 
     def test_fau_extractor_output_contract(self):
         extractor = FAUExtractor(DummyFAUEncoder(num_au=4, feature_dim=20))

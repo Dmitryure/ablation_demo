@@ -7,6 +7,7 @@ from encoders import build_local_encoders
 from extractors.base import FeatureExtractor
 from extractors.eye_gaze import build_eye_gaze_extractor
 from extractors.fau import FAUExtractor
+from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
 
 
@@ -20,12 +21,16 @@ def build_extractors(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("eye_gaze", "fau", "rppg"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "fau", "rppg"))
     enabled_set = set(enabled)
 
     encoder_result = build_local_encoders(config, modalities=enabled)
     extractors: dict[str, FeatureExtractor] = {}
 
+    if "rgb" in enabled_set:
+        if encoder_result.rgb_encoder is None:
+            raise RuntimeError("RGB encoder was not built for the selected modalities.")
+        extractors["rgb"] = RGBExtractor(encoder_result.rgb_encoder)
     if "eye_gaze" in enabled_set:
         extractors["eye_gaze"] = build_eye_gaze_extractor(config)
     if "fau" in enabled_set:

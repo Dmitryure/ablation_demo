@@ -7,12 +7,14 @@ from typing import Any, Mapping, Sequence
 import torch.nn as nn
 
 from encoders.fau import FAUEncoder
+from encoders.rgb import RGBEncoder
 from encoders.rppg import RPPGEncoder
 
 
 @dataclass(frozen=True)
 class EncoderFactoryResult:
     fau_encoder: nn.Module | None
+    rgb_encoder: nn.Module | None
     rppg_encoder: nn.Module | None
     warnings: tuple[str, ...]
 
@@ -54,23 +56,33 @@ def build_local_encoders(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> EncoderFactoryResult:
-    enabled = set(modalities or ("fau", "rppg"))
+    enabled = set(modalities or ("rgb", "fau", "rppg"))
     frames = _require_int(config, "frames")
 
+    rgb_config = _require_mapping(config, "rgb")
     fau_config = _require_mapping(config, "fau")
     rppg_config = _require_mapping(config, "rppg")
 
+    rgb_checkpoint_path = _optional_path(rgb_config, "checkpoint_path")
     fau_checkpoint_path = _optional_path(fau_config, "checkpoint_path")
     rppg_checkpoint_path = _optional_path(rppg_config, "checkpoint_path")
 
     warnings: list[str] = []
+    if "rgb" in enabled and rgb_checkpoint_path is None:
+        warnings.append("RGB checkpoint_path omitted; building encoder without pretrained weights.")
     if "fau" in enabled and fau_checkpoint_path is None:
         warnings.append("FAU checkpoint_path omitted; building encoder without pretrained weights.")
     if "rppg" in enabled and rppg_checkpoint_path is None:
         warnings.append("rPPG checkpoint_path omitted; building encoder without pretrained weights.")
 
+    rgb_encoder = None
     fau_encoder = None
     rppg_encoder = None
+    if "rgb" in enabled:
+        rgb_encoder = RGBEncoder(
+            backbone=_require_str(rgb_config, "backbone"),
+            checkpoint_path=rgb_checkpoint_path,
+        )
     if "fau" in enabled:
         fau_encoder = FAUEncoder(
             backbone=_require_str(fau_config, "backbone"),
@@ -84,6 +96,7 @@ def build_local_encoders(
         )
     return EncoderFactoryResult(
         fau_encoder=fau_encoder,
+        rgb_encoder=rgb_encoder,
         rppg_encoder=rppg_encoder,
         warnings=tuple(warnings),
     )
