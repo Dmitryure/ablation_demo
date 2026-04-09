@@ -9,39 +9,16 @@ import torch
 import torch.nn as nn
 import yaml
 
+from encoders import build_local_encoders
 from registry import CURRENT_MODALITIES, build_registry
 
 
 DEFAULT_CONFIG = Path("/home/comp/ablation_task/configs/registry_fusion.yaml")
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
-class DummyFAUEncoder(nn.Module):
-    def __init__(self, num_au: int = 12, feature_dim: int = 20):
-        super().__init__()
-        self.num_au = num_au
-        self.feature_dim = feature_dim
-
-    def forward(self, x: torch.Tensor):
-        batch_frames = x.shape[0]
-        features = torch.randn(batch_frames, self.num_au, self.feature_dim, device=x.device)
-        logits = torch.randn(batch_frames, self.num_au, device=x.device)
-        edge_logits = torch.randn(batch_frames, self.num_au, 3, device=x.device)
-        return features, logits, edge_logits
-
-
-class DummyRPPGEncoder(nn.Module):
-    def __init__(self, feature_dim: int = 64):
-        super().__init__()
-        self.feature_dim = feature_dim
-
-    def forward(self, x: torch.Tensor):
-        batch, _, num_frames, _, _ = x.shape
-        waveform = torch.randn(batch, num_frames, device=x.device)
-        features = torch.randn(batch, num_frames, self.feature_dim, device=x.device)
-        return waveform, features
-
-
-def load_video_clip(path: Path, num_frames: int, image_size: int = 64) -> torch.Tensor:
+def load_video_clip(path: Path, num_frames: int, image_size: int = 224) -> torch.Tensor:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
@@ -64,6 +41,7 @@ def load_video_clip(path: Path, num_frames: int, image_size: int = 64) -> torch.
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
         frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+        frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
         frames.append(frame_tensor)
 
     cap.release()
@@ -147,19 +125,24 @@ def main() -> None:
 
     torch.manual_seed(seed)
 
+    encoder_result = build_local_encoders(config, modalities=enabled_modalities)
     registry = build_registry(
         dim=dim,
-        fau_encoder=DummyFAUEncoder(),
-        rppg_encoder=DummyRPPGEncoder(),
+        fau_encoder=encoder_result.fau_encoder,
+        rppg_encoder=encoder_result.rppg_encoder,
     )
+    registry.eval()
     batch = {"video": load_video_clip(video_path, num_frames=frames, image_size=image_size)}
-    fused, debug = fuse_selected_modalities(registry, batch, enabled_modalities)
+    with torch.inference_mode():
+        fused, debug = fuse_selected_modalities(registry, batch, enabled_modalities)
 
     print("config_path:", str(args.config))
     print("video_path:", str(video_path))
     print("available_modalities:", CURRENT_MODALITIES)
     print("selected_modalities:", enabled_modalities)
     print("video_tensor_shape:", tuple(batch["video"].shape))
+    for warning in encoder_result.warnings:
+        print("warning:", warning)
     for name in enabled_modalities:
         print(f"{name}_token_shape:", debug[name]["token_shape"])
     print("fused_token_shape:", debug["fused_token_shape"])

@@ -3,6 +3,12 @@ modalities:
   - fau
   - rppg
 frames: 16
-image_size: 64
+image_size: 224
 dim: 32
 seed: 0
+fau:
+  backbone: swin_transformer_tiny
+  num_classes: 12
+  checkpoint_path: null
+rppg:
+  checkpoint_path: /home/comp/ablation_task/checkpoints/PURE_PhysNet_DiffNormalized.pth

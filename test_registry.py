@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from branches import ModalityBranch, ModalityOutput
+from encoders import FAUEncoder, RPPGEncoder
 from registry import CURRENT_MODALITIES, build_registry, registry_required_keys, validate_registry
 
 
@@ -64,6 +65,39 @@ class RegistryTest(unittest.TestCase):
         keys = registry_required_keys(registry, ("fau", "rppg"))
         self.assertEqual(keys["fau"], ("video",))
         self.assertEqual(keys["rppg"], ("video",))
+
+    def test_local_wrappers_instantiate(self):
+        fau_encoder = FAUEncoder(backbone="swin_transformer_tiny", num_classes=4)
+        rppg_encoder = RPPGEncoder(frames=4)
+
+        self.assertIsInstance(fau_encoder, nn.Module)
+        self.assertIsInstance(rppg_encoder, nn.Module)
+
+    def test_local_fau_branch_output_contract(self):
+        registry = build_registry(
+            dim=16,
+            fau_encoder=FAUEncoder(backbone="swin_transformer_tiny", num_classes=4),
+            rppg_encoder=DummyRPPGEncoder(),
+        )
+        video = torch.randn(1, 3, 1, 224, 224)
+
+        output = registry["fau"].encode({"video": video})
+
+        self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
+        self.assertEqual(tuple(output.time_ids.shape), (4,))
+
+    def test_local_rppg_branch_output_contract(self):
+        registry = build_registry(
+            dim=16,
+            fau_encoder=DummyFAUEncoder(),
+            rppg_encoder=RPPGEncoder(frames=4),
+        )
+        video = torch.randn(1, 3, 4, 32, 32)
+
+        output = registry["rppg"].encode({"video": video})
+
+        self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
+        self.assertEqual(tuple(output.time_ids.shape), (4,))
 
 
 if __name__ == "__main__":
