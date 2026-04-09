@@ -1,0 +1,8 @@
+video: /home/comp/ablation_task/assets/92oIcJfqoxU_01_14_13-01_15_46part2_f_swapped.mp4
+modalities:
+  - fau
+  - rppg
+frames: 16
+image_size: 64
+dim: 32
+seed: 0
