@@ -26,16 +26,12 @@ PENDING_MODALITIES: Tuple[str, ...] = tuple(
 SUPPORTED_FRAME_COUNTS: Tuple[int, ...] = (16, 32, 64)
 
 
-def build_registry(
-    dim: int,
-    fau_encoder: nn.Module,
-    rppg_encoder: nn.Module,
-) -> nn.ModuleDict:
+def build_registry(dim: int) -> nn.ModuleDict:
     return nn.ModuleDict(
         {
             "eye_gaze": EyeGazeBranch(dim=dim),
-            "fau": FAUBranch(encoder=fau_encoder, dim=dim),
-            "rppg": RPPGBranch(encoder=rppg_encoder, dim=dim),
+            "fau": FAUBranch(dim=dim),
+            "rppg": RPPGBranch(dim=dim),
         }
     )
 

@@ -5,11 +5,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
 
-from encoders import build_local_encoders
+from extractors import build_extractors
 from registry import CURRENT_MODALITIES, build_registry
 
 
@@ -18,7 +19,11 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3,
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
 
-def load_video_clip(path: Path, num_frames: int, image_size: int = 224) -> torch.Tensor:
+def load_video_inputs(
+    path: Path,
+    num_frames: int,
+    image_size: int = 224,
+) -> dict[str, object]:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
@@ -29,7 +34,8 @@ def load_video_clip(path: Path, num_frames: int, image_size: int = 224) -> torch
         raise RuntimeError(f"Video has only {total_frames} frames, need at least {num_frames}")
 
     indices = torch.linspace(0, total_frames - 1, steps=num_frames).round().to(dtype=torch.int64).tolist()
-    frames = []
+    clip_frames = []
+    rgb_frames = []
 
     for frame_index in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
@@ -39,13 +45,31 @@ def load_video_clip(path: Path, num_frames: int, image_size: int = 224) -> torch
             raise RuntimeError(f"Failed to read frame {frame_index} from {path}")
 
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frames.append(frame)
         frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
         frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
         frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
-        frames.append(frame_tensor)
+        clip_frames.append(frame_tensor)
 
     cap.release()
-    return torch.stack(frames, dim=1).unsqueeze(0)  # [1, 3, N, H, W]
+    return {
+        "video": torch.stack(clip_frames, dim=1).unsqueeze(0),  # [1, 3, N, H, W]
+        "video_rgb_frames": rgb_frames,
+    }
+
+
+def extract_selected_modalities(
+    extractors: Mapping[str, object],
+    raw_batch: Mapping[str, object],
+    enabled_modalities: Sequence[str],
+) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+    feature_batch: dict[str, torch.Tensor] = {}
+    debug: dict[str, object] = {}
+    for name in enabled_modalities:
+        extracted = extractors[name].extract(raw_batch)
+        feature_batch.update(extracted)
+        debug[name] = {key: tuple(value.shape) for key, value in extracted.items() if isinstance(value, torch.Tensor)}
+    return feature_batch, debug
 
 
 def fuse_selected_modalities(
@@ -117,31 +141,40 @@ def main() -> None:
     dim = require_int(config, "dim")
     seed = require_int(config, "seed")
 
-    unsupported = [m for m in enabled_modalities if m not in {"fau", "rppg"}]
+    unsupported = [m for m in enabled_modalities if m not in {"eye_gaze", "fau", "rppg"}]
     if unsupported:
         raise ValueError(
-            f"This smoke script currently supports only fau and rppg, got unsupported modalities: {unsupported}"
+            "This smoke script currently supports only eye_gaze, fau, and rppg, "
+            f"got unsupported modalities: {unsupported}"
         )
 
     torch.manual_seed(seed)
 
-    encoder_result = build_local_encoders(config, modalities=enabled_modalities)
-    registry = build_registry(
-        dim=dim,
-        fau_encoder=encoder_result.fau_encoder,
-        rppg_encoder=encoder_result.rppg_encoder,
-    )
+    extractor_result = build_extractors(config, modalities=enabled_modalities)
+    registry = build_registry(dim=dim)
     registry.eval()
-    batch = {"video": load_video_clip(video_path, num_frames=frames, image_size=image_size)}
-    with torch.inference_mode():
-        fused, debug = fuse_selected_modalities(registry, batch, enabled_modalities)
+    raw_batch = load_video_inputs(video_path, num_frames=frames, image_size=image_size)
+    try:
+        batch, feature_debug = extract_selected_modalities(
+            extractor_result.extractors,
+            raw_batch,
+            enabled_modalities,
+        )
+        with torch.inference_mode():
+            fused, debug = fuse_selected_modalities(registry, batch, enabled_modalities)
+    finally:
+        for extractor in extractor_result.extractors.values():
+            extractor.close()
 
     print("config_path:", str(args.config))
     print("video_path:", str(video_path))
     print("available_modalities:", CURRENT_MODALITIES)
     print("selected_modalities:", enabled_modalities)
-    print("video_tensor_shape:", tuple(batch["video"].shape))
-    for warning in encoder_result.warnings:
+    print("video_tensor_shape:", tuple(raw_batch["video"].shape))
+    for name in enabled_modalities:
+        for key, shape in feature_debug[name].items():
+            print(f"{key}_shape:", shape)
+    for warning in extractor_result.warnings:
         print("warning:", warning)
     for name in enabled_modalities:
         print(f"{name}_token_shape:", debug[name]["token_shape"])

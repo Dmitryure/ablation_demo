@@ -1,4 +1,5 @@
 from branches import EyeGazeBranch, FAUBranch, ModalityBranch, ModalityOutput, RPPGBranch
+from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, FeatureExtractor, RPPGExtractor, build_extractors
 from registry import (
     CURRENT_MODALITIES,
     FULL_MODALITIES,
@@ -18,6 +19,12 @@ __all__ = [
     "ModalityOutput",
     "EyeGazeBranch",
     "FAUBranch",
+    "FeatureExtractor",
+    "FAUExtractor",
+    "RPPGExtractor",
+    "EyeGazeExtractor",
+    "EYE_GAZE_COLUMNS",
+    "build_extractors",
     "RPPGBranch",
     "build_registry",
     "validate_registry",

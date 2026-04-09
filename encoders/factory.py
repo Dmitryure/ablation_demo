@@ -12,8 +12,8 @@ from encoders.rppg import RPPGEncoder
 
 @dataclass(frozen=True)
 class EncoderFactoryResult:
-    fau_encoder: nn.Module
-    rppg_encoder: nn.Module
+    fau_encoder: nn.Module | None
+    rppg_encoder: nn.Module | None
     warnings: tuple[str, ...]
 
 
@@ -69,15 +69,19 @@ def build_local_encoders(
     if "rppg" in enabled and rppg_checkpoint_path is None:
         warnings.append("rPPG checkpoint_path omitted; building encoder without pretrained weights.")
 
-    fau_encoder = FAUEncoder(
-        backbone=_require_str(fau_config, "backbone"),
-        num_classes=_require_int(fau_config, "num_classes"),
-        checkpoint_path=fau_checkpoint_path,
-    )
-    rppg_encoder = RPPGEncoder(
-        frames=frames,
-        checkpoint_path=rppg_checkpoint_path,
-    )
+    fau_encoder = None
+    rppg_encoder = None
+    if "fau" in enabled:
+        fau_encoder = FAUEncoder(
+            backbone=_require_str(fau_config, "backbone"),
+            num_classes=_require_int(fau_config, "num_classes"),
+            checkpoint_path=fau_checkpoint_path,
+        )
+    if "rppg" in enabled:
+        rppg_encoder = RPPGEncoder(
+            frames=frames,
+            checkpoint_path=rppg_checkpoint_path,
+        )
     return EncoderFactoryResult(
         fau_encoder=fau_encoder,
         rppg_encoder=rppg_encoder,

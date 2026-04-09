@@ -2,10 +2,13 @@ video: /home/comp/ablation_task/assets/92oIcJfqoxU_01_14_13-01_15_46part2_f_swap
 modalities:
   - fau
   - rppg
+  # - eye_gaze
 frames: 16
 image_size: 224
-dim: 32
+dim: 128
 seed: 0
+eye_gaze:
+  model_path: /home/comp/ablation_task/models/face_landmarker_v2_with_blendshapes.task
 fau:
   backbone: swin_transformer_tiny
   num_classes: 12
