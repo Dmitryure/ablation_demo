@@ -7,8 +7,14 @@ import torch.nn as nn
 from branches import ModalityBranch, ModalityOutput
 from encoders import FAUEncoder, RGBEncoder, RPPGEncoder
 from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, RGBExtractor, RPPGExtractor
-from registry import CURRENT_MODALITIES, build_registry, registry_required_keys, validate_registry
-from run_registry_fusion import FusionOutput, fuse_selected_modalities
+from fusion import FusionOutput, TokenBankFusion
+from registry import CURRENT_MODALITIES, MODALITY_TO_ID, build_registry, registry_required_keys, validate_registry
+from run_registry_fusion import (
+    build_fusion_module,
+    fuse_selected_modalities,
+    require_fusion_config,
+    validate_selected_modalities,
+)
 
 
 class DummyFAUEncoder(nn.Module):
@@ -37,7 +43,31 @@ class DummyRPPGEncoder(nn.Module):
         return waveform, features
 
 
+class DummyMetadataBranch(ModalityBranch):
+    name = "metadata"
+
+    def required_keys(self):
+        return ("metadata_tokens",)
+
+    def encode(self, batch):
+        tokens = batch["metadata_tokens"]
+        time_ids = torch.zeros(tokens.shape[1], dtype=torch.long, device=tokens.device)
+        return ModalityOutput(tokens=tokens, time_ids=time_ids, debug={"token_shape": tuple(tokens.shape)})
+
+
 class RegistryTest(unittest.TestCase):
+    def build_test_fusion(self, dim: int = 16, max_time_steps: int = 8) -> TokenBankFusion:
+        num_heads = 4 if dim % 4 == 0 else 2 if dim % 2 == 0 else 1
+        return TokenBankFusion(
+            dim=dim,
+            num_layers=2,
+            num_heads=num_heads,
+            mlp_ratio=2.0,
+            dropout=0.0,
+            max_time_steps=max_time_steps,
+            num_modalities=len(MODALITY_TO_ID),
+        )
+
     def test_registry_contains_current_modalities(self):
         registry = build_registry(dim=32)
 
@@ -144,6 +174,7 @@ class RegistryTest(unittest.TestCase):
 
     def test_fuse_selected_modalities_returns_token_bank_metadata(self):
         registry = build_registry(dim=16)
+        fusion_module = self.build_test_fusion(dim=16, max_time_steps=4)
         batch = {
             "rgb_features": torch.randn(1, 4, 512),
             "rppg_features": torch.randn(1, 4, 12),
@@ -154,18 +185,125 @@ class RegistryTest(unittest.TestCase):
             batch,
             ("rgb", "rppg"),
             {"rgb": 1.0, "rppg": 2.0},
+            fusion_module,
         )
 
         self.assertIsInstance(fusion_output, FusionOutput)
         self.assertEqual(tuple(fusion_output.tokens.shape), (1, 8, 16))
         self.assertEqual(tuple(fusion_output.fused.shape), (1, 16))
+        self.assertEqual(tuple(fusion_output.cls_token.shape), (1, 16))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 9, 16))
         self.assertEqual(tuple(fusion_output.time_ids.shape), (8,))
         self.assertEqual(tuple(fusion_output.modality_ids.shape), (8,))
         self.assertEqual(fusion_output.modality_names, ("rgb", "rppg"))
         self.assertTrue(torch.equal(fusion_output.time_ids, torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])))
-        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])))
+        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0, 0, 0, 0, 4, 4, 4, 4])))
         self.assertEqual(debug["token_bank_shape"], (1, 8, 16))
         self.assertEqual(debug["modality_token_counts"], {"rgb": 4, "rppg": 4})
+        self.assertEqual(debug["cls_token_shape"], (1, 16))
+        self.assertEqual(debug["fused_tokens_shape"], (1, 9, 16))
+
+    def test_fuse_selected_modalities_uses_stable_subset_modality_ids(self):
+        registry = build_registry(dim=8)
+        fusion_module = self.build_test_fusion(dim=8, max_time_steps=2)
+        batch = {
+            "eye_gaze": torch.randn(1, 2, 8),
+            "rppg_features": torch.randn(1, 2, 12),
+        }
+
+        fusion_output, _ = fuse_selected_modalities(
+            registry,
+            batch,
+            ("eye_gaze", "rppg"),
+            {"eye_gaze": 1.0, "rppg": 1.0},
+            fusion_module,
+        )
+
+        expected = torch.tensor(
+            [
+                MODALITY_TO_ID["eye_gaze"],
+                MODALITY_TO_ID["eye_gaze"],
+                MODALITY_TO_ID["rppg"],
+                MODALITY_TO_ID["rppg"],
+            ]
+        )
+        self.assertTrue(torch.equal(fusion_output.modality_ids, expected))
+
+    def test_fuse_selected_modalities_supports_mixed_token_layouts(self):
+        registry = build_registry(dim=12)
+        fusion_module = self.build_test_fusion(dim=12, max_time_steps=3)
+        batch = {
+            "rgb_features": torch.randn(1, 3, 512),
+            "fau_features": torch.randn(1, 3, 2, 20),
+        }
+
+        fusion_output, debug = fuse_selected_modalities(
+            registry,
+            batch,
+            ("rgb", "fau"),
+            {"rgb": 1.0, "fau": 1.0},
+            fusion_module,
+        )
+
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 9, 12))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 10, 12))
+        self.assertEqual(debug["modality_token_counts"], {"rgb": 3, "fau": 6})
+        self.assertTrue(
+            torch.equal(
+                fusion_output.time_ids,
+                torch.tensor([0, 1, 2, 0, 0, 1, 1, 2, 2]),
+            )
+        )
+
+    def test_future_non_temporal_modality_can_use_time_zero_tokens(self):
+        registry = build_registry(dim=10)
+        registry["metadata"] = DummyMetadataBranch()
+        fusion_module = self.build_test_fusion(dim=10, max_time_steps=4)
+        batch = {"metadata_tokens": torch.randn(1, 3, 10)}
+
+        fusion_output, debug = fuse_selected_modalities(
+            registry,
+            batch,
+            ("metadata",),
+            {"metadata": 1.0},
+            fusion_module,
+        )
+
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 3, 10))
+        self.assertTrue(torch.equal(fusion_output.time_ids, torch.zeros(3, dtype=torch.long)))
+        self.assertTrue(
+            torch.equal(
+                fusion_output.modality_ids,
+                torch.full((3,), MODALITY_TO_ID["metadata"], dtype=torch.long),
+            )
+        )
+        self.assertEqual(debug["fused_tokens_shape"], (1, 4, 10))
+
+    def test_missing_fusion_checkpoint_keeps_random_init_smoke_path_valid(self):
+        config = {
+            "fusion": {
+                "type": "token_transformer",
+                "num_layers": 2,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+                "dropout": 0.0,
+                "max_time_steps": 8,
+                "checkpoint_path": None,
+            }
+        }
+
+        fusion_config = require_fusion_config(config)
+        fusion_module = build_fusion_module(dim=16, fusion_config=fusion_config)
+
+        self.assertIsInstance(fusion_module, TokenBankFusion)
+
+    def test_require_fusion_config_rejects_malformed_values(self):
+        with self.assertRaisesRegex(ValueError, "`fusion.type` must be `token_transformer`."):
+            require_fusion_config({"fusion": {"type": "mean_pool"}})
+
+    def test_validate_selected_modalities_rejects_unknown_names(self):
+        with self.assertRaisesRegex(ValueError, "unsupported modalities"):
+            validate_selected_modalities(("rgb", "metadata"))
 
 
 if __name__ == "__main__":

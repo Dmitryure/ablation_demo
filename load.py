@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import shutil
 import sys
 import urllib.request
@@ -237,7 +238,14 @@ def _download_gdrive(entry: WeightEntry) -> Path:
 
     entry.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"gdrive: {entry.source} -> {path}")
-    downloaded = gdown.download(id=entry.source, output=str(path), quiet=False, fuzzy=True)
+    download_kwargs = {
+        "id": entry.source,
+        "output": str(path),
+        "quiet": False,
+    }
+    if "fuzzy" in inspect.signature(gdown.download).parameters:
+        download_kwargs["fuzzy"] = True
+    downloaded = gdown.download(**download_kwargs)
     if downloaded is None:
         raise RuntimeError(f"gdown failed for: {entry.source}")
     return Path(downloaded)

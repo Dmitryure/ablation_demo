@@ -12,22 +12,23 @@ import torch.nn as nn
 import yaml
 
 from extractors import build_extractors
-from registry import CURRENT_MODALITIES, build_registry
+from fusion import FusionOutput, TokenBankFusion, prepare_token_bank
+from registry import CURRENT_MODALITIES, MODALITY_TO_ID, build_registry
 
 
 DEFAULT_CONFIG = Path("/home/comp/ablation_task/configs/registry_fusion.yaml")
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 
-
 @dataclass(frozen=True)
-class FusionOutput:
-    fused: torch.Tensor
-    tokens: torch.Tensor
-    time_ids: torch.Tensor
-    modality_ids: torch.Tensor
-    modality_names: tuple[str, ...]
-    modality_vectors: torch.Tensor
+class FusionConfig:
+    type: str
+    num_layers: int
+    num_heads: int
+    mlp_ratio: float
+    dropout: float
+    max_time_steps: int
+    checkpoint_path: Path | None
 
 
 def load_video_inputs(
@@ -88,61 +89,51 @@ def fuse_selected_modalities(
     batch: dict[str, torch.Tensor],
     enabled_modalities: Sequence[str],
     modality_weights: Mapping[str, float],
+    fusion_module: TokenBankFusion,
 ) -> tuple[FusionOutput, dict[str, object]]:
-    outputs = []
-    debug = {}
+    outputs_by_name = {}
+    debug: dict[str, object] = {}
     for name in enabled_modalities:
         output = registry[name].encode(batch)
-        outputs.append(output)
+        outputs_by_name[name] = output
         debug[name] = {
             "token_shape": tuple(output.tokens.shape),
             "time_ids_shape": tuple(output.time_ids.shape),
         }
 
-    tokens = torch.cat([output.tokens for output in outputs], dim=1)
-    time_ids = torch.cat([output.time_ids.to(device=tokens.device) for output in outputs], dim=0)
-    modality_ids = torch.cat(
-        [
-            torch.full(
-                (output.tokens.shape[1],),
-                index,
-                dtype=torch.long,
-                device=tokens.device,
-            )
-            for index, output in enumerate(outputs)
-        ],
-        dim=0,
+    token_bank = prepare_token_bank(
+        outputs_by_name=outputs_by_name,
+        enabled_modalities=enabled_modalities,
+        modality_to_id=MODALITY_TO_ID,
+        modality_weights=modality_weights,
     )
-    modality_vectors = torch.stack([output.tokens.mean(dim=1) for output in outputs], dim=1)
-    raw_weights = torch.tensor(
-        [float(modality_weights[name]) for name in enabled_modalities],
-        dtype=modality_vectors.dtype,
-        device=modality_vectors.device,
+    cls_token, fused_tokens = fusion_module(
+        tokens=token_bank.weighted_tokens,
+        time_ids=token_bank.time_ids,
+        modality_ids=token_bank.modality_ids,
     )
-    normalized_weights = raw_weights / raw_weights.sum()
-    fused = (modality_vectors * normalized_weights.view(1, -1, 1)).sum(dim=1)
 
-    debug["modality_vectors_shape"] = tuple(modality_vectors.shape)
     debug["raw_modality_weights"] = {
         name: float(modality_weights[name]) for name in enabled_modalities
     }
-    debug["normalized_modality_weights"] = {
-        name: float(weight) for name, weight in zip(enabled_modalities, normalized_weights.tolist())
-    }
-    debug["token_bank_shape"] = tuple(tokens.shape)
-    debug["token_time_ids_shape"] = tuple(time_ids.shape)
-    debug["token_modality_ids_shape"] = tuple(modality_ids.shape)
+    debug["normalized_modality_weights"] = token_bank.normalized_weights
+    debug["token_bank_shape"] = tuple(token_bank.tokens.shape)
+    debug["token_time_ids_shape"] = tuple(token_bank.time_ids.shape)
+    debug["token_modality_ids_shape"] = tuple(token_bank.modality_ids.shape)
     debug["modality_token_counts"] = {
-        name: int(output.tokens.shape[1]) for name, output in zip(enabled_modalities, outputs)
+        name: int(outputs_by_name[name].tokens.shape[1]) for name in enabled_modalities
     }
-    debug["fused_tensor_shape"] = tuple(fused.shape)
+    debug["cls_token_shape"] = tuple(cls_token.shape)
+    debug["fused_tokens_shape"] = tuple(fused_tokens.shape)
+    debug["fused_tensor_shape"] = tuple(cls_token.shape)
     return FusionOutput(
-        fused=fused,
-        tokens=tokens,
-        time_ids=time_ids,
-        modality_ids=modality_ids,
-        modality_names=tuple(enabled_modalities),
-        modality_vectors=modality_vectors,
+        fused=cls_token,
+        tokens=token_bank.tokens,
+        time_ids=token_bank.time_ids,
+        modality_ids=token_bank.modality_ids,
+        modality_names=token_bank.modality_names,
+        cls_token=cls_token,
+        fused_tokens=fused_tokens,
     ), debug
 
 
@@ -208,6 +199,81 @@ def require_modality_weights(
     return weights
 
 
+def validate_selected_modalities(
+    enabled_modalities: Sequence[str],
+    supported_modalities: Sequence[str] = CURRENT_MODALITIES,
+) -> None:
+    unsupported = [name for name in enabled_modalities if name not in supported_modalities]
+    if unsupported:
+        raise ValueError(
+            "This smoke script currently supports only rgb, eye_gaze, fau, and rppg, "
+            f"got unsupported modalities: {unsupported}"
+        )
+
+
+def require_float(config: Mapping[str, Any], key: str) -> float:
+    value = config.get(key)
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"`{key}` must be a number in the YAML config.")
+    return float(value)
+
+
+def optional_path(config: Mapping[str, Any], key: str) -> Path | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"`{key}` must be a non-empty string path or null in the YAML config.")
+    return Path(value)
+
+
+def require_fusion_config(config: Mapping[str, Any]) -> FusionConfig:
+    value = config.get("fusion")
+    if not isinstance(value, Mapping):
+        raise ValueError("`fusion` must be a YAML mapping.")
+
+    fusion_type = value.get("type")
+    if fusion_type != "token_transformer":
+        raise ValueError("`fusion.type` must be `token_transformer`.")
+
+    return FusionConfig(
+        type=fusion_type,
+        num_layers=require_int(value, "num_layers"),
+        num_heads=require_int(value, "num_heads"),
+        mlp_ratio=require_float(value, "mlp_ratio"),
+        dropout=require_float(value, "dropout"),
+        max_time_steps=require_int(value, "max_time_steps"),
+        checkpoint_path=optional_path(value, "checkpoint_path"),
+    )
+
+
+def build_fusion_module(dim: int, fusion_config: FusionConfig) -> TokenBankFusion:
+    return TokenBankFusion(
+        dim=dim,
+        num_layers=fusion_config.num_layers,
+        num_heads=fusion_config.num_heads,
+        mlp_ratio=fusion_config.mlp_ratio,
+        dropout=fusion_config.dropout,
+        max_time_steps=fusion_config.max_time_steps,
+        num_modalities=len(MODALITY_TO_ID),
+    )
+
+
+def load_fusion_checkpoint(fusion_module: TokenBankFusion, checkpoint_path: Path | None) -> bool:
+    if checkpoint_path is None:
+        return False
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Fusion checkpoint does not exist: {checkpoint_path}")
+
+    state = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(state, Mapping) and "state_dict" in state:
+        state = state["state_dict"]
+    if not isinstance(state, Mapping):
+        raise ValueError("Fusion checkpoint must be a state_dict mapping or contain `state_dict`.")
+    fusion_module.load_state_dict(state)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a plug-and-play registry fusion smoke test from YAML.")
     parser.add_argument(
@@ -225,20 +291,22 @@ def main() -> None:
     image_size = require_int(config, "image_size")
     dim = require_int(config, "dim")
     seed = require_int(config, "seed")
+    fusion_config = require_fusion_config(config)
 
-    unsupported = [m for m in enabled_modalities if m not in {"rgb", "eye_gaze", "fau", "rppg"}]
-    if unsupported:
-        raise ValueError(
-            "This smoke script currently supports only rgb, eye_gaze, fau, and rppg, "
-            f"got unsupported modalities: {unsupported}"
-        )
+    validate_selected_modalities(enabled_modalities)
     modality_weights = require_modality_weights(config, enabled_modalities)
 
     torch.manual_seed(seed)
 
     extractor_result = build_extractors(config, modalities=enabled_modalities)
     registry = build_registry(dim=dim)
+    fusion_module = build_fusion_module(dim=dim, fusion_config=fusion_config)
+    fusion_checkpoint_loaded = load_fusion_checkpoint(
+        fusion_module=fusion_module,
+        checkpoint_path=fusion_config.checkpoint_path,
+    )
     registry.eval()
+    fusion_module.eval()
     raw_batch = load_video_inputs(video_path, num_frames=frames, image_size=image_size)
     try:
         batch, feature_debug = extract_selected_modalities(
@@ -252,6 +320,7 @@ def main() -> None:
                 batch,
                 enabled_modalities,
                 modality_weights,
+                fusion_module,
             )
     finally:
         for extractor in extractor_result.extractors.values():
@@ -261,6 +330,8 @@ def main() -> None:
     print("video_path:", str(video_path))
     print("available_modalities:", CURRENT_MODALITIES)
     print("selected_modalities:", enabled_modalities)
+    print("fusion_type:", fusion_config.type)
+    print("fusion_checkpoint_loaded:", fusion_checkpoint_loaded)
     print("modality_weights:", debug["raw_modality_weights"])
     print("normalized_modality_weights:", debug["normalized_modality_weights"])
     print("video_tensor_shape:", tuple(raw_batch["video"].shape))
@@ -271,16 +342,19 @@ def main() -> None:
         print("warning:", warning)
     for name in enabled_modalities:
         print(f"{name}_token_shape:", debug[name]["token_shape"])
-    print("modality_vectors_shape:", debug["modality_vectors_shape"])
     print("token_bank_shape:", debug["token_bank_shape"])
     print("token_time_ids_shape:", debug["token_time_ids_shape"])
     print("token_modality_ids_shape:", debug["token_modality_ids_shape"])
     print("modality_token_counts:", debug["modality_token_counts"])
+    print("cls_token_shape:", debug["cls_token_shape"])
+    print("fused_tokens_shape:", debug["fused_tokens_shape"])
     print("fused_tensor_shape:", debug["fused_tensor_shape"])
     print("token_time_ids:")
     print(fusion_output.time_ids)
     print("token_modality_ids:")
     print(fusion_output.modality_ids)
+    print("cls_token:")
+    print(fusion_output.cls_token)
     print("fused_tensor:")
     print(fusion_output.fused)
 

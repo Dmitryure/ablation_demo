@@ -3,6 +3,7 @@ from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, Feature
 from registry import (
     CURRENT_MODALITIES,
     FULL_MODALITIES,
+    MODALITY_TO_ID,
     PENDING_MODALITIES,
     SUPPORTED_FRAME_COUNTS,
     build_registry,
@@ -13,6 +14,7 @@ from registry import (
 __all__ = [
     "CURRENT_MODALITIES",
     "FULL_MODALITIES",
+    "MODALITY_TO_ID",
     "PENDING_MODALITIES",
     "SUPPORTED_FRAME_COUNTS",
     "ModalityBranch",

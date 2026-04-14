@@ -19,6 +19,8 @@ FULL_MODALITIES: Tuple[str, ...] = (
     "manipulation_mask",
 )
 
+MODALITY_TO_ID = {name: index for index, name in enumerate(FULL_MODALITIES)}
+
 CURRENT_MODALITIES: Tuple[str, ...] = ("rgb", "eye_gaze", "fau", "rppg")
 PENDING_MODALITIES: Tuple[str, ...] = tuple(
     modality for modality in FULL_MODALITIES if modality not in CURRENT_MODALITIES
