@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -17,6 +18,16 @@ from registry import CURRENT_MODALITIES, build_registry
 DEFAULT_CONFIG = Path("/home/comp/ablation_task/configs/registry_fusion.yaml")
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
+
+@dataclass(frozen=True)
+class FusionOutput:
+    fused: torch.Tensor
+    tokens: torch.Tensor
+    time_ids: torch.Tensor
+    modality_ids: torch.Tensor
+    modality_names: tuple[str, ...]
+    modality_vectors: torch.Tensor
 
 
 def load_video_inputs(
@@ -77,7 +88,7 @@ def fuse_selected_modalities(
     batch: dict[str, torch.Tensor],
     enabled_modalities: Sequence[str],
     modality_weights: Mapping[str, float],
-) -> tuple[torch.Tensor, dict[str, object]]:
+) -> tuple[FusionOutput, dict[str, object]]:
     outputs = []
     debug = {}
     for name in enabled_modalities:
@@ -89,6 +100,19 @@ def fuse_selected_modalities(
         }
 
     tokens = torch.cat([output.tokens for output in outputs], dim=1)
+    time_ids = torch.cat([output.time_ids.to(device=tokens.device) for output in outputs], dim=0)
+    modality_ids = torch.cat(
+        [
+            torch.full(
+                (output.tokens.shape[1],),
+                index,
+                dtype=torch.long,
+                device=tokens.device,
+            )
+            for index, output in enumerate(outputs)
+        ],
+        dim=0,
+    )
     modality_vectors = torch.stack([output.tokens.mean(dim=1) for output in outputs], dim=1)
     raw_weights = torch.tensor(
         [float(modality_weights[name]) for name in enabled_modalities],
@@ -105,9 +129,21 @@ def fuse_selected_modalities(
     debug["normalized_modality_weights"] = {
         name: float(weight) for name, weight in zip(enabled_modalities, normalized_weights.tolist())
     }
-    debug["fused_token_shape"] = tuple(tokens.shape)
+    debug["token_bank_shape"] = tuple(tokens.shape)
+    debug["token_time_ids_shape"] = tuple(time_ids.shape)
+    debug["token_modality_ids_shape"] = tuple(modality_ids.shape)
+    debug["modality_token_counts"] = {
+        name: int(output.tokens.shape[1]) for name, output in zip(enabled_modalities, outputs)
+    }
     debug["fused_tensor_shape"] = tuple(fused.shape)
-    return fused, debug
+    return FusionOutput(
+        fused=fused,
+        tokens=tokens,
+        time_ids=time_ids,
+        modality_ids=modality_ids,
+        modality_names=tuple(enabled_modalities),
+        modality_vectors=modality_vectors,
+    ), debug
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -211,7 +247,7 @@ def main() -> None:
             enabled_modalities,
         )
         with torch.inference_mode():
-            fused, debug = fuse_selected_modalities(
+            fusion_output, debug = fuse_selected_modalities(
                 registry,
                 batch,
                 enabled_modalities,
@@ -236,10 +272,17 @@ def main() -> None:
     for name in enabled_modalities:
         print(f"{name}_token_shape:", debug[name]["token_shape"])
     print("modality_vectors_shape:", debug["modality_vectors_shape"])
-    print("fused_token_shape:", debug["fused_token_shape"])
+    print("token_bank_shape:", debug["token_bank_shape"])
+    print("token_time_ids_shape:", debug["token_time_ids_shape"])
+    print("token_modality_ids_shape:", debug["token_modality_ids_shape"])
+    print("modality_token_counts:", debug["modality_token_counts"])
     print("fused_tensor_shape:", debug["fused_tensor_shape"])
+    print("token_time_ids:")
+    print(fusion_output.time_ids)
+    print("token_modality_ids:")
+    print(fusion_output.modality_ids)
     print("fused_tensor:")
-    print(fused)
+    print(fusion_output.fused)
 
 
 if __name__ == "__main__":

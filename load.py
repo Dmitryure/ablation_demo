@@ -24,6 +24,7 @@ class WeightEntry:
     output_dir: Path
     filename: str
     extract_zip: bool = False
+    local_fallbacks: tuple[str, ...] = ()
 
 
 BACKBONE_WEIGHTS: dict[str, WeightEntry] = {
@@ -87,6 +88,10 @@ FAU_BP4D_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "bp4d" / "resnet50",
         filename="ME-GraphAU_resnet50_BP4D.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_resnet50_BP4D_fold1.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_resnet50_BP4D.pth",
+        ),
     ),
     "resnet101": WeightEntry(
         source="1i-ra0dtoEhwIep6goZ55PvEgwE3kecbl",
@@ -94,6 +99,10 @@ FAU_BP4D_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "bp4d" / "resnet101",
         filename="ME-GraphAU_resnet101_BP4D.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_resnet101_BP4D_fold1.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_resnet101_BP4D.pth",
+        ),
     ),
     "swin_transformer_tiny": WeightEntry(
         source="1BT4n7_5Wr6bGxHWVf3WrT7uBT0Zg9B5c",
@@ -101,6 +110,10 @@ FAU_BP4D_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "bp4d" / "swin_transformer_tiny",
         filename="ME-GraphAU_swin_tiny_BP4D.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_tiny_BP4D_fold1.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_tiny_BP4D.pth",
+        ),
     ),
     "swin_transformer_small": WeightEntry(
         source="1EiQd6q7x1bEO6JBLi3s2y5348EuVdP3L",
@@ -108,6 +121,10 @@ FAU_BP4D_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "bp4d" / "swin_transformer_small",
         filename="ME-GraphAU_swin_small_BP4D.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_small_BP4D_fold1.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_small_BP4D.pth",
+        ),
     ),
     "swin_transformer_base": WeightEntry(
         source="1Ti0auMA5o94toJfszuHoMlSlWUumm9L8",
@@ -115,6 +132,10 @@ FAU_BP4D_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "bp4d" / "swin_transformer_base",
         filename="ME-GraphAU_swin_base_BP4D.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_base_BP4D_fold1.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_base_BP4D.pth",
+        ),
     ),
 }
 
@@ -125,6 +146,10 @@ FAU_DISFA_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "disfa" / "resnet50",
         filename="ME-GraphAU_resnet50_DISFA.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_resnet50_DISFA_fold2.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_resnet50_DISFA.pth",
+        ),
     ),
     "swin_transformer_base": WeightEntry(
         source="1T44KPDaUhi4J_C-fWa6RxXNkY3yoDwIi",
@@ -132,6 +157,10 @@ FAU_DISFA_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR / "fau" / "disfa" / "swin_transformer_base",
         filename="ME-GraphAU_swin_base_DISFA.zip",
         extract_zip=True,
+        local_fallbacks=(
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_base_DISFA_fold2.pth",
+            "/home/comp/detectors/src/backbones/MEGraphAU/checkpoints/MEFARG_swin_base_DISFA.pth",
+        ),
     ),
 }
 
@@ -230,6 +259,24 @@ def _copy_local(entry: WeightEntry) -> Path:
     return path
 
 
+def _copy_local_fallback(entry: WeightEntry) -> Path | None:
+    for source in entry.local_fallbacks:
+        source_path = Path(source)
+        if not source_path.exists():
+            continue
+
+        entry.output_dir.mkdir(parents=True, exist_ok=True)
+        target_path = entry.output_dir / source_path.name
+        if target_path.exists():
+            print(f"exists: {target_path}")
+            return target_path
+
+        print(f"copy-local-fallback: {source_path} -> {target_path}")
+        shutil.copy2(source_path, target_path)
+        return target_path
+    return None
+
+
 def _extract_zip(path: Path, output_dir: Path) -> None:
     if not zipfile.is_zipfile(path):
         raise RuntimeError(f"Expected zip archive: {path}")
@@ -244,6 +291,10 @@ def fetch_entry(entry: WeightEntry) -> Path:
     if _has_extracted_payload(entry):
         print(f"exists: {entry.output_dir}")
         return entry.output_dir
+
+    local_fallback_path = _copy_local_fallback(entry)
+    if local_fallback_path is not None:
+        return entry.output_dir if entry.extract_zip else local_fallback_path
 
     if entry.source_kind == "url":
         path = _download_url(entry)

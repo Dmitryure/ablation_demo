@@ -8,6 +8,7 @@ from branches import ModalityBranch, ModalityOutput
 from encoders import FAUEncoder, RGBEncoder, RPPGEncoder
 from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, RGBExtractor, RPPGExtractor
 from registry import CURRENT_MODALITIES, build_registry, registry_required_keys, validate_registry
+from run_registry_fusion import FusionOutput, fuse_selected_modalities
 
 
 class DummyFAUEncoder(nn.Module):
@@ -140,6 +141,31 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
         self.assertEqual(tuple(output.time_ids.shape), (4,))
+
+    def test_fuse_selected_modalities_returns_token_bank_metadata(self):
+        registry = build_registry(dim=16)
+        batch = {
+            "rgb_features": torch.randn(1, 4, 512),
+            "rppg_features": torch.randn(1, 4, 12),
+        }
+
+        fusion_output, debug = fuse_selected_modalities(
+            registry,
+            batch,
+            ("rgb", "rppg"),
+            {"rgb": 1.0, "rppg": 2.0},
+        )
+
+        self.assertIsInstance(fusion_output, FusionOutput)
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 8, 16))
+        self.assertEqual(tuple(fusion_output.fused.shape), (1, 16))
+        self.assertEqual(tuple(fusion_output.time_ids.shape), (8,))
+        self.assertEqual(tuple(fusion_output.modality_ids.shape), (8,))
+        self.assertEqual(fusion_output.modality_names, ("rgb", "rppg"))
+        self.assertTrue(torch.equal(fusion_output.time_ids, torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])))
+        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])))
+        self.assertEqual(debug["token_bank_shape"], (1, 8, 16))
+        self.assertEqual(debug["modality_token_counts"], {"rgb": 4, "rppg": 4})
 
 
 if __name__ == "__main__":
