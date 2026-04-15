@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import yaml
 
-from extractors import build_extractors
+from extractors import FeatureExtractor, build_extractors
 from fusion import FusionOutput, TokenBankFusion, prepare_token_bank
 from registry import CURRENT_MODALITIES, MODALITY_TO_ID, build_registry
 
@@ -71,7 +71,7 @@ def load_video_inputs(
 
 
 def extract_selected_modalities(
-    extractors: Mapping[str, object],
+    extractors: Mapping[str, FeatureExtractor],
     raw_batch: Mapping[str, object],
     enabled_modalities: Sequence[str],
 ) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
