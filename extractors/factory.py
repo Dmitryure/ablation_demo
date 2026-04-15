@@ -30,7 +30,10 @@ def build_extractors(
     if "rgb" in enabled_set:
         if encoder_result.rgb_encoder is None:
             raise RuntimeError("RGB encoder was not built for the selected modalities.")
-        extractors["rgb"] = RGBExtractor(encoder_result.rgb_encoder)
+        extractors["rgb"] = RGBExtractor(
+            encoder_result.rgb_encoder,
+            image_size=int(config.get("image_size", 224)),
+        )
     if "eye_gaze" in enabled_set:
         extractors["eye_gaze"] = build_eye_gaze_extractor(config)
     if "fau" in enabled_set:

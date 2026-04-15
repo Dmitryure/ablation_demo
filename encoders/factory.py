@@ -68,8 +68,6 @@ def build_local_encoders(
     rppg_checkpoint_path = _optional_path(rppg_config, "checkpoint_path")
 
     warnings: list[str] = []
-    if "rgb" in enabled and rgb_checkpoint_path is None:
-        warnings.append("RGB checkpoint_path omitted; building encoder without pretrained weights.")
     if "fau" in enabled and fau_checkpoint_path is None:
         warnings.append("FAU checkpoint_path omitted; building encoder without pretrained weights.")
     if "rppg" in enabled and rppg_checkpoint_path is None:
@@ -79,8 +77,11 @@ def build_local_encoders(
     fau_encoder = None
     rppg_encoder = None
     if "rgb" in enabled:
+        if rgb_checkpoint_path is None:
+            raise ValueError("RGB checkpoint_path is required when `rgb` modality is enabled.")
         rgb_encoder = RGBEncoder(
-            backbone=_require_str(rgb_config, "backbone"),
+            frames=frames,
+            image_size=_require_int(config, "image_size"),
             checkpoint_path=rgb_checkpoint_path,
         )
     if "fau" in enabled:

@@ -24,8 +24,7 @@ fusion:
 eye_gaze:
   model_path: /home/comp/ablation_task/models/face_landmarker_v2_with_blendshapes.task
 rgb:
-  backbone: resnet18
-  checkpoint_path: /home/comp/ablation_task/checkpoints/resnet18-5c106cde.pth
+  checkpoint_path: /home/comp/ablation_task/checkpoints/mvit_v2_s-ae3be167.pth
 fau:
   backbone: swin_transformer_tiny
   num_classes: 12

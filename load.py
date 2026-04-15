@@ -77,9 +77,15 @@ BACKBONE_WEIGHTS: dict[str, WeightEntry] = {
         output_dir=CHECKPOINTS_DIR,
         filename="swin_base_patch4_window7_224.pth",
     ),
+    "mvit_v2_s": WeightEntry(
+        source="https://download.pytorch.org/models/mvit_v2_s-ae3be167.pth",
+        source_kind="url",
+        output_dir=CHECKPOINTS_DIR,
+        filename="mvit_v2_s-ae3be167.pth",
+    ),
 }
 RGB_WEIGHTS: dict[str, WeightEntry] = {
-    model: entry for model, entry in BACKBONE_WEIGHTS.items() if model.startswith("resnet")
+    "mvit_v2_s": BACKBONE_WEIGHTS["mvit_v2_s"],
 }
 
 FAU_BP4D_WEIGHTS: dict[str, WeightEntry] = {
@@ -192,6 +198,7 @@ ALIASES: dict[str, str] = {
     "swin-tiny": "swin_transformer_tiny",
     "swin-small": "swin_transformer_small",
     "swin-base": "swin_transformer_base",
+    "mvit": "mvit_v2_s",
     "physnet": "physnet-pure",
     "pure-physnet": "physnet-pure",
     "eye-gaze": "face-landmarker-v2-blendshapes",

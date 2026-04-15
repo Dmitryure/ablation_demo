@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from branches import ModalityBranch, ModalityOutput
-from encoders import FAUEncoder, RGBEncoder, RPPGEncoder
+from encoders import FAUEncoder, RGBEncoder, RPPGEncoder, build_local_encoders
 from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, RGBExtractor, RPPGExtractor
 from fusion import FusionOutput, TokenBankFusion
 from registry import CURRENT_MODALITIES, MODALITY_TO_ID, build_registry, registry_required_keys, validate_registry
@@ -41,6 +41,19 @@ class DummyRPPGEncoder(nn.Module):
         waveform = torch.randn(batch, num_frames, device=x.device)
         features = torch.randn(batch, num_frames, self.feature_dim, device=x.device)
         return waveform, features
+
+
+class DummyRGBClipEncoder(nn.Module):
+    def __init__(self, token_count: int = 8, feature_dim: int = 96):
+        super().__init__()
+        self.token_count = token_count
+        self.feature_dim = feature_dim
+        self.last_input: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.last_input = x.detach().clone()
+        batch = x.shape[0]
+        return torch.randn(batch, self.token_count, self.feature_dim, device=x.device)
 
 
 class DummyMetadataBranch(ModalityBranch):
@@ -89,7 +102,7 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(keys["rppg"], ("rppg_features",))
 
     def test_local_wrappers_instantiate(self):
-        rgb_encoder = RGBEncoder(backbone="resnet18")
+        rgb_encoder = RGBEncoder(frames=16, image_size=224)
         fau_encoder = FAUEncoder(backbone="swin_transformer_tiny", num_classes=4)
         rppg_encoder = RPPGEncoder(frames=4)
 
@@ -97,22 +110,39 @@ class RegistryTest(unittest.TestCase):
         self.assertIsInstance(fau_encoder, nn.Module)
         self.assertIsInstance(rppg_encoder, nn.Module)
 
+    def test_rgb_encoder_output_contract(self):
+        encoder = RGBEncoder(frames=16, image_size=224)
+        video = torch.randn(1, 3, 16, 224, 224)
+
+        with torch.no_grad():
+            output = encoder(video)
+
+        self.assertEqual(tuple(output.shape), (1, 8, 768))
+
     def test_rgb_extractor_output_contract(self):
-        extractor = RGBExtractor(RGBEncoder(backbone="resnet18"))
-        video = torch.randn(1, 3, 4, 224, 224)
+        encoder = DummyRGBClipEncoder(token_count=8, feature_dim=96)
+        extractor = RGBExtractor(encoder, image_size=224)
+        frames = [np.full((12, 10, 3), 128, dtype=np.uint8) for _ in range(16)]
 
-        output = extractor.extract({"video": video})
+        output = extractor.extract({"video_rgb_frames": frames})
 
-        self.assertEqual(tuple(output["rgb_features"].shape), (1, 4, 512))
+        self.assertEqual(tuple(output["rgb_features"].shape), (1, 8, 96))
+        self.assertIsNotNone(encoder.last_input)
+        self.assertEqual(tuple(encoder.last_input.shape), (1, 3, 16, 224, 224))
+        self.assertAlmostEqual(
+            float(encoder.last_input[0, 0, 0, 0, 0]),
+            (128 / 255.0 - 0.45) / 0.225,
+            places=5,
+        )
 
     def test_rgb_branch_output_contract(self):
         registry = build_registry(dim=16)
-        rgb_features = torch.randn(1, 4, 512)
+        rgb_features = torch.randn(1, 8, 768)
 
         output = registry["rgb"].encode({"rgb_features": rgb_features})
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
-        self.assertEqual(tuple(output.time_ids.shape), (4,))
+        self.assertEqual(tuple(output.tokens.shape), (1, 8, 16))
+        self.assertEqual(tuple(output.time_ids.shape), (8,))
 
     def test_fau_extractor_output_contract(self):
         extractor = FAUExtractor(DummyFAUEncoder(num_au=4, feature_dim=20))
@@ -174,10 +204,10 @@ class RegistryTest(unittest.TestCase):
 
     def test_fuse_selected_modalities_returns_token_bank_metadata(self):
         registry = build_registry(dim=16)
-        fusion_module = self.build_test_fusion(dim=16, max_time_steps=4)
+        fusion_module = self.build_test_fusion(dim=16, max_time_steps=16)
         batch = {
-            "rgb_features": torch.randn(1, 4, 512),
-            "rppg_features": torch.randn(1, 4, 12),
+            "rgb_features": torch.randn(1, 8, 768),
+            "rppg_features": torch.randn(1, 16, 12),
         }
 
         fusion_output, debug = fuse_selected_modalities(
@@ -189,19 +219,24 @@ class RegistryTest(unittest.TestCase):
         )
 
         self.assertIsInstance(fusion_output, FusionOutput)
-        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 8, 16))
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 24, 16))
         self.assertEqual(tuple(fusion_output.fused.shape), (1, 16))
         self.assertEqual(tuple(fusion_output.cls_token.shape), (1, 16))
-        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 9, 16))
-        self.assertEqual(tuple(fusion_output.time_ids.shape), (8,))
-        self.assertEqual(tuple(fusion_output.modality_ids.shape), (8,))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 25, 16))
+        self.assertEqual(tuple(fusion_output.time_ids.shape), (24,))
+        self.assertEqual(tuple(fusion_output.modality_ids.shape), (24,))
         self.assertEqual(fusion_output.modality_names, ("rgb", "rppg"))
-        self.assertTrue(torch.equal(fusion_output.time_ids, torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])))
-        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0, 0, 0, 0, 4, 4, 4, 4])))
-        self.assertEqual(debug["token_bank_shape"], (1, 8, 16))
-        self.assertEqual(debug["modality_token_counts"], {"rgb": 4, "rppg": 4})
+        self.assertTrue(
+            torch.equal(
+                fusion_output.time_ids,
+                torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            )
+        )
+        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0] * 8 + [4] * 16)))
+        self.assertEqual(debug["token_bank_shape"], (1, 24, 16))
+        self.assertEqual(debug["modality_token_counts"], {"rgb": 8, "rppg": 16})
         self.assertEqual(debug["cls_token_shape"], (1, 16))
-        self.assertEqual(debug["fused_tokens_shape"], (1, 9, 16))
+        self.assertEqual(debug["fused_tokens_shape"], (1, 25, 16))
 
     def test_fuse_selected_modalities_uses_stable_subset_modality_ids(self):
         registry = build_registry(dim=8)
@@ -231,9 +266,9 @@ class RegistryTest(unittest.TestCase):
 
     def test_fuse_selected_modalities_supports_mixed_token_layouts(self):
         registry = build_registry(dim=12)
-        fusion_module = self.build_test_fusion(dim=12, max_time_steps=3)
+        fusion_module = self.build_test_fusion(dim=12, max_time_steps=8)
         batch = {
-            "rgb_features": torch.randn(1, 3, 512),
+            "rgb_features": torch.randn(1, 8, 768),
             "fau_features": torch.randn(1, 3, 2, 20),
         }
 
@@ -245,15 +280,27 @@ class RegistryTest(unittest.TestCase):
             fusion_module,
         )
 
-        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 9, 12))
-        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 10, 12))
-        self.assertEqual(debug["modality_token_counts"], {"rgb": 3, "fau": 6})
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 14, 12))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 15, 12))
+        self.assertEqual(debug["modality_token_counts"], {"rgb": 8, "fau": 6})
         self.assertTrue(
             torch.equal(
                 fusion_output.time_ids,
-                torch.tensor([0, 1, 2, 0, 0, 1, 1, 2, 2]),
+                torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 0, 1, 1, 2, 2]),
             )
         )
+
+    def test_build_local_encoders_requires_rgb_checkpoint(self):
+        config = {
+            "frames": 16,
+            "image_size": 224,
+            "rgb": {"checkpoint_path": None},
+            "fau": {"backbone": "swin_transformer_tiny", "num_classes": 12, "checkpoint_path": None},
+            "rppg": {"checkpoint_path": None},
+        }
+
+        with self.assertRaisesRegex(ValueError, "RGB checkpoint_path is required"):
+            build_local_encoders(config, modalities=("rgb",))
 
     def test_future_non_temporal_modality_can_use_time_zero_tokens(self):
         registry = build_registry(dim=10)

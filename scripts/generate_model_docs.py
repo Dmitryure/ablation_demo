@@ -80,6 +80,12 @@ def modality_node_id(doc: ModalityDoc) -> str:
     return doc.name.replace("-", "_")
 
 
+def rgb_token_count(frames: int) -> int | None:
+    if frames != 16:
+        return None
+    return 8
+
+
 def build_modality_doc(
     name: str,
     config: dict[str, Any],
@@ -90,19 +96,21 @@ def build_modality_doc(
 ) -> ModalityDoc:
     stroke_color, fill_color = MODALITY_COLORS.get(name, DEFAULT_COLOR)
     if name == "rgb":
-        backbone = str(config.get("rgb", {}).get("backbone", "unknown"))
+        backbone = "mvit_v2_s"
+        token_count = rgb_token_count(frames)
+        token_formula = str(token_count) if token_count is not None else "unknown"
         return ModalityDoc(
             name=name,
             title="RGB",
-            encoder_summary=f"{backbone} frame encoder",
-            projector_summary=f"mean spatial tokens -> Linear(*, {dim})",
-            token_formula=str(frames),
-            token_count=frames,
+            encoder_summary=f"{backbone} temporal encoder",
+            projector_summary=f"spatial-mean temporal tokens -> Linear(*, {dim})",
+            token_formula=token_formula,
+            token_count=token_count,
             raw_weight=raw_weight,
             normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
-            note="One token per frame after pooled image features.",
+            note="One token per MViT time step after spatial pooling.",
         )
     if name == "eye_gaze":
         return ModalityDoc(
@@ -204,6 +212,10 @@ def build_modality_docs(config: dict[str, Any]) -> tuple[list[ModalityDoc], dict
 
 def markdown_table_row(columns: list[str]) -> str:
     return "| " + " | ".join(columns) + " |"
+
+
+def dot_label_text(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("->", "→")
 
 
 def render_markdown(
@@ -309,8 +321,9 @@ def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
         node_id = modality_node_id(doc)
         lines.append(
             (
-                f'  {node_id} [label="{doc.title}\\n{doc.encoder_summary}\\n{doc.projector_summary}'
-                f'\\ntokens={doc.token_formula}\\nw={format_float(doc.raw_weight)}'
+                f'  {node_id} [label="{dot_label_text(doc.title)}\\n{dot_label_text(doc.encoder_summary)}'
+                f'\\n{dot_label_text(doc.projector_summary)}\\ntokens={dot_label_text(doc.token_formula)}'
+                f'\\nw={format_float(doc.raw_weight)}'
                 f' (norm {format_float(doc.normalized_weight)})", '
                 f'fillcolor="{doc.fill_color}", color="{doc.stroke_color}"];'
             )
