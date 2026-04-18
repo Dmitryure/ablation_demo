@@ -1,5 +1,28 @@
 from branches import EyeGazeBranch, FAUBranch, ModalityBranch, ModalityOutput, RGBBranch, RPPGBranch
+from dataset import (
+    LabeledVideoDataset,
+    VideoExample,
+    build_real_fake_examples,
+    collate_labeled_video_batch,
+    discover_real_fake_video_paths,
+    load_dataset_manifest,
+    load_video_clip,
+    summarize_examples,
+    write_dataset_manifest,
+)
 from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, FeatureExtractor, RGBExtractor, RPPGExtractor, build_extractors
+from prediction import (
+    ClassifierConfig,
+    ClipRealFakePredictor,
+    PredictionBuildResult,
+    PredictionOutput,
+    TrainingConfig,
+    VideoRealFakeHead,
+    build_binary_classification_loss,
+    build_prediction_model,
+    build_prediction_model_from_yaml,
+    resolve_model_device,
+)
 from registry import (
     CURRENT_MODALITIES,
     FULL_MODALITIES,
@@ -9,6 +32,16 @@ from registry import (
     build_registry,
     registry_required_keys,
     validate_registry,
+)
+from training import (
+    EpochMetrics,
+    LoadedTrainingResult,
+    RunConfig,
+    TrainingResult,
+    load_training_result,
+    train_from_yaml,
+    train_model,
+    validate_model,
 )
 
 __all__ = [
@@ -33,4 +66,31 @@ __all__ = [
     "build_registry",
     "validate_registry",
     "registry_required_keys",
+    "VideoExample",
+    "discover_real_fake_video_paths",
+    "build_real_fake_examples",
+    "summarize_examples",
+    "write_dataset_manifest",
+    "load_dataset_manifest",
+    "load_video_clip",
+    "LabeledVideoDataset",
+    "collate_labeled_video_batch",
+    "PredictionOutput",
+    "ClassifierConfig",
+    "TrainingConfig",
+    "PredictionBuildResult",
+    "VideoRealFakeHead",
+    "ClipRealFakePredictor",
+    "build_binary_classification_loss",
+    "build_prediction_model",
+    "build_prediction_model_from_yaml",
+    "resolve_model_device",
+    "RunConfig",
+    "EpochMetrics",
+    "TrainingResult",
+    "LoadedTrainingResult",
+    "train_model",
+    "train_from_yaml",
+    "validate_model",
+    "load_training_result",
 ]

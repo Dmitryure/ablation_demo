@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping, Tuple
 import torch
 import torch.nn as nn
 
-from extractors.base import FeatureExtractor
+from extractors.base import FeatureExtractor, module_device
 
 
 class FAUExtractor(FeatureExtractor):
@@ -23,7 +23,7 @@ class FAUExtractor(FeatureExtractor):
             raise ValueError(f"`video` must have shape [B, 3, N, H, W], got {tuple(video.shape)}")
 
         batch_size, channels, num_frames, height, width = video.shape
-        frame_batch = video.permute(0, 2, 1, 3, 4).reshape(
+        frame_batch = video.to(module_device(self.encoder)).permute(0, 2, 1, 3, 4).reshape(
             batch_size * num_frames, channels, height, width
         )
         encoded = self.encoder(frame_batch)

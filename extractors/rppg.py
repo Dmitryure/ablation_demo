@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping, Tuple
 import torch
 import torch.nn as nn
 
-from extractors.base import FeatureExtractor
+from extractors.base import FeatureExtractor, module_device
 
 
 class RPPGExtractor(FeatureExtractor):
@@ -22,7 +22,7 @@ class RPPGExtractor(FeatureExtractor):
         if not isinstance(video, torch.Tensor) or video.ndim != 5:
             raise ValueError(f"`video` must have shape [B, 3, N, H, W], got {tuple(video.shape)}")
 
-        encoded = self.encoder(video)
+        encoded = self.encoder(video.to(module_device(self.encoder)))
         if not isinstance(encoded, tuple) or len(encoded) < 2:
             raise ValueError("RPPG encoder must return `(waveform, temporal_features)`")
 

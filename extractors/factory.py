@@ -17,14 +17,12 @@ class ExtractorFactoryResult:
     warnings: tuple[str, ...]
 
 
-def build_extractors(
+def _build_extractors_from_encoder_result(
     config: Mapping[str, Any],
-    modalities: Sequence[str] | None = None,
-) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "fau", "rppg"))
+    enabled: Sequence[str],
+    encoder_result,
+) -> dict[str, FeatureExtractor]:
     enabled_set = set(enabled)
-
-    encoder_result = build_local_encoders(config, modalities=enabled)
     extractors: dict[str, FeatureExtractor] = {}
 
     if "rgb" in enabled_set:
@@ -45,7 +43,36 @@ def build_extractors(
             raise RuntimeError("rPPG encoder was not built for the selected modalities.")
         extractors["rppg"] = RPPGExtractor(encoder_result.rppg_encoder)
 
+    return extractors
+
+
+def build_extractors(
+    config: Mapping[str, Any],
+    modalities: Sequence[str] | None = None,
+) -> ExtractorFactoryResult:
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "fau", "rppg"))
+    encoder_result = build_local_encoders(config, modalities=enabled)
     return ExtractorFactoryResult(
-        extractors=extractors,
+        extractors=_build_extractors_from_encoder_result(
+            config=config,
+            enabled=enabled,
+            encoder_result=encoder_result,
+        ),
+        warnings=encoder_result.warnings,
+    )
+
+
+def build_extractors_from_encoders(
+    config: Mapping[str, Any],
+    encoder_result,
+    modalities: Sequence[str] | None = None,
+) -> ExtractorFactoryResult:
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "fau", "rppg"))
+    return ExtractorFactoryResult(
+        extractors=_build_extractors_from_encoder_result(
+            config=config,
+            enabled=enabled,
+            encoder_result=encoder_result,
+        ),
         warnings=encoder_result.warnings,
     )

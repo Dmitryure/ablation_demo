@@ -204,8 +204,11 @@ def build_modality_docs(config: dict[str, Any]) -> tuple[list[ModalityDoc], dict
         "frames": frames,
         "dim": dim,
         "total_tokens": total_tokens if all_known else None,
+        "device": str(config.get("device", "unknown")),
         "modalities": enabled,
         "fusion": config["fusion"],
+        "classifier": config.get("classifier", {}),
+        "training": config.get("training", {}),
         "dot_available": shutil.which("dot") is not None,
     }
 
@@ -224,6 +227,8 @@ def render_markdown(
     summary: dict[str, Any],
 ) -> str:
     fusion = summary["fusion"]
+    classifier = summary.get("classifier", {})
+    training = summary.get("training", {})
     total_tokens = summary["total_tokens"]
     total_tokens_text = str(total_tokens) if total_tokens is not None else "unknown"
     render_hint = (
@@ -255,8 +260,11 @@ def render_markdown(
         f"- Frames: `{summary['frames']}`",
         f"- Token dim: `{summary['dim']}`",
         f"- Token bank size: `{total_tokens_text}`",
+        f"- Runtime device: `{summary['device']}`",
         f"- Fusion: `TokenBankFusion`, layers=`{fusion['num_layers']}`, heads=`{fusion['num_heads']}`, mlp_ratio=`{fusion['mlp_ratio']}`, max_time_steps=`{fusion['max_time_steps']}`",
         f"- Fusion internals: `CLS token` + `time embedding` + `modality embedding` + `TransformerEncoderLayer x{fusion['num_layers']}` + `LayerNorm`",
+        f"- Classifier: `VideoRealFakeHead`, hidden=`{classifier.get('hidden_dim', 'unknown')}`, dropout=`{classifier.get('dropout', 'unknown')}`",
+        f"- Training defaults: freeze_encoders=`{training.get('freeze_encoders', 'unknown')}`, lr_head=`{training.get('lr_head', 'unknown')}`, lr_fusion=`{training.get('lr_fusion', 'unknown')}`, pos_weight=`{training.get('pos_weight', 'unknown')}`",
         f"- Graphviz status: {render_hint}",
         "",
         "## Modality Summary",
@@ -305,6 +313,7 @@ def render_markdown(
 
 def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
     fusion = summary["fusion"]
+    classifier = summary.get("classifier", {})
     total_tokens = summary["total_tokens"]
     total_tokens_text = str(total_tokens) if total_tokens is not None else "unknown"
     lines = [
@@ -347,7 +356,10 @@ def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
             ),
             '  norm [label="LayerNorm\\noutput_norm", fillcolor="#DCEAF7", color="#295C8A"];',
             f'  cls [label="CLS Output\\n[1 x {summary["dim"]}]", fillcolor="#DCEAF7", color="#295C8A"];',
-            '  head [label="Downstream Head\\nfuture real/fake classifier", fillcolor="#FFFFFF", color="#295C8A", style="rounded,dashed,filled"];',
+            (
+                f'  head [label="VideoRealFakeHead\\nMLP {summary["dim"]}->{classifier.get("hidden_dim", "?")}->1'
+                f'\\ndropout={classifier.get("dropout", "?")}", fillcolor="#FFFFFF", color="#295C8A", style="rounded,dashed,filled"];'
+            ),
             "",
             "  { rank=same; video; " + "; ".join(modality_node_id(doc) for doc in docs) + "; }",
             "  { rank=same; bank; time; cls_in; modality; }",

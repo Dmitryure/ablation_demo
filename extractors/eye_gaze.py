@@ -132,6 +132,13 @@ class EyeGazeExtractor(FeatureExtractor):
         frames_rgb = batch["video_rgb_frames"]
         if not isinstance(frames_rgb, Sequence) or isinstance(frames_rgb, (str, bytes)):
             raise ValueError("`video_rgb_frames` must be a sequence of RGB frame arrays.")
+        if frames_rgb and isinstance(frames_rgb[0], Sequence) and not isinstance(frames_rgb[0], np.ndarray):
+            return {
+                "eye_gaze": torch.stack(
+                    [self.extract_tensor(clip_frames) for clip_frames in frames_rgb],
+                    dim=0,
+                ),
+            }
         return {
             "eye_gaze": self.extract_tensor(frames_rgb).unsqueeze(0),
         }
