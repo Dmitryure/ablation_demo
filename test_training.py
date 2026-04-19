@@ -10,6 +10,7 @@ from unittest.mock import patch
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES
 from fusion import FusionOutput
 from prediction import PredictionBuildResult, PredictionOutput, TrainingConfig
 from test_prediction import build_test_predictor
@@ -19,11 +20,11 @@ from training import RunConfig, load_training_result, train_model, validate_mode
 def build_test_config() -> dict[str, Any]:
     return {
         "device": "cpu",
-        "modalities": ["rgb", "fau", "rppg", "eye_gaze"],
+        "modalities": ["rgb", "fau", "rppg", "eye_gaze", "face_mesh"],
         "frames": 16,
         "image_size": 224,
         "dim": 16,
-        "modality_weights": {"rgb": 1.0, "fau": 1.0, "rppg": 1.0, "eye_gaze": 1.0},
+        "modality_weights": {"rgb": 1.0, "fau": 1.0, "rppg": 1.0, "eye_gaze": 1.0, "face_mesh": 1.0},
         "fusion": {
             "type": "token_transformer",
             "num_layers": 2,
@@ -55,6 +56,7 @@ def build_test_config() -> dict[str, Any]:
             "checkpoint_path": None,
         },
         "eye_gaze": {},
+        "face_mesh": {},
         "seed": 0,
     }
 
@@ -68,6 +70,7 @@ class PrecomputedFeatureDataset(Dataset[dict[str, Any]]):
                 "fau_features": polarity[index].view(1, 1, 1).repeat(16, 12, 10),
                 "rppg_features": polarity[index].view(1, 1).repeat(16, 9),
                 "eye_gaze": polarity[index].view(1, 1).repeat(16, 8),
+                "face_mesh": polarity[index].view(1, 1, 1).repeat(16, len(FACE_MESH_CONTOUR_INDICES), 3),
                 "label": labels[index].view(1),
             }
             for index in range(labels.shape[0])

@@ -18,11 +18,19 @@ from dataset import (
     write_dataset_manifest,
 )
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
+from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.rgb import RGBExtractor
 
 
 def fake_eye_gaze_detector(_: np.ndarray) -> dict[str, float]:
     return {name: float(index) / 10.0 for index, name in enumerate(EYE_GAZE_COLUMNS, start=1)}
+
+
+def fake_face_mesh_detector(_: np.ndarray) -> np.ndarray:
+    points = np.zeros((len(FACE_MESH_CONTOUR_INDICES), 3), dtype=np.float32)
+    for index in range(points.shape[0]):
+        points[index] = (index / 100.0, index / 200.0, -index / 300.0)
+    return points
 
 
 class DummyRGBEncoder(torch.nn.Module):
@@ -111,6 +119,17 @@ class DatasetTest(unittest.TestCase):
         output = extractor.extract({"video_rgb_frames": [clip, clip]})
 
         self.assertEqual(tuple(output["eye_gaze"].shape), (2, 4, 8))
+
+    def test_face_mesh_extractor_supports_batched_clip_sequences(self):
+        extractor = FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)
+        clip = [np.zeros((6, 6, 3), dtype=np.uint8) for _ in range(4)]
+
+        output = extractor.extract({"video_rgb_frames": [clip, clip]})
+
+        self.assertEqual(
+            tuple(output["face_mesh"].shape),
+            (2, 4, len(FACE_MESH_CONTOUR_INDICES), 3),
+        )
 
     def test_dataset_can_use_stubbed_video_loader(self):
         dataset = LabeledVideoDataset(

@@ -16,6 +16,7 @@ DEFAULT_DOCS_DIR = PROJECT_ROOT / "docs"
 MODALITY_COLORS: dict[str, tuple[str, str]] = {
     "rgb": ("#E4572E", "#F6C4B7"),
     "eye_gaze": ("#4C956C", "#C8E5D5"),
+    "face_mesh": ("#F4A261", "#FCE1C8"),
     "fau": ("#2E86AB", "#BFDBE8"),
     "rppg": ("#7B5EA7", "#D9CCE9"),
 }
@@ -125,6 +126,21 @@ def build_modality_doc(
             stroke_color=stroke_color,
             fill_color=fill_color,
             note="Eight blendshape eye-look values per frame.",
+        )
+    if name == "face_mesh":
+        contour_points = 36
+        return ModalityDoc(
+            name=name,
+            title="Face Mesh",
+            encoder_summary="MediaPipe face landmarker contour points",
+            projector_summary=f"36 contour landmarks x (x,y,z) -> point MLP -> {dim} -> flatten",
+            token_formula=f"{frames} x {contour_points}",
+            token_count=frames * contour_points,
+            raw_weight=raw_weight,
+            normalized_weight=normalized_weight,
+            stroke_color=stroke_color,
+            fill_color=fill_color,
+            note="One token per face-oval contour point per frame.",
         )
     if name == "fau":
         fau_config = config.get("fau", {})

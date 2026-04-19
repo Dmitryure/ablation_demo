@@ -8,6 +8,11 @@ import numpy as np
 import torch
 
 from extractors.base import FeatureExtractor
+from extractors.mediapipe_face_landmarker import (
+    create_face_landmarker,
+    optional_model_path,
+    resolve_face_landmarker_model_path,
+)
 
 
 EYE_GAZE_COLUMNS: tuple[str, ...] = (
@@ -20,50 +25,6 @@ EYE_GAZE_COLUMNS: tuple[str, ...] = (
     "eyeLookUpLeft",
     "eyeLookUpRight",
 )
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "face_landmarker_v2_with_blendshapes.task"
-DEFAULT_MODEL_CANDIDATES: tuple[Path, ...] = (
-    DEFAULT_MODEL_PATH,
-    Path("/models/face_landmarker_v2_with_blendshapes.task"),
-)
-
-
-def _optional_path(config: Mapping[str, Any], key: str) -> Path | None:
-    value = config.get(key)
-    if value is None:
-        return None
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return None
-        return Path(stripped)
-    raise ValueError(f"`{key}` must be a string path or null.")
-
-
-def _import_mediapipe() -> Any:
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
-    try:
-        import mediapipe as mp
-    except ImportError as exc:
-        raise RuntimeError(
-            "Eye-gaze extraction requires `mediapipe` in this repo's active environment."
-        ) from exc
-    return mp
-
-
-def _resolve_model_path(model_path: Path | None) -> Path:
-    if model_path is not None:
-        if not model_path.exists():
-            raise FileNotFoundError(f"Eye-gaze model path does not exist: {model_path}")
-        return model_path
-
-    for candidate in DEFAULT_MODEL_CANDIDATES:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(
-        "Could not find `face_landmarker_v2_with_blendshapes.task`. "
-        "Set `eye_gaze.model_path` in the YAML config."
-    )
 
 
 class EyeGazeExtractor(FeatureExtractor):
@@ -80,21 +41,13 @@ class EyeGazeExtractor(FeatureExtractor):
             self._detect_features = detect_features_fn
             return
 
-        self.model_path = _resolve_model_path(Path(model_path) if isinstance(model_path, str) else model_path)
-        mp = _import_mediapipe()
-        from mediapipe.tasks import python
-        from mediapipe.tasks.python import vision
-
-        base_options = python.BaseOptions(model_asset_path=str(self.model_path))
-        options = vision.FaceLandmarkerOptions(
-            base_options=base_options,
-            output_face_blendshapes=True,
-            output_facial_transformation_matrixes=False,
-            min_face_detection_confidence=0.7,
-            num_faces=2,
+        self.model_path = resolve_face_landmarker_model_path(
+            Path(model_path) if isinstance(model_path, str) else model_path
         )
-        self._mp = mp
-        self._landmarker = vision.FaceLandmarker.create_from_options(options)
+        self._mp, self._landmarker = create_face_landmarker(
+            self.model_path,
+            output_face_blendshapes=True,
+        )
 
         def detect_features(frame_rgb: np.ndarray) -> Mapping[str, float] | None:
             mp_image = self._mp.Image(
@@ -157,5 +110,5 @@ def build_eye_gaze_extractor(config: Mapping[str, Any]) -> EyeGazeExtractor:
         raise ValueError("`eye_gaze` must be a YAML mapping when provided.")
 
     return EyeGazeExtractor(
-        model_path=_optional_path(eye_gaze_config, "model_path"),
+        model_path=optional_model_path(eye_gaze_config, "model_path"),
     )

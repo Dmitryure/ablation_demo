@@ -4,7 +4,7 @@ from typing import Dict, Tuple
 
 import torch.nn as nn
 
-from branches import EyeGazeBranch, FAUBranch, ModalityBranch, RGBBranch, RPPGBranch
+from branches import EyeGazeBranch, FAUBranch, FaceMeshBranch, ModalityBranch, RGBBranch, RPPGBranch
 
 
 FULL_MODALITIES: Tuple[str, ...] = (
@@ -21,7 +21,7 @@ FULL_MODALITIES: Tuple[str, ...] = (
 
 MODALITY_TO_ID = {name: index for index, name in enumerate(FULL_MODALITIES)}
 
-CURRENT_MODALITIES: Tuple[str, ...] = ("rgb", "eye_gaze", "fau", "rppg")
+CURRENT_MODALITIES: Tuple[str, ...] = ("rgb", "eye_gaze", "face_mesh", "fau", "rppg")
 PENDING_MODALITIES: Tuple[str, ...] = tuple(
     modality for modality in FULL_MODALITIES if modality not in CURRENT_MODALITIES
 )
@@ -33,6 +33,7 @@ def build_registry(dim: int) -> nn.ModuleDict:
         {
             "rgb": RGBBranch(dim=dim),
             "eye_gaze": EyeGazeBranch(dim=dim),
+            "face_mesh": FaceMeshBranch(dim=dim),
             "fau": FAUBranch(dim=dim),
             "rppg": RPPGBranch(dim=dim),
         }

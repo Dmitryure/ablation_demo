@@ -1,4 +1,4 @@
-from branches import EyeGazeBranch, FAUBranch, ModalityBranch, ModalityOutput, RGBBranch, RPPGBranch
+from branches import EyeGazeBranch, FAUBranch, FaceMeshBranch, ModalityBranch, ModalityOutput, RGBBranch, RPPGBranch
 from dataset import (
     LabeledVideoDataset,
     VideoExample,
@@ -10,7 +10,17 @@ from dataset import (
     summarize_examples,
     write_dataset_manifest,
 )
-from extractors import EYE_GAZE_COLUMNS, EyeGazeExtractor, FAUExtractor, FeatureExtractor, RGBExtractor, RPPGExtractor, build_extractors
+from extractors import (
+    EYE_GAZE_COLUMNS,
+    FACE_MESH_CONTOUR_INDICES,
+    EyeGazeExtractor,
+    FAUExtractor,
+    FaceMeshExtractor,
+    FeatureExtractor,
+    RGBExtractor,
+    RPPGExtractor,
+    build_extractors,
+)
 from prediction import (
     ClassifierConfig,
     ClipRealFakePredictor,
@@ -54,13 +64,16 @@ __all__ = [
     "ModalityOutput",
     "RGBBranch",
     "EyeGazeBranch",
+    "FaceMeshBranch",
     "FAUBranch",
     "FeatureExtractor",
     "RGBExtractor",
     "FAUExtractor",
     "RPPGExtractor",
     "EyeGazeExtractor",
+    "FaceMeshExtractor",
     "EYE_GAZE_COLUMNS",
+    "FACE_MESH_CONTOUR_INDICES",
     "build_extractors",
     "RPPGBranch",
     "build_registry",

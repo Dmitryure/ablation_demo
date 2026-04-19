@@ -206,7 +206,7 @@ def validate_selected_modalities(
     unsupported = [name for name in enabled_modalities if name not in supported_modalities]
     if unsupported:
         raise ValueError(
-            "This smoke script currently supports only rgb, eye_gaze, fau, and rppg, "
+            "This smoke script currently supports only rgb, eye_gaze, face_mesh, fau, and rppg, "
             f"got unsupported modalities: {unsupported}"
         )
 

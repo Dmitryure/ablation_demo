@@ -1,5 +1,6 @@
 from extractors.base import FeatureExtractor
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor, build_eye_gaze_extractor
+from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor, build_face_mesh_extractor
 from extractors.factory import ExtractorFactoryResult, build_extractors, build_extractors_from_encoders
 from extractors.fau import FAUExtractor
 from extractors.rgb import RGBExtractor
@@ -7,13 +8,16 @@ from extractors.rppg import RPPGExtractor
 
 __all__ = [
     "EYE_GAZE_COLUMNS",
+    "FACE_MESH_CONTOUR_INDICES",
     "ExtractorFactoryResult",
     "FAUExtractor",
     "FeatureExtractor",
     "EyeGazeExtractor",
+    "FaceMeshExtractor",
     "RGBExtractor",
     "RPPGExtractor",
     "build_extractors",
     "build_extractors_from_encoders",
     "build_eye_gaze_extractor",
+    "build_face_mesh_extractor",
 ]

@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
+from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.factory import ExtractorFactoryResult
 from extractors.fau import FAUExtractor
 from extractors.rgb import RGBExtractor
@@ -28,6 +29,13 @@ from encoders.factory import EncoderFactoryResult
 
 def fake_eye_gaze_detector(_: np.ndarray) -> dict[str, float]:
     return {name: float(index) / 10.0 for index, name in enumerate(EYE_GAZE_COLUMNS, start=1)}
+
+
+def fake_face_mesh_detector(_: np.ndarray) -> np.ndarray:
+    points = np.zeros((len(FACE_MESH_CONTOUR_INDICES), 3), dtype=np.float32)
+    for index in range(points.shape[0]):
+        points[index] = (index / 100.0, index / 200.0, -index / 300.0)
+    return points
 
 
 class ParameterizedDummyRGBEncoder(nn.Module):
@@ -77,7 +85,7 @@ class ParameterizedDummyRPPGEncoder(nn.Module):
 
 def build_test_predictor(
     dim: int = 16,
-    enabled_modalities: tuple[str, ...] = ("rgb", "fau", "rppg", "eye_gaze"),
+    enabled_modalities: tuple[str, ...] = ("rgb", "fau", "rppg", "eye_gaze", "face_mesh"),
     freeze_encoders: bool = True,
 ) -> ClipRealFakePredictor:
     rgb_encoder = ParameterizedDummyRGBEncoder()
@@ -88,6 +96,7 @@ def build_test_predictor(
         "fau": FAUExtractor(fau_encoder),
         "rppg": RPPGExtractor(rppg_encoder),
         "eye_gaze": EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector),
+        "face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector),
     }
     model = ClipRealFakePredictor(
         registry=build_registry(dim=dim),
@@ -135,8 +144,8 @@ class PredictionModelTest(unittest.TestCase):
         self.assertEqual(tuple(output.probs.shape), (1, 1))
         self.assertTrue(torch.all(output.probs >= 0.0))
         self.assertTrue(torch.all(output.probs <= 1.0))
-        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 232, 16))
-        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 233, 16))
+        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 808, 16))
+        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 809, 16))
 
     def test_gradient_flow_skips_frozen_encoders_but_updates_fusion_and_head(self):
         model = build_test_predictor(freeze_encoders=True)
@@ -159,21 +168,25 @@ class PredictionModelTest(unittest.TestCase):
         self.assertIsNotNone(model.registry["fau"].proj.weight.grad)
         self.assertIsNotNone(model.registry["rppg"].proj.weight.grad)
         self.assertIsNotNone(model.registry["eye_gaze"].proj[0].weight.grad)
+        self.assertIsNotNone(model.registry["face_mesh"].proj[0].weight.grad)
         self.assertIsNone(model.encoder_modules["rgb"].scale.grad)
         self.assertIsNone(model.encoder_modules["fau"].scale.grad)
         self.assertIsNone(model.encoder_modules["rppg"].scale.grad)
 
     def test_modality_subset_keeps_stable_ids_and_expected_token_count(self):
-        model = build_test_predictor(enabled_modalities=("eye_gaze", "rppg"))
+        model = build_test_predictor(enabled_modalities=("face_mesh", "rppg"))
 
         output = model(build_raw_batch())
 
-        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 32, 16))
-        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 33, 16))
+        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 592, 16))
+        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 593, 16))
         self.assertTrue(
             torch.equal(
                 output.fusion_output.modality_ids,
-                torch.tensor([MODALITY_TO_ID["eye_gaze"]] * 16 + [MODALITY_TO_ID["rppg"]] * 16),
+                torch.tensor(
+                    [MODALITY_TO_ID["face_mesh"]] * (16 * len(FACE_MESH_CONTOUR_INDICES))
+                    + [MODALITY_TO_ID["rppg"]] * 16
+                ),
             )
         )
 
@@ -196,6 +209,7 @@ class PredictionModelTest(unittest.TestCase):
             "fau_features": polarity.view(8, 1, 1, 1).repeat(1, 16, 12, 10),
             "rppg_features": polarity.view(8, 1, 1).repeat(1, 16, 9),
             "eye_gaze": polarity.view(8, 1, 1).repeat(1, 16, 8),
+            "face_mesh": polarity.view(8, 1, 1, 1).repeat(1, 16, len(FACE_MESH_CONTOUR_INDICES), 3),
         }
 
         model.train()
@@ -227,11 +241,11 @@ class PredictionModelTest(unittest.TestCase):
     def test_build_prediction_model_moves_modules_to_requested_cpu_device(self):
         config = {
             "device": "cpu",
-            "modalities": ["eye_gaze"],
+            "modalities": ["face_mesh"],
             "frames": 16,
             "image_size": 224,
             "dim": 16,
-            "modality_weights": {"eye_gaze": 1.0},
+            "modality_weights": {"face_mesh": 1.0},
             "fusion": {
                 "type": "token_transformer",
                 "num_layers": 2,
@@ -263,6 +277,7 @@ class PredictionModelTest(unittest.TestCase):
                 "checkpoint_path": None,
             },
             "eye_gaze": {},
+            "face_mesh": {},
         }
 
         encoder_result = EncoderFactoryResult(
@@ -272,13 +287,13 @@ class PredictionModelTest(unittest.TestCase):
             warnings=(),
         )
         extractors_result = ExtractorFactoryResult(
-            extractors={"eye_gaze": EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector)},
+            extractors={"face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)},
             warnings=(),
         )
         with patch("prediction.build_local_encoders", return_value=encoder_result), patch(
             "prediction.build_extractors_from_encoders", return_value=extractors_result
         ):
-            build_result = build_prediction_model(config, modalities=("eye_gaze",))
+            build_result = build_prediction_model(config, modalities=("face_mesh",))
 
         self.assertEqual(str(build_result.device), "cpu")
         self.assertEqual(str(next(build_result.model.parameters()).device), "cpu")

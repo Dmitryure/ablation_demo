@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 from encoders import build_local_encoders
 from extractors.base import FeatureExtractor
 from extractors.eye_gaze import build_eye_gaze_extractor
+from extractors.face_mesh import build_face_mesh_extractor
 from extractors.fau import FAUExtractor
 from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
@@ -34,6 +35,8 @@ def _build_extractors_from_encoder_result(
         )
     if "eye_gaze" in enabled_set:
         extractors["eye_gaze"] = build_eye_gaze_extractor(config)
+    if "face_mesh" in enabled_set:
+        extractors["face_mesh"] = build_face_mesh_extractor(config)
     if "fau" in enabled_set:
         if encoder_result.fau_encoder is None:
             raise RuntimeError("FAU encoder was not built for the selected modalities.")
@@ -50,7 +53,7 @@ def build_extractors(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "fau", "rppg"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg"))
     encoder_result = build_local_encoders(config, modalities=enabled)
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
@@ -67,7 +70,7 @@ def build_extractors_from_encoders(
     encoder_result,
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "fau", "rppg"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg"))
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
             config=config,
