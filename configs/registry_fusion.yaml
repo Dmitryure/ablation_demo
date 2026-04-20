@@ -4,6 +4,7 @@ modalities:
   - fau
   - rppg
   - eye_gaze
+  - face_mesh
 frames: 16
 image_size: 224
 dim: 128
