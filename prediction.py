@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import yaml
 
+from branches.compression import validate_branch_token_config
 from encoders import EncoderFactoryResult, build_local_encoders
 from extractors import FeatureExtractor, build_extractors_from_encoders
 from fusion import FusionOutput, TokenBankFusion, prepare_token_bank
@@ -409,6 +410,12 @@ def build_prediction_model(
     modality_weights = _require_modality_weights(config, enabled_modalities)
     classifier_config = require_classifier_config(config)
     training_config = require_training_config(config)
+    fusion_config = _require_mapping(config, "fusion")
+    validate_branch_token_config(
+        config,
+        modalities=enabled_modalities,
+        fusion_max_time_steps=_require_int(fusion_config, "max_time_steps"),
+    )
 
     encoder_result = build_local_encoders(config, modalities=enabled_modalities)
     extractors_result = build_extractors_from_encoders(
@@ -419,10 +426,10 @@ def build_prediction_model(
     fusion_module = build_fusion_from_config(config)
     load_fusion_checkpoint(
         fusion_module=fusion_module,
-        checkpoint_path=_optional_path(_require_mapping(config, "fusion"), "checkpoint_path"),
+        checkpoint_path=_optional_path(fusion_config, "checkpoint_path"),
     )
     model = ClipRealFakePredictor(
-        registry=build_registry(dim=dim),
+        registry=build_registry(dim=dim, config=config),
         fusion_module=fusion_module,
         classifier_head=VideoRealFakeHead(
             input_dim=dim,

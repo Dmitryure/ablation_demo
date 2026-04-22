@@ -133,27 +133,35 @@ Projects `rgb_features` into `[B, N_rgb, dim]`.
 
 #### Eye Gaze Branch
 
-Projects per-frame gaze features into `[B, T, dim]`.
+Projects per-frame gaze features, adds temporal positional encoding, then applies learned
+latent-query temporal pooling into
+`[B, output_tokens_per_clip, dim]`.
+With the current config, this is `[B, 4, dim]`.
 
 - [branches/eye_gaze.py](/home/comp/ablation_task/branches/eye_gaze.py:59)
 
 #### rPPG Branch
 
-Projects temporal rPPG features into `[B, T, dim]`.
+Projects temporal rPPG features, adds temporal positional encoding, then applies learned
+latent-query temporal pooling into
+`[B, output_tokens_per_clip, dim]`.
+With the current config, this is `[B, 4, dim]`.
 
 - [branches/rppg.py](/home/comp/ablation_task/branches/rppg.py:181)
 
 #### FAU Branch
 
-Projects `[B, T, num_au, F]` and reshapes it into `[B, T * num_au, dim]`.
-This creates one token per AU per frame.
+Projects `[B, T, num_au, F]`, pools AU tokens inside each frame with learned latent queries,
+then reshapes into `[B, T * output_tokens_per_frame, dim]`.
+With the current config, this is `[B, T * 2, dim]`.
 
 - [branches/fau.py](/home/comp/ablation_task/branches/fau.py:133)
 
 #### Face Mesh Branch
 
-Projects `[B, T, num_points, 3]` and reshapes it into `[B, T * num_points, dim]`.
-This creates one token per point per frame.
+Projects `[B, T, num_points, 3]`, pools point tokens inside each frame with learned latent queries,
+then reshapes into `[B, T * output_tokens_per_frame, dim]`.
+With the current config, this is `[B, T, dim]`.
 
 - [branches/face_mesh.py](/home/comp/ablation_task/branches/face_mesh.py:94)
 
@@ -185,13 +193,15 @@ This is the token bank:
 Example mental model:
 
 ```text
-RGB tokens
-+ FAU tokens
-+ rPPG tokens
-+ Eye Gaze tokens
-+ Face Mesh tokens
+RGB: 8
++ FAU: 32
++ rPPG: 4
++ Eye Gaze: 4
++ Face Mesh: 16
 = token bank
 ```
+
+With the current YAML defaults, the token bank has `64` tokens per 16-frame clip.
 
 ### 6. Fusion Transformer
 

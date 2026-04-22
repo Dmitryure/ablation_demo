@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import yaml
 
+from branches.compression import validate_branch_token_config
 from extractors import FeatureExtractor, build_extractors
 from fusion import FusionOutput, TokenBankFusion, prepare_token_bank
 from registry import CURRENT_MODALITIES, MODALITY_TO_ID, build_registry
@@ -294,12 +295,17 @@ def main() -> None:
     fusion_config = require_fusion_config(config)
 
     validate_selected_modalities(enabled_modalities)
+    validate_branch_token_config(
+        config,
+        modalities=enabled_modalities,
+        fusion_max_time_steps=fusion_config.max_time_steps,
+    )
     modality_weights = require_modality_weights(config, enabled_modalities)
 
     torch.manual_seed(seed)
 
     extractor_result = build_extractors(config, modalities=enabled_modalities)
-    registry = build_registry(dim=dim)
+    registry = build_registry(dim=dim, config=config)
     fusion_module = build_fusion_module(dim=dim, fusion_config=fusion_config)
     fusion_checkpoint_loaded = load_fusion_checkpoint(
         fusion_module=fusion_module,

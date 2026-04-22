@@ -144,8 +144,8 @@ class PredictionModelTest(unittest.TestCase):
         self.assertEqual(tuple(output.probs.shape), (1, 1))
         self.assertTrue(torch.all(output.probs >= 0.0))
         self.assertTrue(torch.all(output.probs <= 1.0))
-        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 808, 16))
-        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 809, 16))
+        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 64, 16))
+        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 65, 16))
 
     def test_gradient_flow_skips_frozen_encoders_but_updates_fusion_and_head(self):
         model = build_test_predictor(freeze_encoders=True)
@@ -178,14 +178,13 @@ class PredictionModelTest(unittest.TestCase):
 
         output = model(build_raw_batch())
 
-        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 592, 16))
-        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 593, 16))
+        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 20, 16))
+        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 21, 16))
         self.assertTrue(
             torch.equal(
                 output.fusion_output.modality_ids,
                 torch.tensor(
-                    [MODALITY_TO_ID["face_mesh"]] * (16 * len(FACE_MESH_CONTOUR_INDICES))
-                    + [MODALITY_TO_ID["rppg"]] * 16
+                    [MODALITY_TO_ID["face_mesh"]] * 16 + [MODALITY_TO_ID["rppg"]] * 4
                 ),
             )
         )
@@ -277,7 +276,7 @@ class PredictionModelTest(unittest.TestCase):
                 "checkpoint_path": None,
             },
             "eye_gaze": {},
-            "face_mesh": {},
+            "face_mesh": {"output_tokens_per_frame": 2},
         }
 
         encoder_result = EncoderFactoryResult(
@@ -297,7 +296,54 @@ class PredictionModelTest(unittest.TestCase):
 
         self.assertEqual(str(build_result.device), "cpu")
         self.assertEqual(str(next(build_result.model.parameters()).device), "cpu")
+        self.assertEqual(build_result.model.registry["face_mesh"].output_tokens_per_frame, 2)
         build_result.model.close()
+
+    def test_build_prediction_model_rejects_fusion_max_time_step_mismatch(self):
+        config = {
+            "device": "cpu",
+            "modalities": ["rppg"],
+            "frames": 16,
+            "image_size": 224,
+            "dim": 16,
+            "modality_weights": {"rppg": 1.0},
+            "fusion": {
+                "type": "token_transformer",
+                "num_layers": 2,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+                "dropout": 0.0,
+                "max_time_steps": 3,
+                "checkpoint_path": None,
+            },
+            "classifier": {
+                "hidden_dim": 16,
+                "dropout": 0.1,
+            },
+            "training": {
+                "freeze_encoders": True,
+                "lr_head": 1e-3,
+                "lr_fusion": 1e-4,
+                "pos_weight": 1.0,
+            },
+            "rgb": {
+                "checkpoint_path": "/tmp/unused-rgb-checkpoint.pth",
+            },
+            "fau": {
+                "backbone": "swin_transformer_tiny",
+                "num_classes": 12,
+                "checkpoint_path": None,
+            },
+            "rppg": {
+                "checkpoint_path": None,
+                "output_tokens_per_clip": 4,
+            },
+            "eye_gaze": {},
+            "face_mesh": {},
+        }
+
+        with self.assertRaisesRegex(ValueError, "fusion.max_time_steps"):
+            build_prediction_model(config, modalities=("rppg",))
 
 
 if __name__ == "__main__":

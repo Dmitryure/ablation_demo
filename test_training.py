@@ -51,12 +51,14 @@ def build_test_config() -> dict[str, Any]:
             "backbone": "swin_transformer_tiny",
             "num_classes": 12,
             "checkpoint_path": None,
+            "output_tokens_per_frame": 2,
         },
         "rppg": {
             "checkpoint_path": None,
+            "output_tokens_per_clip": 4,
         },
-        "eye_gaze": {},
-        "face_mesh": {},
+        "eye_gaze": {"output_tokens_per_clip": 4},
+        "face_mesh": {"output_tokens_per_frame": 1},
         "seed": 0,
     }
 

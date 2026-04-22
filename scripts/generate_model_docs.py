@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
 DEFAULT_DOCS_DIR = PROJECT_ROOT / "docs"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from branches.compression import resolve_output_token_count
 
 MODALITY_COLORS: dict[str, tuple[str, str]] = {
     "rgb": ("#E4572E", "#F6C4B7"),
@@ -114,64 +118,68 @@ def build_modality_doc(
             note="One token per MViT time step after spatial pooling.",
         )
     if name == "eye_gaze":
+        token_count = resolve_output_token_count(config, "eye_gaze")
         return ModalityDoc(
             name=name,
             title="Eye Gaze",
             encoder_summary="MediaPipe face landmarker",
-            projector_summary=f"8 gaze blendshapes -> MLP -> {dim}",
-            token_formula=str(frames),
-            token_count=frames,
+            projector_summary=f"8 gaze blendshapes -> MLP -> temporal position encoding -> latent-query pool -> {dim}",
+            token_formula=str(token_count),
+            token_count=token_count,
             raw_weight=raw_weight,
             normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
-            note="Eight blendshape eye-look values per frame.",
+            note="Per-frame gaze features compressed to a fixed clip token budget with order-aware pooling.",
         )
     if name == "face_mesh":
         contour_points = 36
+        output_tokens_per_frame = resolve_output_token_count(config, "face_mesh")
         return ModalityDoc(
             name=name,
             title="Face Mesh",
             encoder_summary="MediaPipe face landmarker contour points",
-            projector_summary=f"36 contour landmarks x (x,y,z) -> point MLP -> {dim} -> flatten",
-            token_formula=f"{frames} x {contour_points}",
-            token_count=frames * contour_points,
+            projector_summary=f"36 contour landmarks x (x,y,z) -> point MLP -> latent-query pool -> {dim}",
+            token_formula=f"{frames} x {output_tokens_per_frame}",
+            token_count=frames * output_tokens_per_frame,
             raw_weight=raw_weight,
             normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
-            note="One token per face-oval contour point per frame.",
+            note=f"{contour_points} contour points compressed to {output_tokens_per_frame} tokens per frame.",
         )
     if name == "fau":
         fau_config = config.get("fau", {})
         backbone = str(fau_config.get("backbone", "unknown"))
         num_classes = int(fau_config.get("num_classes", 12))
+        output_tokens_per_frame = resolve_output_token_count(config, "fau")
         return ModalityDoc(
             name=name,
             title="FAU",
             encoder_summary=f"{backbone} + ME-GraphAU",
-            projector_summary=f"AU graph features -> Linear(*, {dim}) -> flatten",
-            token_formula=f"{frames} x {num_classes}",
-            token_count=frames * num_classes,
+            projector_summary=f"AU graph features -> Linear(*, {dim}) -> latent-query pool -> flatten",
+            token_formula=f"{frames} x {output_tokens_per_frame}",
+            token_count=frames * output_tokens_per_frame,
             raw_weight=raw_weight,
             normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
-            note="One token per AU per frame.",
+            note=f"{num_classes} AU features compressed to {output_tokens_per_frame} tokens per frame.",
         )
     if name == "rppg":
+        token_count = resolve_output_token_count(config, "rppg")
         return ModalityDoc(
             name=name,
             title="rPPG",
             encoder_summary="PhysNet temporal encoder",
-            projector_summary=f"waveform + temporal features -> Linear(*, {dim})",
-            token_formula=str(frames),
-            token_count=frames,
+            projector_summary=f"waveform + temporal features -> Linear(*, {dim}) -> temporal position encoding -> latent-query pool",
+            token_formula=str(token_count),
+            token_count=token_count,
             raw_weight=raw_weight,
             normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
-            note="Temporal tokens plus raw waveform side output.",
+            note="Temporal features compressed to a fixed clip token budget with order-aware pooling plus raw waveform side output.",
         )
     return ModalityDoc(
         name=name,

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Any, Dict, Mapping, Tuple
 
 import torch.nn as nn
 
 from branches import EyeGazeBranch, FAUBranch, FaceMeshBranch, ModalityBranch, RGBBranch, RPPGBranch
+from branches.compression import resolve_output_token_count, validate_branch_token_config
 
 
 FULL_MODALITIES: Tuple[str, ...] = (
@@ -28,14 +29,27 @@ PENDING_MODALITIES: Tuple[str, ...] = tuple(
 SUPPORTED_FRAME_COUNTS: Tuple[int, ...] = (16, 32, 64)
 
 
-def build_registry(dim: int) -> nn.ModuleDict:
+def build_registry(dim: int, config: Mapping[str, Any] | None = None) -> nn.ModuleDict:
+    validate_branch_token_config(config, modalities=CURRENT_MODALITIES)
     return nn.ModuleDict(
         {
             "rgb": RGBBranch(dim=dim),
-            "eye_gaze": EyeGazeBranch(dim=dim),
-            "face_mesh": FaceMeshBranch(dim=dim),
-            "fau": FAUBranch(dim=dim),
-            "rppg": RPPGBranch(dim=dim),
+            "eye_gaze": EyeGazeBranch(
+                dim=dim,
+                output_tokens_per_clip=resolve_output_token_count(config, "eye_gaze"),
+            ),
+            "face_mesh": FaceMeshBranch(
+                dim=dim,
+                output_tokens_per_frame=resolve_output_token_count(config, "face_mesh"),
+            ),
+            "fau": FAUBranch(
+                dim=dim,
+                output_tokens_per_frame=resolve_output_token_count(config, "fau"),
+            ),
+            "rppg": RPPGBranch(
+                dim=dim,
+                output_tokens_per_clip=resolve_output_token_count(config, "rppg"),
+            ),
         }
     )
 

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 
 from branches import ModalityBranch, ModalityOutput
+from branches.compression import DEFAULT_OUTPUT_TOKENS, validate_branch_token_config
 from encoders import FAUEncoder, RGBEncoder, RPPGEncoder, build_local_encoders
 from extractors import (
     EYE_GAZE_COLUMNS,
@@ -112,6 +113,26 @@ class RegistryTest(unittest.TestCase):
         for name in CURRENT_MODALITIES:
             self.assertIsInstance(registry[name], ModalityBranch)
 
+    def test_build_registry_without_config_uses_default_token_budgets(self):
+        registry = build_registry(dim=32)
+
+        self.assertEqual(
+            registry["eye_gaze"].output_tokens_per_clip,
+            DEFAULT_OUTPUT_TOKENS["eye_gaze"],
+        )
+        self.assertEqual(
+            registry["rppg"].output_tokens_per_clip,
+            DEFAULT_OUTPUT_TOKENS["rppg"],
+        )
+        self.assertEqual(
+            registry["face_mesh"].output_tokens_per_frame,
+            DEFAULT_OUTPUT_TOKENS["face_mesh"],
+        )
+        self.assertEqual(
+            registry["fau"].output_tokens_per_frame,
+            DEFAULT_OUTPUT_TOKENS["fau"],
+        )
+
     def test_registry_required_keys_for_video_modalities(self):
         registry = build_registry(dim=32)
 
@@ -179,8 +200,9 @@ class RegistryTest(unittest.TestCase):
 
         output = registry["fau"].encode({"fau_features": fau_features})
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 8, 16))
-        self.assertEqual(tuple(output.time_ids.shape), (8,))
+        self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
+        self.assertEqual(tuple(output.time_ids.shape), (4,))
+        self.assertTrue(torch.equal(output.time_ids, torch.tensor([0, 0, 1, 1])))
 
     def test_rppg_extractor_output_contract(self):
         extractor = RPPGExtractor(DummyRPPGEncoder(feature_dim=12))
@@ -199,6 +221,17 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
         self.assertEqual(tuple(output.time_ids.shape), (4,))
+        self.assertTrue(torch.equal(output.time_ids, torch.tensor([0, 1, 2, 3])))
+
+    def test_rppg_temporal_pooling_changes_when_frame_order_changes(self):
+        registry = build_registry(dim=16)
+        temporal_features = torch.arange(1, 1 + 6 * 12, dtype=torch.float32).reshape(1, 6, 12)
+        reversed_features = torch.flip(temporal_features, dims=(1,))
+
+        output = registry["rppg"].encode({"rppg_features": temporal_features})
+        reversed_output = registry["rppg"].encode({"rppg_features": reversed_features})
+
+        self.assertFalse(torch.allclose(output.tokens, reversed_output.tokens))
 
     def test_eye_gaze_extractor_tensor_shape_with_fake_detector(self):
         extractor = EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector)
@@ -218,6 +251,17 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
         self.assertEqual(tuple(output.time_ids.shape), (4,))
+        self.assertTrue(torch.equal(output.time_ids, torch.tensor([0, 1, 2, 3])))
+
+    def test_eye_gaze_temporal_pooling_changes_when_frame_order_changes(self):
+        registry = build_registry(dim=16)
+        eye_gaze = torch.arange(1, 1 + 6 * 8, dtype=torch.float32).reshape(1, 6, 8)
+        reversed_eye_gaze = torch.flip(eye_gaze, dims=(1,))
+
+        output = registry["eye_gaze"].encode({"eye_gaze": eye_gaze})
+        reversed_output = registry["eye_gaze"].encode({"eye_gaze": reversed_eye_gaze})
+
+        self.assertFalse(torch.allclose(output.tokens, reversed_output.tokens))
 
     def test_face_mesh_extractor_tensor_shape_with_fake_detector(self):
         extractor = FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)
@@ -235,8 +279,52 @@ class RegistryTest(unittest.TestCase):
 
         output = registry["face_mesh"].encode({"face_mesh": face_mesh})
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 4 * len(FACE_MESH_CONTOUR_INDICES), 16))
-        self.assertEqual(tuple(output.time_ids.shape), (4 * len(FACE_MESH_CONTOUR_INDICES),))
+        self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
+        self.assertEqual(tuple(output.time_ids.shape), (4,))
+        self.assertTrue(torch.equal(output.time_ids, torch.tensor([0, 1, 2, 3])))
+
+    def test_build_registry_config_overrides_change_token_counts(self):
+        registry = build_registry(
+            dim=16,
+            config={
+                "eye_gaze": {"output_tokens_per_clip": 3},
+                "rppg": {"output_tokens_per_clip": 2},
+                "face_mesh": {"output_tokens_per_frame": 2},
+                "fau": {"output_tokens_per_frame": 3},
+            },
+        )
+
+        eye_gaze_output = registry["eye_gaze"].encode({"eye_gaze": torch.randn(1, 16, 8)})
+        rppg_output = registry["rppg"].encode({"rppg_features": torch.randn(1, 16, 12)})
+        face_mesh_output = registry["face_mesh"].encode(
+            {"face_mesh": torch.randn(1, 4, len(FACE_MESH_CONTOUR_INDICES), 3)}
+        )
+        fau_output = registry["fau"].encode({"fau_features": torch.randn(1, 4, 5, 20)})
+
+        self.assertEqual(tuple(eye_gaze_output.tokens.shape), (1, 3, 16))
+        self.assertEqual(tuple(rppg_output.tokens.shape), (1, 2, 16))
+        self.assertEqual(tuple(face_mesh_output.tokens.shape), (1, 8, 16))
+        self.assertEqual(tuple(fau_output.tokens.shape), (1, 12, 16))
+        self.assertTrue(torch.equal(face_mesh_output.time_ids, torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])))
+        self.assertTrue(torch.equal(fau_output.time_ids, torch.tensor([0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3])))
+
+    def test_build_registry_rejects_non_positive_token_budgets(self):
+        with self.assertRaisesRegex(ValueError, "rppg.output_tokens_per_clip"):
+            build_registry(dim=16, config={"rppg": {"output_tokens_per_clip": 0}})
+
+    def test_validate_branch_token_config_rejects_fusion_time_step_mismatch(self):
+        config = {
+            "frames": 16,
+            "fusion": {"max_time_steps": 3},
+            "eye_gaze": {"output_tokens_per_clip": 4},
+        }
+
+        with self.assertRaisesRegex(ValueError, "fusion.max_time_steps"):
+            validate_branch_token_config(
+                config,
+                modalities=("eye_gaze",),
+                fusion_max_time_steps=config["fusion"]["max_time_steps"],
+            )
 
     def test_fuse_selected_modalities_returns_token_bank_metadata(self):
         registry = build_registry(dim=16)
@@ -255,28 +343,28 @@ class RegistryTest(unittest.TestCase):
         )
 
         self.assertIsInstance(fusion_output, FusionOutput)
-        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 24, 16))
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 12, 16))
         self.assertEqual(tuple(fusion_output.fused.shape), (1, 16))
         self.assertEqual(tuple(fusion_output.cls_token.shape), (1, 16))
-        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 25, 16))
-        self.assertEqual(tuple(fusion_output.time_ids.shape), (24,))
-        self.assertEqual(tuple(fusion_output.modality_ids.shape), (24,))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 13, 16))
+        self.assertEqual(tuple(fusion_output.time_ids.shape), (12,))
+        self.assertEqual(tuple(fusion_output.modality_ids.shape), (12,))
         self.assertEqual(fusion_output.modality_names, ("rgb", "rppg"))
         self.assertTrue(
             torch.equal(
                 fusion_output.time_ids,
-                torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+                torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]),
             )
         )
-        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0] * 8 + [4] * 16)))
-        self.assertEqual(debug["token_bank_shape"], (1, 24, 16))
-        self.assertEqual(debug["modality_token_counts"], {"rgb": 8, "rppg": 16})
+        self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0] * 8 + [4] * 4)))
+        self.assertEqual(debug["token_bank_shape"], (1, 12, 16))
+        self.assertEqual(debug["modality_token_counts"], {"rgb": 8, "rppg": 4})
         self.assertEqual(debug["cls_token_shape"], (1, 16))
-        self.assertEqual(debug["fused_tokens_shape"], (1, 25, 16))
+        self.assertEqual(debug["fused_tokens_shape"], (1, 13, 16))
 
     def test_fuse_selected_modalities_uses_stable_subset_modality_ids(self):
         registry = build_registry(dim=8)
-        fusion_module = self.build_test_fusion(dim=8, max_time_steps=2)
+        fusion_module = self.build_test_fusion(dim=8, max_time_steps=4)
         batch = {
             "eye_gaze": torch.randn(1, 2, 8),
             "rppg_features": torch.randn(1, 2, 12),
@@ -294,6 +382,10 @@ class RegistryTest(unittest.TestCase):
             [
                 MODALITY_TO_ID["eye_gaze"],
                 MODALITY_TO_ID["eye_gaze"],
+                MODALITY_TO_ID["eye_gaze"],
+                MODALITY_TO_ID["eye_gaze"],
+                MODALITY_TO_ID["rppg"],
+                MODALITY_TO_ID["rppg"],
                 MODALITY_TO_ID["rppg"],
                 MODALITY_TO_ID["rppg"],
             ]
@@ -343,15 +435,15 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(
             tuple(fusion_output.tokens.shape),
-            (1, 3 * len(FACE_MESH_CONTOUR_INDICES), 12),
+            (1, 3, 12),
         )
         self.assertTrue(
             torch.equal(
                 fusion_output.time_ids,
-                torch.arange(3).repeat_interleave(len(FACE_MESH_CONTOUR_INDICES)),
+                torch.arange(3),
             )
         )
-        self.assertEqual(debug["modality_token_counts"], {"face_mesh": 3 * len(FACE_MESH_CONTOUR_INDICES)})
+        self.assertEqual(debug["modality_token_counts"], {"face_mesh": 3})
 
     def test_build_local_encoders_requires_rgb_checkpoint(self):
         config = {
