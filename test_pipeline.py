@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from encoders.factory import EncoderFactoryResult
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
 from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.factory import ExtractorFactoryResult
@@ -14,17 +15,8 @@ from extractors.fau import FAUExtractor
 from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
 from fusion import TokenBankFusion
-from prediction import (
-    ClassifierConfig,
-    ClipRealFakePredictor,
-    TrainingConfig,
-    VideoRealFakeHead,
-    build_binary_classification_loss,
-    build_prediction_model,
-    resolve_model_device,
-)
+from pipeline import ClipFusionPipeline, build_fusion_pipeline, resolve_model_device
 from registry import MODALITY_TO_ID, build_registry
-from encoders.factory import EncoderFactoryResult
 
 
 def fake_eye_gaze_detector(_: np.ndarray) -> dict[str, float]:
@@ -83,11 +75,10 @@ class ParameterizedDummyRPPGEncoder(nn.Module):
         return waveform, features
 
 
-def build_test_predictor(
+def build_test_pipeline(
     dim: int = 16,
     enabled_modalities: tuple[str, ...] = ("rgb", "fau", "rppg", "eye_gaze", "face_mesh"),
-    freeze_encoders: bool = True,
-) -> ClipRealFakePredictor:
+) -> ClipFusionPipeline:
     rgb_encoder = ParameterizedDummyRGBEncoder()
     fau_encoder = ParameterizedDummyFAUEncoder()
     rppg_encoder = ParameterizedDummyRPPGEncoder()
@@ -98,7 +89,7 @@ def build_test_predictor(
         "eye_gaze": EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector),
         "face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector),
     }
-    model = ClipRealFakePredictor(
+    return ClipFusionPipeline(
         registry=build_registry(dim=dim),
         fusion_module=TokenBankFusion(
             dim=dim,
@@ -109,9 +100,7 @@ def build_test_predictor(
             max_time_steps=16,
             num_modalities=len(MODALITY_TO_ID),
         ),
-        classifier_head=VideoRealFakeHead(input_dim=dim, hidden_dim=dim, dropout=0.1),
         enabled_modalities=enabled_modalities,
-        modality_weights={name: 1.0 for name in enabled_modalities},
         extractors={name: extractors[name] for name in enabled_modalities},
         encoder_modules=nn.ModuleDict(
             {
@@ -121,9 +110,6 @@ def build_test_predictor(
             }
         ),
     )
-    if freeze_encoders:
-        model.freeze_encoder_parameters()
-    return model
 
 
 def build_raw_batch(num_frames: int = 16) -> dict[str, object]:
@@ -134,117 +120,62 @@ def build_raw_batch(num_frames: int = 16) -> dict[str, object]:
     }
 
 
-class PredictionModelTest(unittest.TestCase):
-    def test_clip_predictor_returns_logits_probs_and_full_token_layout(self):
-        model = build_test_predictor()
+class PipelineTest(unittest.TestCase):
+    def test_clip_pipeline_returns_fusion_output_and_full_token_layout(self):
+        pipeline = build_test_pipeline()
 
-        output = model(build_raw_batch())
+        output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.logits.shape), (1, 1))
-        self.assertEqual(tuple(output.probs.shape), (1, 1))
-        self.assertTrue(torch.all(output.probs >= 0.0))
-        self.assertTrue(torch.all(output.probs <= 1.0))
-        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 64, 16))
-        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 65, 16))
+        self.assertEqual(tuple(output.tokens.shape), (1, 64, 16))
+        self.assertEqual(tuple(output.fused.shape), (1, 16))
+        self.assertEqual(tuple(output.cls_token.shape), (1, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 65, 16))
 
-    def test_gradient_flow_skips_frozen_encoders_but_updates_fusion_and_head(self):
-        model = build_test_predictor(freeze_encoders=True)
-        criterion = build_binary_classification_loss(
-            TrainingConfig(
-                freeze_encoders=True,
-                lr_head=1e-3,
-                lr_fusion=1e-4,
-                pos_weight=1.0,
-            )
-        )
+    def test_prepare_features_reuses_precomputed_modalities(self):
+        pipeline = build_test_pipeline(enabled_modalities=("fau", "rppg"))
+        batch = {
+            "fau_features": torch.randn(1, 16, 12, 10),
+            "fau_au_logits": torch.randn(1, 16, 12),
+            "fau_au_edge_logits": torch.randn(1, 16, 12, 3),
+            "rppg_features": torch.randn(1, 16, 9),
+            "rppg_waveform": torch.randn(1, 16),
+        }
 
-        output = model(build_raw_batch())
-        loss = criterion(output.logits, torch.ones_like(output.logits))
-        loss.backward()
+        features = pipeline.prepare_features(batch)
 
-        self.assertIsNotNone(model.classifier_head.layers[0].weight.grad)
-        self.assertIsNotNone(model.fusion_module.cls_token.grad)
-        self.assertIsNotNone(model.registry["rgb"].proj.weight.grad)
-        self.assertIsNotNone(model.registry["fau"].proj.weight.grad)
-        self.assertIsNotNone(model.registry["rppg"].proj.weight.grad)
-        self.assertIsNotNone(model.registry["eye_gaze"].proj[0].weight.grad)
-        self.assertIsNotNone(model.registry["face_mesh"].proj[0].weight.grad)
-        self.assertIsNone(model.encoder_modules["rgb"].scale.grad)
-        self.assertIsNone(model.encoder_modules["fau"].scale.grad)
-        self.assertIsNone(model.encoder_modules["rppg"].scale.grad)
+        self.assertIs(features["fau_features"], batch["fau_features"])
+        self.assertIs(features["fau_au_logits"], batch["fau_au_logits"])
+        self.assertIs(features["fau_au_edge_logits"], batch["fau_au_edge_logits"])
+        self.assertIs(features["rppg_features"], batch["rppg_features"])
+        self.assertIs(features["rppg_waveform"], batch["rppg_waveform"])
+        self.assertEqual(pipeline.last_feature_timings, {"fau": 0.0, "rppg": 0.0})
 
     def test_modality_subset_keeps_stable_ids_and_expected_token_count(self):
-        model = build_test_predictor(enabled_modalities=("face_mesh", "rppg"))
+        pipeline = build_test_pipeline(enabled_modalities=("face_mesh", "rppg"))
 
-        output = model(build_raw_batch())
+        output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.fusion_output.tokens.shape), (1, 20, 16))
-        self.assertEqual(tuple(output.fusion_output.fused_tokens.shape), (1, 21, 16))
+        self.assertEqual(tuple(output.tokens.shape), (1, 20, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 21, 16))
         self.assertTrue(
             torch.equal(
-                output.fusion_output.modality_ids,
+                output.modality_ids,
                 torch.tensor(
                     [MODALITY_TO_ID["face_mesh"]] * 16 + [MODALITY_TO_ID["rppg"]] * 4
                 ),
             )
         )
 
-    def test_tiny_overfit_on_precomputed_clip_features(self):
-        torch.manual_seed(0)
-        model = build_test_predictor(freeze_encoders=True)
-        training_config = TrainingConfig(
-            freeze_encoders=True,
-            lr_head=5e-2,
-            lr_fusion=5e-2,
-            pos_weight=1.0,
-        )
-        optimizer = model.build_optimizer(training_config, weight_decay=0.0)
-        criterion = build_binary_classification_loss(training_config)
-
-        labels = torch.tensor([[0.0], [0.0], [0.0], [0.0], [1.0], [1.0], [1.0], [1.0]])
-        polarity = labels * 2.0 - 1.0
-        batch = {
-            "rgb_features": polarity.view(8, 1, 1).repeat(1, 8, 12),
-            "fau_features": polarity.view(8, 1, 1, 1).repeat(1, 16, 12, 10),
-            "rppg_features": polarity.view(8, 1, 1).repeat(1, 16, 9),
-            "eye_gaze": polarity.view(8, 1, 1).repeat(1, 16, 8),
-            "face_mesh": polarity.view(8, 1, 1, 1).repeat(1, 16, len(FACE_MESH_CONTOUR_INDICES), 3),
-        }
-
-        model.train()
-        for _ in range(120):
-            optimizer.zero_grad()
-            output = model(batch)
-            loss = criterion(output.logits, labels)
-            loss.backward()
-            optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            output = model(batch)
-        predictions = (output.probs >= 0.5).float()
-        self.assertTrue(torch.equal(predictions, labels))
-        self.assertLess(float(criterion(output.logits, labels).item()), 0.05)
-
-    def test_classifier_config_dataclass_keeps_requested_shape(self):
-        config = ClassifierConfig(hidden_dim=32, dropout=0.2)
-        head = VideoRealFakeHead(input_dim=16, hidden_dim=config.hidden_dim, dropout=config.dropout)
-
-        logits = head(torch.randn(3, 16))
-
-        self.assertEqual(tuple(logits.shape), (3, 1))
-
     def test_resolve_model_device_accepts_cpu(self):
         self.assertEqual(str(resolve_model_device({"device": "cpu"})), "cpu")
 
-    def test_build_prediction_model_moves_modules_to_requested_cpu_device(self):
+    def test_build_fusion_pipeline_moves_modules_to_requested_cpu_device(self):
         config = {
             "device": "cpu",
             "modalities": ["face_mesh"],
             "frames": 16,
             "image_size": 224,
             "dim": 16,
-            "modality_weights": {"face_mesh": 1.0},
             "fusion": {
                 "type": "token_transformer",
                 "num_layers": 2,
@@ -253,16 +184,6 @@ class PredictionModelTest(unittest.TestCase):
                 "dropout": 0.0,
                 "max_time_steps": 16,
                 "checkpoint_path": None,
-            },
-            "classifier": {
-                "hidden_dim": 16,
-                "dropout": 0.1,
-            },
-            "training": {
-                "freeze_encoders": True,
-                "lr_head": 1e-3,
-                "lr_fusion": 1e-4,
-                "pos_weight": 1.0,
             },
             "rgb": {
                 "checkpoint_path": "/tmp/unused-rgb-checkpoint.pth",
@@ -289,24 +210,23 @@ class PredictionModelTest(unittest.TestCase):
             extractors={"face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)},
             warnings=(),
         )
-        with patch("prediction.build_local_encoders", return_value=encoder_result), patch(
-            "prediction.build_extractors_from_encoders", return_value=extractors_result
+        with patch("pipeline.build_local_encoders", return_value=encoder_result), patch(
+            "pipeline.build_extractors_from_encoders", return_value=extractors_result
         ):
-            build_result = build_prediction_model(config, modalities=("face_mesh",))
+            build_result = build_fusion_pipeline(config, modalities=("face_mesh",))
 
         self.assertEqual(str(build_result.device), "cpu")
-        self.assertEqual(str(next(build_result.model.parameters()).device), "cpu")
-        self.assertEqual(build_result.model.registry["face_mesh"].output_tokens_per_frame, 2)
-        build_result.model.close()
+        self.assertEqual(str(next(build_result.pipeline.parameters()).device), "cpu")
+        self.assertEqual(build_result.pipeline.registry["face_mesh"].output_tokens_per_frame, 2)
+        build_result.pipeline.close()
 
-    def test_build_prediction_model_rejects_fusion_max_time_step_mismatch(self):
+    def test_build_fusion_pipeline_rejects_fusion_max_time_step_mismatch(self):
         config = {
             "device": "cpu",
             "modalities": ["rppg"],
             "frames": 16,
             "image_size": 224,
             "dim": 16,
-            "modality_weights": {"rppg": 1.0},
             "fusion": {
                 "type": "token_transformer",
                 "num_layers": 2,
@@ -315,16 +235,6 @@ class PredictionModelTest(unittest.TestCase):
                 "dropout": 0.0,
                 "max_time_steps": 3,
                 "checkpoint_path": None,
-            },
-            "classifier": {
-                "hidden_dim": 16,
-                "dropout": 0.1,
-            },
-            "training": {
-                "freeze_encoders": True,
-                "lr_head": 1e-3,
-                "lr_fusion": 1e-4,
-                "pos_weight": 1.0,
             },
             "rgb": {
                 "checkpoint_path": "/tmp/unused-rgb-checkpoint.pth",
@@ -343,7 +253,7 @@ class PredictionModelTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "fusion.max_time_steps"):
-            build_prediction_model(config, modalities=("rppg",))
+            build_fusion_pipeline(config, modalities=("rppg",))
 
 
 if __name__ == "__main__":

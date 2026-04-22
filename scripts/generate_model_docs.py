@@ -35,8 +35,6 @@ class ModalityDoc:
     projector_summary: str
     token_formula: str
     token_count: int | None
-    raw_weight: float
-    normalized_weight: float
     stroke_color: str
     fill_color: str
     note: str
@@ -69,13 +67,6 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
-def normalize_weights(modalities: list[str], raw_weights: dict[str, float]) -> dict[str, float]:
-    total = sum(raw_weights[name] for name in modalities)
-    if total <= 0.0:
-        raise ValueError("At least one modality weight must be greater than zero.")
-    return {name: raw_weights[name] / total for name in modalities}
-
-
 def format_float(value: float) -> str:
     rounded = f"{value:.3f}"
     return rounded.rstrip("0").rstrip(".")
@@ -95,8 +86,6 @@ def build_modality_doc(
     name: str,
     config: dict[str, Any],
     frames: int,
-    raw_weight: float,
-    normalized_weight: float,
     dim: int,
 ) -> ModalityDoc:
     stroke_color, fill_color = MODALITY_COLORS.get(name, DEFAULT_COLOR)
@@ -111,8 +100,6 @@ def build_modality_doc(
             projector_summary=f"spatial-mean temporal tokens -> Linear(*, {dim})",
             token_formula=token_formula,
             token_count=token_count,
-            raw_weight=raw_weight,
-            normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
             note="One token per MViT time step after spatial pooling.",
@@ -126,8 +113,6 @@ def build_modality_doc(
             projector_summary=f"8 gaze blendshapes -> MLP -> temporal position encoding -> latent-query pool -> {dim}",
             token_formula=str(token_count),
             token_count=token_count,
-            raw_weight=raw_weight,
-            normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
             note="Per-frame gaze features compressed to a fixed clip token budget with order-aware pooling.",
@@ -142,8 +127,6 @@ def build_modality_doc(
             projector_summary=f"36 contour landmarks x (x,y,z) -> point MLP -> latent-query pool -> {dim}",
             token_formula=f"{frames} x {output_tokens_per_frame}",
             token_count=frames * output_tokens_per_frame,
-            raw_weight=raw_weight,
-            normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
             note=f"{contour_points} contour points compressed to {output_tokens_per_frame} tokens per frame.",
@@ -160,8 +143,6 @@ def build_modality_doc(
             projector_summary=f"AU graph features -> Linear(*, {dim}) -> latent-query pool -> flatten",
             token_formula=f"{frames} x {output_tokens_per_frame}",
             token_count=frames * output_tokens_per_frame,
-            raw_weight=raw_weight,
-            normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
             note=f"{num_classes} AU features compressed to {output_tokens_per_frame} tokens per frame.",
@@ -175,8 +156,6 @@ def build_modality_doc(
             projector_summary=f"waveform + temporal features -> Linear(*, {dim}) -> temporal position encoding -> latent-query pool",
             token_formula=str(token_count),
             token_count=token_count,
-            raw_weight=raw_weight,
-            normalized_weight=normalized_weight,
             stroke_color=stroke_color,
             fill_color=fill_color,
             note="Temporal features compressed to a fixed clip token budget with order-aware pooling plus raw waveform side output.",
@@ -188,8 +167,6 @@ def build_modality_doc(
         projector_summary=f"project features -> {dim}",
         token_formula="custom",
         token_count=None,
-        raw_weight=raw_weight,
-        normalized_weight=normalized_weight,
         stroke_color=stroke_color,
         fill_color=fill_color,
         note="Unknown to doc generator. Update script if branch changes.",
@@ -206,18 +183,11 @@ def build_modality_docs(config: dict[str, Any]) -> tuple[list[ModalityDoc], dict
 
     frames = int(config["frames"])
     dim = int(config["dim"])
-    raw_weights = {
-        name: float(config.get("modality_weights", {}).get(name, 1.0))
-        for name in enabled
-    }
-    normalized_weights = normalize_weights(enabled, raw_weights)
     docs = [
         build_modality_doc(
             name=name,
             config=config,
             frames=frames,
-            raw_weight=raw_weights[name],
-            normalized_weight=normalized_weights[name],
             dim=dim,
         )
         for name in enabled
@@ -231,8 +201,6 @@ def build_modality_docs(config: dict[str, Any]) -> tuple[list[ModalityDoc], dict
         "device": str(config.get("device", "unknown")),
         "modalities": enabled,
         "fusion": config["fusion"],
-        "classifier": config.get("classifier", {}),
-        "training": config.get("training", {}),
         "dot_available": shutil.which("dot") is not None,
     }
 
@@ -251,8 +219,6 @@ def render_markdown(
     summary: dict[str, Any],
 ) -> str:
     fusion = summary["fusion"]
-    classifier = summary.get("classifier", {})
-    training = summary.get("training", {})
     total_tokens = summary["total_tokens"]
     total_tokens_text = str(total_tokens) if total_tokens is not None else "unknown"
     render_hint = (
@@ -287,8 +253,7 @@ def render_markdown(
         f"- Runtime device: `{summary['device']}`",
         f"- Fusion: `TokenBankFusion`, layers=`{fusion['num_layers']}`, heads=`{fusion['num_heads']}`, mlp_ratio=`{fusion['mlp_ratio']}`, max_time_steps=`{fusion['max_time_steps']}`",
         f"- Fusion internals: `CLS token` + `time embedding` + `modality embedding` + `TransformerEncoderLayer x{fusion['num_layers']}` + `LayerNorm`",
-        f"- Classifier: `VideoRealFakeHead`, hidden=`{classifier.get('hidden_dim', 'unknown')}`, dropout=`{classifier.get('dropout', 'unknown')}`",
-        f"- Training defaults: freeze_encoders=`{training.get('freeze_encoders', 'unknown')}`, lr_head=`{training.get('lr_head', 'unknown')}`, lr_fusion=`{training.get('lr_fusion', 'unknown')}`, pos_weight=`{training.get('pos_weight', 'unknown')}`",
+        f"- Output contract: `FusionOutput.cls_token` gives the fused clip summary, `FusionOutput.fused_tokens` keeps the full mixed token sequence",
         f"- Graphviz status: {render_hint}",
         "",
         "## Modality Summary",
@@ -299,12 +264,10 @@ def render_markdown(
                 "Encoder",
                 "Projection",
                 "Token Formula",
-                "Raw Weight",
-                "Normalized Weight",
                 "Note",
             ]
         ),
-        markdown_table_row(["---", "---", "---", "---", "---", "---", "---"]),
+        markdown_table_row(["---", "---", "---", "---", "---"]),
     ]
     for doc in docs:
         lines.append(
@@ -314,8 +277,6 @@ def render_markdown(
                     doc.encoder_summary,
                     doc.projector_summary,
                     doc.token_formula,
-                    format_float(doc.raw_weight),
-                    format_float(doc.normalized_weight),
                     doc.note,
                 ]
             )
@@ -337,7 +298,6 @@ def render_markdown(
 
 def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
     fusion = summary["fusion"]
-    classifier = summary.get("classifier", {})
     total_tokens = summary["total_tokens"]
     total_tokens_text = str(total_tokens) if total_tokens is not None else "unknown"
     lines = [
@@ -356,15 +316,13 @@ def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
             (
                 f'  {node_id} [label="{dot_label_text(doc.title)}\\n{dot_label_text(doc.encoder_summary)}'
                 f'\\n{dot_label_text(doc.projector_summary)}\\ntokens={dot_label_text(doc.token_formula)}'
-                f'\\nw={format_float(doc.raw_weight)}'
-                f' (norm {format_float(doc.normalized_weight)})", '
-                f'fillcolor="{doc.fill_color}", color="{doc.stroke_color}"];'
+                f'", fillcolor="{doc.fill_color}", color="{doc.stroke_color}"];'
             )
         )
 
     lines.extend(
         [
-            f'  bank [label="Weighted Token Bank\\ntotal tokens={total_tokens_text}", fillcolor="#FFF4CC", color="#B38600"];',
+            f'  bank [label="Token Bank\\ntotal tokens={total_tokens_text}", fillcolor="#FFF4CC", color="#B38600"];',
             f'  time [label="Time Embedding\\nmax_time_steps={fusion["max_time_steps"]}", fillcolor="#FFF4CC", color="#B38600"];',
             f'  cls_in [label="CLS Token\\n[1 x {summary["dim"]}]", fillcolor="#FFF4CC", color="#B38600"];',
             f'  modality [label="Modality Embedding\\n{len(docs)} active ids", fillcolor="#FFF4CC", color="#B38600"];',
@@ -380,14 +338,11 @@ def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
             ),
             '  norm [label="LayerNorm\\noutput_norm", fillcolor="#DCEAF7", color="#295C8A"];',
             f'  cls [label="CLS Output\\n[1 x {summary["dim"]}]", fillcolor="#DCEAF7", color="#295C8A"];',
-            (
-                f'  head [label="VideoRealFakeHead\\nMLP {summary["dim"]}->{classifier.get("hidden_dim", "?")}->1'
-                f'\\ndropout={classifier.get("dropout", "?")}", fillcolor="#FFFFFF", color="#295C8A", style="rounded,dashed,filled"];'
-            ),
+            f'  tokens [label="Fused Tokens\\n[1 + {total_tokens_text} x {summary["dim"]}]", fillcolor="#FFFFFF", color="#295C8A", style="rounded,dashed,filled"];',
             "",
             "  { rank=same; video; " + "; ".join(modality_node_id(doc) for doc in docs) + "; }",
             "  { rank=same; bank; time; cls_in; modality; }",
-            "  { rank=same; encoder; layer_hint; norm; cls; head; }",
+            "  { rank=same; encoder; layer_hint; norm; cls; tokens; }",
             "",
         ]
     )
@@ -406,7 +361,7 @@ def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
             '  encoder -> layer_hint [style=dashed, arrowhead=none, color="#7B8794"];',
             "  encoder -> norm;",
             "  norm -> cls;",
-            "  cls -> head;",
+            "  norm -> tokens;",
             "}",
         ]
     )

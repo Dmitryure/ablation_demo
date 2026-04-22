@@ -23,11 +23,9 @@ class FusionOutput:
 @dataclass(frozen=True)
 class TokenBankBatch:
     tokens: torch.Tensor
-    weighted_tokens: torch.Tensor
     time_ids: torch.Tensor
     modality_ids: torch.Tensor
     modality_names: tuple[str, ...]
-    normalized_weights: dict[str, float]
 
 
 def validate_modality_output(name: str, output: ModalityOutput) -> None:
@@ -62,28 +60,14 @@ def build_modality_id_tensor(
     )
 
 
-def normalize_modality_weights(
-    modality_names: Sequence[str],
-    modality_weights: Mapping[str, float],
-) -> dict[str, float]:
-    raw_weights = {name: float(modality_weights[name]) for name in modality_names}
-    total = sum(raw_weights.values())
-    if total <= 0.0:
-        raise ValueError("At least one modality weight must be greater than zero.")
-    return {name: raw_weights[name] / total for name in modality_names}
-
-
 def prepare_token_bank(
     outputs_by_name: Mapping[str, ModalityOutput],
     enabled_modalities: Sequence[str],
     modality_to_id: Mapping[str, int],
-    modality_weights: Mapping[str, float],
 ) -> TokenBankBatch:
     tokens_by_modality: list[torch.Tensor] = []
-    weighted_tokens_by_modality: list[torch.Tensor] = []
     time_ids_by_modality: list[torch.Tensor] = []
     modality_ids_by_modality: list[torch.Tensor] = []
-    normalized_weights = normalize_modality_weights(enabled_modalities, modality_weights)
 
     for name in enabled_modalities:
         output = outputs_by_name[name]
@@ -92,7 +76,6 @@ def prepare_token_bank(
         tokens = output.tokens
         time_ids = output.time_ids.to(device=tokens.device, dtype=torch.long)
         tokens_by_modality.append(tokens)
-        weighted_tokens_by_modality.append(tokens * normalized_weights[name])
         time_ids_by_modality.append(time_ids)
         modality_ids_by_modality.append(
             build_modality_id_tensor(
@@ -105,11 +88,9 @@ def prepare_token_bank(
 
     return TokenBankBatch(
         tokens=torch.cat(tokens_by_modality, dim=1),
-        weighted_tokens=torch.cat(weighted_tokens_by_modality, dim=1),
         time_ids=torch.cat(time_ids_by_modality, dim=0),
         modality_ids=torch.cat(modality_ids_by_modality, dim=0),
         modality_names=tuple(enabled_modalities),
-        normalized_weights=normalized_weights,
     )
 
 

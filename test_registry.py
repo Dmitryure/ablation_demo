@@ -17,13 +17,8 @@ from extractors import (
     RPPGExtractor,
 )
 from fusion import FusionOutput, TokenBankFusion
+from pipeline import build_fusion_from_config, fuse_selected_modalities
 from registry import CURRENT_MODALITIES, MODALITY_TO_ID, build_registry, registry_required_keys, validate_registry
-from run_registry_fusion import (
-    build_fusion_module,
-    fuse_selected_modalities,
-    require_fusion_config,
-    validate_selected_modalities,
-)
 
 
 class DummyFAUEncoder(nn.Module):
@@ -334,11 +329,10 @@ class RegistryTest(unittest.TestCase):
             "rppg_features": torch.randn(1, 16, 12),
         }
 
-        fusion_output, debug = fuse_selected_modalities(
+        fusion_output = fuse_selected_modalities(
             registry,
             batch,
             ("rgb", "rppg"),
-            {"rgb": 1.0, "rppg": 2.0},
             fusion_module,
         )
 
@@ -357,10 +351,6 @@ class RegistryTest(unittest.TestCase):
             )
         )
         self.assertTrue(torch.equal(fusion_output.modality_ids, torch.tensor([0] * 8 + [4] * 4)))
-        self.assertEqual(debug["token_bank_shape"], (1, 12, 16))
-        self.assertEqual(debug["modality_token_counts"], {"rgb": 8, "rppg": 4})
-        self.assertEqual(debug["cls_token_shape"], (1, 16))
-        self.assertEqual(debug["fused_tokens_shape"], (1, 13, 16))
 
     def test_fuse_selected_modalities_uses_stable_subset_modality_ids(self):
         registry = build_registry(dim=8)
@@ -370,11 +360,10 @@ class RegistryTest(unittest.TestCase):
             "rppg_features": torch.randn(1, 2, 12),
         }
 
-        fusion_output, _ = fuse_selected_modalities(
+        fusion_output = fuse_selected_modalities(
             registry,
             batch,
             ("eye_gaze", "rppg"),
-            {"eye_gaze": 1.0, "rppg": 1.0},
             fusion_module,
         )
 
@@ -400,17 +389,15 @@ class RegistryTest(unittest.TestCase):
             "fau_features": torch.randn(1, 3, 2, 20),
         }
 
-        fusion_output, debug = fuse_selected_modalities(
+        fusion_output = fuse_selected_modalities(
             registry,
             batch,
             ("rgb", "fau"),
-            {"rgb": 1.0, "fau": 1.0},
             fusion_module,
         )
 
         self.assertEqual(tuple(fusion_output.tokens.shape), (1, 14, 12))
         self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 15, 12))
-        self.assertEqual(debug["modality_token_counts"], {"rgb": 8, "fau": 6})
         self.assertTrue(
             torch.equal(
                 fusion_output.time_ids,
@@ -425,11 +412,10 @@ class RegistryTest(unittest.TestCase):
             "face_mesh": torch.randn(1, 3, len(FACE_MESH_CONTOUR_INDICES), 3),
         }
 
-        fusion_output, debug = fuse_selected_modalities(
+        fusion_output = fuse_selected_modalities(
             registry,
             batch,
             ("face_mesh",),
-            {"face_mesh": 1.0},
             fusion_module,
         )
 
@@ -443,7 +429,6 @@ class RegistryTest(unittest.TestCase):
                 torch.arange(3),
             )
         )
-        self.assertEqual(debug["modality_token_counts"], {"face_mesh": 3})
 
     def test_build_local_encoders_requires_rgb_checkpoint(self):
         config = {
@@ -463,11 +448,10 @@ class RegistryTest(unittest.TestCase):
         fusion_module = self.build_test_fusion(dim=10, max_time_steps=4)
         batch = {"metadata_tokens": torch.randn(1, 3, 10)}
 
-        fusion_output, debug = fuse_selected_modalities(
+        fusion_output = fuse_selected_modalities(
             registry,
             batch,
             ("metadata",),
-            {"metadata": 1.0},
             fusion_module,
         )
 
@@ -479,10 +463,10 @@ class RegistryTest(unittest.TestCase):
                 torch.full((3,), MODALITY_TO_ID["metadata"], dtype=torch.long),
             )
         )
-        self.assertEqual(debug["fused_tokens_shape"], (1, 4, 10))
 
     def test_missing_fusion_checkpoint_keeps_random_init_smoke_path_valid(self):
         config = {
+            "dim": 16,
             "fusion": {
                 "type": "token_transformer",
                 "num_layers": 2,
@@ -494,18 +478,9 @@ class RegistryTest(unittest.TestCase):
             }
         }
 
-        fusion_config = require_fusion_config(config)
-        fusion_module = build_fusion_module(dim=16, fusion_config=fusion_config)
+        fusion_module = build_fusion_from_config(config)
 
         self.assertIsInstance(fusion_module, TokenBankFusion)
-
-    def test_require_fusion_config_rejects_malformed_values(self):
-        with self.assertRaisesRegex(ValueError, "`fusion.type` must be `token_transformer`."):
-            require_fusion_config({"fusion": {"type": "mean_pool"}})
-
-    def test_validate_selected_modalities_rejects_unknown_names(self):
-        with self.assertRaisesRegex(ValueError, "unsupported modalities"):
-            validate_selected_modalities(("rgb", "metadata"))
 
 
 if __name__ == "__main__":

@@ -21,16 +21,15 @@ from extractors import (
     RPPGExtractor,
     build_extractors,
 )
-from prediction import (
-    ClassifierConfig,
-    ClipRealFakePredictor,
-    PredictionBuildResult,
-    PredictionOutput,
-    TrainingConfig,
-    VideoRealFakeHead,
-    build_binary_classification_loss,
-    build_prediction_model,
-    build_prediction_model_from_yaml,
+from pipeline import (
+    ClipFusionPipeline,
+    FusionPipelineBuildResult,
+    build_fusion_from_config,
+    build_fusion_pipeline,
+    build_fusion_pipeline_from_yaml,
+    fuse_selected_modalities,
+    load_fusion_checkpoint,
+    load_pipeline_yaml,
     resolve_model_device,
 )
 from registry import (
@@ -42,16 +41,6 @@ from registry import (
     build_registry,
     registry_required_keys,
     validate_registry,
-)
-from training import (
-    EpochMetrics,
-    LoadedTrainingResult,
-    RunConfig,
-    TrainingResult,
-    load_training_result,
-    train_from_yaml,
-    train_model,
-    validate_model,
 )
 
 __all__ = [
@@ -88,22 +77,13 @@ __all__ = [
     "load_video_clip",
     "LabeledVideoDataset",
     "collate_labeled_video_batch",
-    "PredictionOutput",
-    "ClassifierConfig",
-    "TrainingConfig",
-    "PredictionBuildResult",
-    "VideoRealFakeHead",
-    "ClipRealFakePredictor",
-    "build_binary_classification_loss",
-    "build_prediction_model",
-    "build_prediction_model_from_yaml",
+    "ClipFusionPipeline",
+    "FusionPipelineBuildResult",
+    "load_pipeline_yaml",
     "resolve_model_device",
-    "RunConfig",
-    "EpochMetrics",
-    "TrainingResult",
-    "LoadedTrainingResult",
-    "train_model",
-    "train_from_yaml",
-    "validate_model",
-    "load_training_result",
+    "build_fusion_from_config",
+    "load_fusion_checkpoint",
+    "fuse_selected_modalities",
+    "build_fusion_pipeline",
+    "build_fusion_pipeline_from_yaml",
 ]

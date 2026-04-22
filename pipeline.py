@@ -23,31 +23,8 @@ OPTIONAL_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
 
 
 @dataclass(frozen=True)
-class PredictionOutput:
-    logits: torch.Tensor
-    probs: torch.Tensor
-    fusion_output: FusionOutput
-
-
-@dataclass(frozen=True)
-class ClassifierConfig:
-    hidden_dim: int
-    dropout: float
-
-
-@dataclass(frozen=True)
-class TrainingConfig:
-    freeze_encoders: bool
-    lr_head: float
-    lr_fusion: float
-    pos_weight: float
-
-
-@dataclass(frozen=True)
-class PredictionBuildResult:
-    model: "ClipRealFakePredictor"
-    classifier_config: ClassifierConfig
-    training_config: TrainingConfig
+class FusionPipelineBuildResult:
+    pipeline: "ClipFusionPipeline"
     device: torch.device
     warnings: tuple[str, ...]
 
@@ -73,13 +50,6 @@ def _require_float(config: Mapping[str, Any], key: str) -> float:
     return float(value)
 
 
-def _require_bool(config: Mapping[str, Any], key: str) -> bool:
-    value = config.get(key)
-    if not isinstance(value, bool):
-        raise ValueError(f"`{key}` must be a boolean.")
-    return value
-
-
 def _require_str(config: Mapping[str, Any], key: str) -> str:
     value = config.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -92,28 +62,6 @@ def _require_modalities(config: Mapping[str, Any]) -> tuple[str, ...]:
     if not isinstance(value, list) or not value or not all(isinstance(item, str) for item in value):
         raise ValueError("`modalities` must be a non-empty YAML list of strings.")
     return tuple(item.strip() for item in value if item.strip())
-
-
-def _require_modality_weights(
-    config: Mapping[str, Any],
-    enabled_modalities: Sequence[str],
-) -> dict[str, float]:
-    value = config.get("modality_weights")
-    if value is None:
-        return {name: 1.0 for name in enabled_modalities}
-    if not isinstance(value, Mapping):
-        raise ValueError("`modality_weights` must be a YAML mapping when provided.")
-
-    weights: dict[str, float] = {}
-    for name in enabled_modalities:
-        raw_weight = value.get(name, 1.0)
-        if not isinstance(raw_weight, (int, float)):
-            raise ValueError(f"`modality_weights.{name}` must be a number.")
-        weight = float(raw_weight)
-        if weight < 0.0:
-            raise ValueError(f"`modality_weights.{name}` must be non-negative.")
-        weights[name] = weight
-    return weights
 
 
 def _encoder_modules_from_result(encoder_result: EncoderFactoryResult) -> nn.ModuleDict:
@@ -136,43 +84,13 @@ def _optional_path(config: Mapping[str, Any], key: str) -> Path | None:
     return Path(value)
 
 
-def load_prediction_yaml(path: str | Path) -> dict[str, Any]:
+def load_pipeline_yaml(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not isinstance(data, dict):
         raise ValueError(f"Config at {config_path} must be a YAML mapping.")
     return data
-
-
-def require_classifier_config(config: Mapping[str, Any]) -> ClassifierConfig:
-    classifier = _require_mapping(config, "classifier")
-    hidden_dim = _require_int(classifier, "hidden_dim")
-    dropout = _require_float(classifier, "dropout")
-    if hidden_dim <= 0:
-        raise ValueError("`classifier.hidden_dim` must be positive.")
-    if dropout < 0.0 or dropout >= 1.0:
-        raise ValueError("`classifier.dropout` must be in [0.0, 1.0).")
-    return ClassifierConfig(hidden_dim=hidden_dim, dropout=dropout)
-
-
-def require_training_config(config: Mapping[str, Any]) -> TrainingConfig:
-    training = _require_mapping(config, "training")
-    lr_head = _require_float(training, "lr_head")
-    lr_fusion = _require_float(training, "lr_fusion")
-    pos_weight = _require_float(training, "pos_weight")
-    if lr_head <= 0.0:
-        raise ValueError("`training.lr_head` must be positive.")
-    if lr_fusion <= 0.0:
-        raise ValueError("`training.lr_fusion` must be positive.")
-    if pos_weight <= 0.0:
-        raise ValueError("`training.pos_weight` must be positive.")
-    return TrainingConfig(
-        freeze_encoders=_require_bool(training, "freeze_encoders"),
-        lr_head=lr_head,
-        lr_fusion=lr_fusion,
-        pos_weight=pos_weight,
-    )
 
 
 def resolve_model_device(config: Mapping[str, Any]) -> torch.device:
@@ -218,19 +136,10 @@ def load_fusion_checkpoint(
     return True
 
 
-def build_binary_classification_loss(
-    training_config: TrainingConfig,
-    device: torch.device | None = None,
-) -> nn.BCEWithLogitsLoss:
-    pos_weight = torch.tensor([training_config.pos_weight], dtype=torch.float32, device=device)
-    return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-
-def fuse_selected_modalities_for_prediction(
+def fuse_selected_modalities(
     registry: nn.ModuleDict,
     batch: Mapping[str, torch.Tensor],
     enabled_modalities: Sequence[str],
-    modality_weights: Mapping[str, float],
     fusion_module: TokenBankFusion,
 ) -> FusionOutput:
     outputs_by_name = {name: registry[name].encode(batch) for name in enabled_modalities}
@@ -238,10 +147,9 @@ def fuse_selected_modalities_for_prediction(
         outputs_by_name=outputs_by_name,
         enabled_modalities=enabled_modalities,
         modality_to_id=MODALITY_TO_ID,
-        modality_weights=modality_weights,
     )
     cls_token, fused_tokens = fusion_module(
-        tokens=token_bank.weighted_tokens,
+        tokens=token_bank.tokens,
         time_ids=token_bank.time_ids,
         modality_ids=token_bank.modality_ids,
     )
@@ -256,41 +164,19 @@ def fuse_selected_modalities_for_prediction(
     )
 
 
-class VideoRealFakeHead(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
-        super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, cls_token: torch.Tensor) -> torch.Tensor:
-        if cls_token.ndim != 2:
-            raise ValueError(
-                f"`cls_token` must have shape [B, dim] for clip-level classification, got {tuple(cls_token.shape)}"
-            )
-        return self.layers(cls_token)
-
-
-class ClipRealFakePredictor(nn.Module):
+class ClipFusionPipeline(nn.Module):
     def __init__(
         self,
         registry: nn.ModuleDict,
         fusion_module: TokenBankFusion,
-        classifier_head: VideoRealFakeHead,
         enabled_modalities: Sequence[str],
-        modality_weights: Mapping[str, float],
         extractors: Mapping[str, FeatureExtractor] | None = None,
         encoder_modules: nn.ModuleDict | None = None,
     ) -> None:
         super().__init__()
         self.registry = registry
         self.fusion_module = fusion_module
-        self.classifier_head = classifier_head
         self.enabled_modalities = tuple(enabled_modalities)
-        self.modality_weights = {name: float(modality_weights[name]) for name in self.enabled_modalities}
         self.extractors = dict(extractors or {})
         self.encoder_modules = encoder_modules if encoder_modules is not None else nn.ModuleDict()
         self.last_feature_timings: dict[str, float] = {}
@@ -344,72 +230,27 @@ class ClipRealFakePredictor(nn.Module):
 
     def fuse(self, batch: Mapping[str, Any]) -> FusionOutput:
         feature_batch = self._move_feature_batch_to_device(self.prepare_features(batch))
-        return fuse_selected_modalities_for_prediction(
+        return fuse_selected_modalities(
             registry=self.registry,
             batch=dict(feature_batch),
             enabled_modalities=self.enabled_modalities,
-            modality_weights=self.modality_weights,
             fusion_module=self.fusion_module,
         )
 
-    def freeze_encoder_parameters(self) -> None:
-        for parameter in self.encoder_modules.parameters():
-            parameter.requires_grad_(False)
-
-    def unfreeze_encoder_parameters(self) -> None:
-        for parameter in self.encoder_modules.parameters():
-            parameter.requires_grad_(True)
-
-    def optimizer_parameter_groups(self, training_config: TrainingConfig) -> list[dict[str, Any]]:
-        groups: list[dict[str, Any]] = []
-        fusion_params = [param for param in self.registry.parameters() if param.requires_grad]
-        fusion_params.extend(param for param in self.fusion_module.parameters() if param.requires_grad)
-        head_params = [param for param in self.classifier_head.parameters() if param.requires_grad]
-        encoder_params = [param for param in self.encoder_modules.parameters() if param.requires_grad]
-
-        if fusion_params:
-            groups.append({"params": fusion_params, "lr": training_config.lr_fusion})
-        if head_params:
-            groups.append({"params": head_params, "lr": training_config.lr_head})
-        if encoder_params:
-            groups.append({"params": encoder_params, "lr": training_config.lr_fusion})
-        return groups
-
-    def build_optimizer(
-        self,
-        training_config: TrainingConfig,
-        weight_decay: float = 0.01,
-    ) -> torch.optim.AdamW:
-        return torch.optim.AdamW(
-            self.optimizer_parameter_groups(training_config),
-            weight_decay=weight_decay,
-        )
-
-    def forward(self, batch: Mapping[str, Any]) -> PredictionOutput:
-        fusion_output = self.fuse(batch)
-        logits = self.classifier_head(fusion_output.cls_token)
-        probs = torch.sigmoid(logits)
-        return PredictionOutput(
-            logits=logits,
-            probs=probs,
-            fusion_output=fusion_output,
-        )
+    def forward(self, batch: Mapping[str, Any]) -> FusionOutput:
+        return self.fuse(batch)
 
     def close(self) -> None:
         for extractor in self.extractors.values():
             extractor.close()
 
 
-def build_prediction_model(
+def build_fusion_pipeline(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
-) -> PredictionBuildResult:
+) -> FusionPipelineBuildResult:
     enabled_modalities = tuple(modalities or _require_modalities(config))
-    dim = _require_int(config, "dim")
     device = resolve_model_device(config)
-    modality_weights = _require_modality_weights(config, enabled_modalities)
-    classifier_config = require_classifier_config(config)
-    training_config = require_training_config(config)
     fusion_config = _require_mapping(config, "fusion")
     validate_branch_token_config(
         config,
@@ -428,33 +269,23 @@ def build_prediction_model(
         fusion_module=fusion_module,
         checkpoint_path=_optional_path(fusion_config, "checkpoint_path"),
     )
-    model = ClipRealFakePredictor(
-        registry=build_registry(dim=dim, config=config),
+    pipeline = ClipFusionPipeline(
+        registry=build_registry(dim=_require_int(config, "dim"), config=config),
         fusion_module=fusion_module,
-        classifier_head=VideoRealFakeHead(
-            input_dim=dim,
-            hidden_dim=classifier_config.hidden_dim,
-            dropout=classifier_config.dropout,
-        ),
         enabled_modalities=enabled_modalities,
-        modality_weights=modality_weights,
         extractors=extractors_result.extractors,
         encoder_modules=_encoder_modules_from_result(encoder_result),
     )
-    if training_config.freeze_encoders:
-        model.freeze_encoder_parameters()
-    model = model.to(device)
-    return PredictionBuildResult(
-        model=model,
-        classifier_config=classifier_config,
-        training_config=training_config,
+    pipeline = pipeline.to(device)
+    return FusionPipelineBuildResult(
+        pipeline=pipeline,
         device=device,
         warnings=extractors_result.warnings,
     )
 
 
-def build_prediction_model_from_yaml(
+def build_fusion_pipeline_from_yaml(
     path: str | Path,
     modalities: Sequence[str] | None = None,
-) -> PredictionBuildResult:
-    return build_prediction_model(load_prediction_yaml(path), modalities=modalities)
+) -> FusionPipelineBuildResult:
+    return build_fusion_pipeline(load_pipeline_yaml(path), modalities=modalities)

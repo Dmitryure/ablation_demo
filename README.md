@@ -20,16 +20,16 @@ raw batch
 
 ### 1. Raw Model Input
 
-Assume the model already receives a batch with the raw inputs needed by modality extractors:
+Assume the fusion pipeline already receives a batch with the raw inputs needed by modality extractors:
 
 - `video`: clip tensor shaped `[B, 3, T, H, W]`
 - `video_rgb_frames`: Python list of raw RGB frames for each clip
 
-The preprocessing path begins in `ClipRealFakePredictor.forward()`, which calls `fuse()`, then `prepare_features()`.
+The preprocessing path begins in `ClipFusionPipeline.forward()`, which calls `fuse()`, then `prepare_features()`.
 
 Relevant code:
 
-- [prediction.py](/home/comp/ablation_task/prediction.py:325)
+- [pipeline.py](/home/comp/ablation_task/pipeline.py:267)
 
 ### 2. Enabled Modalities
 
@@ -54,7 +54,7 @@ For each modality:
 
 Relevant code:
 
-- [prediction.py](/home/comp/ablation_task/prediction.py:325)
+- [pipeline.py](/home/comp/ablation_task/pipeline.py:267)
 
 Extractors do not all behave the same way:
 
@@ -175,10 +175,8 @@ The function:
 - concatenates all modality tokens across the token dimension
 - concatenates all `time_ids`
 - builds `modality_ids`
-- normalizes modality weights
 - builds:
-  - `tokens`: unweighted token bank
-  - `weighted_tokens`: token bank scaled by modality weight
+  - `tokens`: concatenated token bank
 
 Relevant code:
 
@@ -209,7 +207,7 @@ The token bank then goes into `TokenBankFusion`.
 
 Fusion does the following:
 
-1. starts from `weighted_tokens`
+1. starts from `tokens`
 2. adds time embeddings using `time_ids`
 3. adds modality embeddings using `modality_ids`
 4. prepends one learned `CLS` token
@@ -245,7 +243,7 @@ The fusion path returns `FusionOutput`, which includes:
 Relevant code:
 
 - [fusion.py](/home/comp/ablation_task/fusion.py:12)
-- [prediction.py](/home/comp/ablation_task/prediction.py:228)
+- [pipeline.py](/home/comp/ablation_task/pipeline.py:161)
 
 ### Terminology Summary
 
