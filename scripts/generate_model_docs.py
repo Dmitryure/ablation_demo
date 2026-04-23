@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import html
 import shutil
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
@@ -15,29 +12,14 @@ DEFAULT_DOCS_DIR = PROJECT_ROOT / "docs"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from branches.compression import resolve_output_token_count
-
-MODALITY_COLORS: dict[str, tuple[str, str]] = {
-    "rgb": ("#E4572E", "#F6C4B7"),
-    "eye_gaze": ("#4C956C", "#C8E5D5"),
-    "face_mesh": ("#F4A261", "#FCE1C8"),
-    "fau": ("#2E86AB", "#BFDBE8"),
-    "rppg": ("#7B5EA7", "#D9CCE9"),
-}
-DEFAULT_COLOR = ("#6C757D", "#D8DDE3")
-
-
-@dataclass(frozen=True)
-class ModalityDoc:
-    name: str
-    title: str
-    encoder_summary: str
-    projector_summary: str
-    token_formula: str
-    token_count: int | None
-    stroke_color: str
-    fill_color: str
-    note: str
+from scripts.model_architecture_spec import (
+    ArchitectureSpec,
+    ComponentSpec,
+    SourceRef,
+    architecture_spec_to_json,
+    build_architecture_spec,
+    load_yaml,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,173 +41,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
-    if not isinstance(data, dict):
-        raise ValueError(f"Config must be YAML mapping: {path}")
-    return data
-
-
-def format_float(value: float) -> str:
-    rounded = f"{value:.3f}"
-    return rounded.rstrip("0").rstrip(".")
-
-
-def modality_node_id(doc: ModalityDoc) -> str:
-    return doc.name.replace("-", "_")
-
-
-def rgb_token_count(frames: int) -> int | None:
-    if frames != 16:
-        return None
-    return 8
-
-
-def build_modality_doc(
-    name: str,
-    config: dict[str, Any],
-    frames: int,
-    dim: int,
-) -> ModalityDoc:
-    stroke_color, fill_color = MODALITY_COLORS.get(name, DEFAULT_COLOR)
-    if name == "rgb":
-        backbone = "mvit_v2_s"
-        token_count = rgb_token_count(frames)
-        token_formula = str(token_count) if token_count is not None else "unknown"
-        return ModalityDoc(
-            name=name,
-            title="RGB",
-            encoder_summary=f"{backbone} temporal encoder",
-            projector_summary=f"spatial-mean temporal tokens -> Linear(*, {dim})",
-            token_formula=token_formula,
-            token_count=token_count,
-            stroke_color=stroke_color,
-            fill_color=fill_color,
-            note="One token per MViT time step after spatial pooling.",
-        )
-    if name == "eye_gaze":
-        token_count = resolve_output_token_count(config, "eye_gaze")
-        return ModalityDoc(
-            name=name,
-            title="Eye Gaze",
-            encoder_summary="MediaPipe face landmarker",
-            projector_summary=f"8 gaze blendshapes -> MLP -> temporal position encoding -> latent-query pool -> {dim}",
-            token_formula=str(token_count),
-            token_count=token_count,
-            stroke_color=stroke_color,
-            fill_color=fill_color,
-            note="Per-frame gaze features compressed to a fixed clip token budget with order-aware pooling.",
-        )
-    if name == "face_mesh":
-        contour_points = 36
-        output_tokens_per_frame = resolve_output_token_count(config, "face_mesh")
-        return ModalityDoc(
-            name=name,
-            title="Face Mesh",
-            encoder_summary="MediaPipe face landmarker contour points",
-            projector_summary=f"36 contour landmarks x (x,y,z) -> point MLP -> latent-query pool -> {dim}",
-            token_formula=f"{frames} x {output_tokens_per_frame}",
-            token_count=frames * output_tokens_per_frame,
-            stroke_color=stroke_color,
-            fill_color=fill_color,
-            note=f"{contour_points} contour points compressed to {output_tokens_per_frame} tokens per frame.",
-        )
-    if name == "fau":
-        fau_config = config.get("fau", {})
-        backbone = str(fau_config.get("backbone", "unknown"))
-        num_classes = int(fau_config.get("num_classes", 12))
-        output_tokens_per_frame = resolve_output_token_count(config, "fau")
-        return ModalityDoc(
-            name=name,
-            title="FAU",
-            encoder_summary=f"{backbone} + ME-GraphAU",
-            projector_summary=f"AU graph features -> Linear(*, {dim}) -> latent-query pool -> flatten",
-            token_formula=f"{frames} x {output_tokens_per_frame}",
-            token_count=frames * output_tokens_per_frame,
-            stroke_color=stroke_color,
-            fill_color=fill_color,
-            note=f"{num_classes} AU features compressed to {output_tokens_per_frame} tokens per frame.",
-        )
-    if name == "rppg":
-        token_count = resolve_output_token_count(config, "rppg")
-        return ModalityDoc(
-            name=name,
-            title="rPPG",
-            encoder_summary="PhysNet temporal encoder",
-            projector_summary=f"waveform + temporal features -> Linear(*, {dim}) -> temporal position encoding -> latent-query pool",
-            token_formula=str(token_count),
-            token_count=token_count,
-            stroke_color=stroke_color,
-            fill_color=fill_color,
-            note="Temporal features compressed to a fixed clip token budget with order-aware pooling plus raw waveform side output.",
-        )
-    return ModalityDoc(
-        name=name,
-        title=name.replace("_", " ").title(),
-        encoder_summary="custom branch",
-        projector_summary=f"project features -> {dim}",
-        token_formula="custom",
-        token_count=None,
-        stroke_color=stroke_color,
-        fill_color=fill_color,
-        note="Unknown to doc generator. Update script if branch changes.",
-    )
-
-
-def build_modality_docs(config: dict[str, Any]) -> tuple[list[ModalityDoc], dict[str, Any]]:
-    modalities = config.get("modalities")
-    if not isinstance(modalities, list) or not modalities:
-        raise ValueError("`modalities` must be non-empty list.")
-    enabled = [str(item).strip() for item in modalities if str(item).strip()]
-    if not enabled:
-        raise ValueError("No enabled modalities in config.")
-
-    frames = int(config["frames"])
-    dim = int(config["dim"])
-    docs = [
-        build_modality_doc(
-            name=name,
-            config=config,
-            frames=frames,
-            dim=dim,
-        )
-        for name in enabled
-    ]
-    total_tokens = sum(doc.token_count for doc in docs if doc.token_count is not None)
-    all_known = all(doc.token_count is not None for doc in docs)
-    return docs, {
-        "frames": frames,
-        "dim": dim,
-        "total_tokens": total_tokens if all_known else None,
-        "device": str(config.get("device", "unknown")),
-        "modalities": enabled,
-        "fusion": config["fusion"],
-        "dot_available": shutil.which("dot") is not None,
-    }
-
-
 def markdown_table_row(columns: list[str]) -> str:
     return "| " + " | ".join(columns) + " |"
 
 
-def dot_label_text(text: str) -> str:
-    return text.replace("\\", "\\\\").replace('"', '\\"').replace("->", "→")
+def _render_hint() -> str:
+    if shutil.which("dot") is not None:
+        return "`dot` detected locally. Render with `venv/bin/python scripts/render_graphviz.py`."
+    return "`dot` not installed here. Install Graphviz, then run `venv/bin/python scripts/render_graphviz.py`."
 
 
-def render_markdown(
-    config_path: Path,
-    docs: list[ModalityDoc],
-    summary: dict[str, Any],
-) -> str:
-    fusion = summary["fusion"]
-    total_tokens = summary["total_tokens"]
-    total_tokens_text = str(total_tokens) if total_tokens is not None else "unknown"
-    render_hint = (
-        "`dot` detected locally. Render with `venv/bin/python scripts/render_graphviz.py`."
-        if summary["dot_available"]
-        else "`dot` not installed here. Install Graphviz, then run `venv/bin/python scripts/render_graphviz.py`."
-    )
+def _component_rows(spec: ArchitectureSpec, kind: str) -> list[ComponentSpec]:
+    return [component for component in spec.components if component.kind == kind]
+
+
+def _source_label(source: SourceRef | None) -> str:
+    if source is None:
+        return "generated from live code"
+    if source.line is None:
+        return f"`{source.path}`"
+    return f"`{source.path}:{source.line}`"
+
+
+def render_markdown(spec: ArchitectureSpec) -> str:
+    fusion = spec.fusion
     lines = [
         "# Model Architecture",
         "",
@@ -245,39 +84,45 @@ def render_markdown(
         "",
         "## Current Build",
         "",
-        f"- Config: `{config_path.relative_to(PROJECT_ROOT)}`",
-        f"- Modalities: `{', '.join(summary['modalities'])}`",
-        f"- Frames: `{summary['frames']}`",
-        f"- Token dim: `{summary['dim']}`",
-        f"- Token bank size: `{total_tokens_text}`",
-        f"- Runtime device: `{summary['device']}`",
+        f"- Config: `{spec.config_path}`",
+        f"- Enabled modalities: `{', '.join(spec.enabled_modalities)}`",
+        f"- Fixed slot layout: `{', '.join(spec.fixed_slot_modalities)}`",
+        f"- Frames: `{spec.frames}`",
+        f"- Token dim: `{spec.dim}`",
+        f"- Enabled token count: `{spec.enabled_token_count}`",
+        f"- Fixed token bank size: `{spec.total_tokens}`",
+        f"- Runtime device: `{spec.device}`",
         f"- Fusion: `TokenBankFusion`, layers=`{fusion['num_layers']}`, heads=`{fusion['num_heads']}`, mlp_ratio=`{fusion['mlp_ratio']}`, max_time_steps=`{fusion['max_time_steps']}`",
-        f"- Fusion internals: `CLS token` + `time embedding` + `modality embedding` + `TransformerEncoderLayer x{fusion['num_layers']}` + `LayerNorm`",
-        f"- Output contract: `FusionOutput.cls_token` gives the fused clip summary, `FusionOutput.fused_tokens` keeps the full mixed token sequence",
-        f"- Graphviz status: {render_hint}",
+        f"- Graphviz status: {_render_hint()}",
         "",
-        "## Modality Summary",
+        "## Modality Components",
         "",
         markdown_table_row(
             [
-                "Modality",
-                "Encoder",
-                "Projection",
-                "Token Formula",
-                "Note",
+                "Component",
+                "Status",
+                "Input",
+                "Stages",
+                "Output",
+                "Source",
             ]
         ),
-        markdown_table_row(["---", "---", "---", "---", "---"]),
+        markdown_table_row(["---", "---", "---", "---", "---", "---"]),
     ]
-    for doc in docs:
+
+    for component in _component_rows(spec, "modality"):
+        stage_summary = " -> ".join(
+            f"{stage.title}: {stage.detail}" for stage in component.stages
+        )
         lines.append(
             markdown_table_row(
                 [
-                    doc.title,
-                    doc.encoder_summary,
-                    doc.projector_summary,
-                    doc.token_formula,
-                    doc.note,
+                    component.title,
+                    "enabled" if component.enabled else "reserved",
+                    component.input_summary,
+                    stage_summary,
+                    f"{component.output_summary}; {component.token_formula}",
+                    _source_label(component.source),
                 ]
             )
         )
@@ -285,86 +130,147 @@ def render_markdown(
     lines.extend(
         [
             "",
-            "## Graphviz Files",
+            "## Shared Flow",
             "",
-            "- `docs/model_architecture.dot`: source of truth for diagram layout.",
+            markdown_table_row(["Component", "Stages", "Output", "Source"]),
+            markdown_table_row(["---", "---", "---", "---"]),
+        ]
+    )
+    for component in [c for c in spec.components if c.kind in {"token_bank", "fusion"}]:
+        stage_summary = " -> ".join(f"{stage.title}: {stage.detail}" for stage in component.stages)
+        lines.append(
+            markdown_table_row(
+                [
+                    component.title,
+                    stage_summary,
+                    component.output_summary,
+                    _source_label(component.source),
+                ]
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Generated Files",
+            "",
+            "- `docs/model_architecture.json`: machine-readable architecture spec from live code and config.",
+            "- `docs/model_architecture.md`: generated human-readable summary.",
+            "- `docs/model_architecture.dot`: Graphviz source derived from the architecture spec.",
             "- `docs/model_architecture.svg`: rendered Graphviz output after running render script.",
-            "- `docs/model_graphics.md`: repo workflow notes.",
             "",
         ]
     )
     return "\n".join(lines) + "\n"
 
 
-def render_dot(docs: list[ModalityDoc], summary: dict[str, Any]) -> str:
-    fusion = summary["fusion"]
-    total_tokens = summary["total_tokens"]
-    total_tokens_text = str(total_tokens) if total_tokens is not None else "unknown"
-    lines = [
-        "digraph model_architecture {",
-        "  rankdir=LR;",
-        '  graph [pad="0.35", nodesep="0.8", ranksep="1.15", bgcolor="white", splines=ortho];',
-        '  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.2,0.14"];',
-        '  edge [color="#52606D", penwidth=1.7, arrowsize=0.8];',
-        "",
-        f'  video [label="Input Video\\n{summary["frames"]} sampled frames", fillcolor="#FFFFFF", color="#7B8794"];',
-    ]
+def _escape_text(text: str) -> str:
+    return html.escape(text, quote=False)
 
-    for doc in docs:
-        node_id = modality_node_id(doc)
-        lines.append(
+
+def _source_href(source: SourceRef | None, docs_dir: Path) -> str | None:
+    if source is None:
+        return None
+    source_path = PROJECT_ROOT / source.path
+    return str(Path("..") / source_path.relative_to(PROJECT_ROOT))
+
+
+def _source_tooltip(source: SourceRef | None) -> str | None:
+    if source is None:
+        return None
+    if source.line is None:
+        return f"{source.path} ({source.symbol})"
+    return f"{source.path}:{source.line} ({source.symbol})"
+
+
+def _card_label(component: ComponentSpec) -> str:
+    rows = [
+        ("Status", "enabled" if component.enabled else "reserved"),
+        ("Input", component.input_summary),
+    ]
+    rows.extend((stage.title, stage.detail) for stage in component.stages)
+    if component.output_summary:
+        rows.append(("Output", component.output_summary))
+    if component.token_formula:
+        rows.append(("Formula", component.token_formula))
+    if component.note:
+        rows.append(("Note", component.note))
+
+    parts = [
+        '<',
+        (
+            f'<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="6" '
+            f'COLOR="{component.stroke_color}" BGCOLOR="{component.fill_color}">'
+        ),
+        (
+            f'<TR><TD ALIGN="LEFT" BGCOLOR="{component.stroke_color}">'
+            f'<FONT COLOR="white"><B>{_escape_text(component.title)}</B></FONT></TD></TR>'
+        ),
+    ]
+    for label, value in rows:
+        parts.append(
             (
-                f'  {node_id} [label="{dot_label_text(doc.title)}\\n{dot_label_text(doc.encoder_summary)}'
-                f'\\n{dot_label_text(doc.projector_summary)}\\ntokens={dot_label_text(doc.token_formula)}'
-                f'", fillcolor="{doc.fill_color}", color="{doc.stroke_color}"];'
+                '<TR><TD ALIGN="LEFT" BALIGN="LEFT">'
+                f'<FONT POINT-SIZE="10"><B>{_escape_text(label)}:</B> {_escape_text(value)}</FONT>'
+                "</TD></TR>"
             )
         )
+    parts.append("</TABLE>>")
+    return "".join(parts)
 
-    lines.extend(
-        [
-            f'  bank [label="Token Bank\\ntotal tokens={total_tokens_text}", fillcolor="#FFF4CC", color="#B38600"];',
-            f'  time [label="Time Embedding\\nmax_time_steps={fusion["max_time_steps"]}", fillcolor="#FFF4CC", color="#B38600"];',
-            f'  cls_in [label="CLS Token\\n[1 x {summary["dim"]}]", fillcolor="#FFF4CC", color="#B38600"];',
-            f'  modality [label="Modality Embedding\\n{len(docs)} active ids", fillcolor="#FFF4CC", color="#B38600"];',
-            (
-                f'  encoder [label="TransformerEncoder\\nTransformerEncoderLayer x{fusion["num_layers"]}'
-                f'\\nheads={fusion["num_heads"]}, mlp_ratio={fusion["mlp_ratio"]}", '
-                'fillcolor="#DCEAF7", color="#295C8A"];'
-            ),
-            (
-                f'  layer_hint [label="TransformerEncoderLayer x{fusion["num_layers"]}'
-                f'\\nheads={fusion["num_heads"]}\\nmlp_ratio={fusion["mlp_ratio"]}", '
-                'fillcolor="#EAF2FA", color="#5B7FA3"];'
-            ),
-            '  norm [label="LayerNorm\\noutput_norm", fillcolor="#DCEAF7", color="#295C8A"];',
-            f'  cls [label="CLS Output\\n[1 x {summary["dim"]}]", fillcolor="#DCEAF7", color="#295C8A"];',
-            f'  tokens [label="Fused Tokens\\n[1 + {total_tokens_text} x {summary["dim"]}]", fillcolor="#FFFFFF", color="#295C8A", style="rounded,dashed,filled"];',
-            "",
-            "  { rank=same; video; " + "; ".join(modality_node_id(doc) for doc in docs) + "; }",
-            "  { rank=same; bank; time; cls_in; modality; }",
-            "  { rank=same; encoder; layer_hint; norm; cls; tokens; }",
-            "",
-        ]
+
+def _node_attributes(component: ComponentSpec, docs_dir: Path) -> str:
+    attributes = [f"label={_card_label(component)}"]
+    tooltip = _source_tooltip(component.source)
+    href = _source_href(component.source, docs_dir)
+    if tooltip is not None:
+        attributes.append(f'tooltip="{_escape_text(tooltip)}"')
+    if href is not None:
+        attributes.append(f'href="{_escape_text(href)}"')
+    return ", ".join(attributes)
+
+
+def render_dot(spec: ArchitectureSpec, docs_dir: Path) -> str:
+    lines = [
+        "digraph model_architecture {",
+        "  rankdir=TB;",
+        '  graph [pad="0.35", nodesep="0.5", ranksep="0.8", bgcolor="white", splines=polyline, newrank=true];',
+        '  node [shape=plain, fontname="Helvetica"];',
+        '  edge [color="#52606D", penwidth=1.7, arrowsize=0.8, fontname="Helvetica"];',
+        "",
+    ]
+
+    cluster_order = (
+        ("inputs", "Inputs", "#D9E2EC", "#F8FAFC"),
+        ("modalities", "Modality Tokenization", "#D9E2EC", "#F8FAFC"),
+        ("shared", "Token Bank And Fusion", "#F7D070", "#FFF9E6"),
+        ("outputs", "Outputs", "#C3D7F0", "#F4F8FC"),
     )
+    for cluster_name, label, color, fillcolor in cluster_order:
+        cluster_components = [component for component in spec.components if component.cluster == cluster_name]
+        if not cluster_components:
+            continue
+        lines.extend(
+            [
+                f"  subgraph cluster_{cluster_name} {{",
+                f'    label="{label}";',
+                f'    color="{color}";',
+                '    style="rounded,filled";',
+                f'    fillcolor="{fillcolor}";',
+                f'    pencolor="{color}";',
+                "    margin=18;",
+            ]
+        )
+        for component in cluster_components:
+            lines.append(f"    {component.id} [{_node_attributes(component, docs_dir)}];")
+        lines.append("  }")
+        lines.append("")
 
-    for doc in docs:
-        node_id = modality_node_id(doc)
-        lines.append(f"  video -> {node_id};")
-        lines.append(f"  {node_id} -> bank;")
+    for edge in spec.edges:
+        label = f' [label="{_escape_text(edge.label)}"]' if edge.label else ""
+        lines.append(f"  {edge.source} -> {edge.target}{label};")
 
-    lines.extend(
-        [
-            "  bank -> encoder;",
-            "  time -> encoder;",
-            "  cls_in -> encoder;",
-            "  modality -> encoder;",
-            '  encoder -> layer_hint [style=dashed, arrowhead=none, color="#7B8794"];',
-            "  encoder -> norm;",
-            "  norm -> cls;",
-            "  norm -> tokens;",
-            "}",
-        ]
-    )
+    lines.append("}")
     return "\n".join(lines) + "\n"
 
 
@@ -379,14 +285,13 @@ def main() -> None:
     docs_dir = args.docs_dir.resolve()
 
     config = load_yaml(config_path)
-    docs, summary = build_modality_docs(config)
+    spec = build_architecture_spec(config, config_path=config_path)
 
-    markdown = render_markdown(config_path, docs, summary)
-    dot_source = render_dot(docs, summary)
+    write_text(docs_dir / "model_architecture.json", architecture_spec_to_json(spec))
+    write_text(docs_dir / "model_architecture.md", render_markdown(spec))
+    write_text(docs_dir / "model_architecture.dot", render_dot(spec, docs_dir=docs_dir))
 
-    write_text(docs_dir / "model_architecture.md", markdown)
-    write_text(docs_dir / "model_architecture.dot", dot_source)
-
+    print(f"wrote: {docs_dir / 'model_architecture.json'}")
     print(f"wrote: {docs_dir / 'model_architecture.md'}")
     print(f"wrote: {docs_dir / 'model_architecture.dot'}")
 
