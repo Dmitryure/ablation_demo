@@ -16,7 +16,7 @@ from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
 from fusion import TokenBankFusion
 from pipeline import ClipFusionPipeline, build_fusion_pipeline, resolve_model_device
-from registry import MODALITY_TO_ID, build_registry
+from registry import FIXED_SLOT_MODALITIES, MODALITY_TO_ID, build_registry
 
 
 def fake_eye_gaze_detector(_: np.ndarray) -> dict[str, float]:
@@ -97,7 +97,7 @@ def build_test_pipeline(
             num_heads=4,
             mlp_ratio=2.0,
             dropout=0.0,
-            max_time_steps=16,
+            max_time_steps=32,
             num_modalities=len(MODALITY_TO_ID),
         ),
         enabled_modalities=enabled_modalities,
@@ -127,9 +127,11 @@ class PipelineTest(unittest.TestCase):
         output = pipeline(build_raw_batch())
 
         self.assertEqual(tuple(output.tokens.shape), (1, 64, 16))
+        self.assertEqual(tuple(output.token_mask.shape), (64,))
         self.assertEqual(tuple(output.fused.shape), (1, 16))
         self.assertEqual(tuple(output.cls_token.shape), (1, 16))
         self.assertEqual(tuple(output.fused_tokens.shape), (1, 65, 16))
+        self.assertEqual(output.modality_names, FIXED_SLOT_MODALITIES)
 
     def test_prepare_features_reuses_precomputed_modalities(self):
         pipeline = build_test_pipeline(enabled_modalities=("fau", "rppg"))
@@ -155,13 +157,31 @@ class PipelineTest(unittest.TestCase):
 
         output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 20, 16))
-        self.assertEqual(tuple(output.fused_tokens.shape), (1, 21, 16))
+        self.assertEqual(tuple(output.tokens.shape), (1, 64, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 65, 16))
+        self.assertEqual(int(output.token_mask.sum().item()), 20)
+        self.assertTrue(torch.count_nonzero(output.tokens[:, :40]).item() == 0)
         self.assertTrue(
             torch.equal(
                 output.modality_ids,
                 torch.tensor(
-                    [MODALITY_TO_ID["face_mesh"]] * 16 + [MODALITY_TO_ID["rppg"]] * 4
+                    [MODALITY_TO_ID["rgb"]] * 8
+                    + [MODALITY_TO_ID["fau"]] * 32
+                    + [MODALITY_TO_ID["rppg"]] * 4
+                    + [MODALITY_TO_ID["eye_gaze"]] * 4
+                    + [MODALITY_TO_ID["face_mesh"]] * 16
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output.token_mask,
+                torch.tensor(
+                    [False] * 8
+                    + [False] * 32
+                    + [True] * 4
+                    + [False] * 4
+                    + [True] * 16
                 ),
             )
         )
@@ -182,7 +202,7 @@ class PipelineTest(unittest.TestCase):
                 "num_heads": 4,
                 "mlp_ratio": 2.0,
                 "dropout": 0.0,
-                "max_time_steps": 16,
+                "max_time_steps": 32,
                 "checkpoint_path": None,
             },
             "rgb": {
@@ -197,7 +217,7 @@ class PipelineTest(unittest.TestCase):
                 "checkpoint_path": None,
             },
             "eye_gaze": {},
-            "face_mesh": {"output_tokens_per_frame": 2},
+            "face_mesh": {"slot_count": 12},
         }
 
         encoder_result = EncoderFactoryResult(
@@ -217,7 +237,7 @@ class PipelineTest(unittest.TestCase):
 
         self.assertEqual(str(build_result.device), "cpu")
         self.assertEqual(str(next(build_result.pipeline.parameters()).device), "cpu")
-        self.assertEqual(build_result.pipeline.registry["face_mesh"].output_tokens_per_frame, 2)
+        self.assertEqual(build_result.pipeline.registry["face_mesh"].slot_count, 12)
         build_result.pipeline.close()
 
     def test_build_fusion_pipeline_rejects_fusion_max_time_step_mismatch(self):
@@ -233,7 +253,7 @@ class PipelineTest(unittest.TestCase):
                 "num_heads": 4,
                 "mlp_ratio": 2.0,
                 "dropout": 0.0,
-                "max_time_steps": 3,
+                "max_time_steps": 31,
                 "checkpoint_path": None,
             },
             "rgb": {
@@ -246,7 +266,6 @@ class PipelineTest(unittest.TestCase):
             },
             "rppg": {
                 "checkpoint_path": None,
-                "output_tokens_per_clip": 4,
             },
             "eye_gaze": {},
             "face_mesh": {},

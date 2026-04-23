@@ -5,20 +5,26 @@ from typing import Mapping, Tuple
 import torch
 
 from branches.base import ModalityBranch, ModalityOutput, mlp
-from branches.compression import DEFAULT_OUTPUT_TOKENS, LatentQueryPooling, validate_positive_int
+from branches.compression import (
+    DEFAULT_SLOT_COUNTS,
+    LatentQueryPooling,
+    TemporalLatentQueryPooling,
+    validate_positive_int,
+)
+
+
+POINT_QUERY_TOKENS = 1
 
 
 class FaceMeshBranch(ModalityBranch):
     name = "face_mesh"
 
-    def __init__(self, dim: int, output_tokens_per_frame: int = DEFAULT_OUTPUT_TOKENS["face_mesh"]):
+    def __init__(self, dim: int, slot_count: int = DEFAULT_SLOT_COUNTS["face_mesh"]):
         super().__init__()
-        self.output_tokens_per_frame = validate_positive_int(
-            output_tokens_per_frame,
-            "face_mesh.output_tokens_per_frame",
-        )
+        self.slot_count = validate_positive_int(slot_count, "face_mesh.slot_count")
         self.proj = mlp(3, dim, dim)
-        self.pool = LatentQueryPooling(dim=dim, output_tokens=self.output_tokens_per_frame)
+        self.point_pool = LatentQueryPooling(dim=dim, output_tokens=POINT_QUERY_TOKENS)
+        self.clip_pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
     def required_keys(self) -> Tuple[str, ...]:
         return ("face_mesh",)
@@ -33,18 +39,20 @@ class FaceMeshBranch(ModalityBranch):
 
         batch_size, num_frames, num_points, _ = face_mesh.shape
         projected_tokens = self.proj(face_mesh)
-        pooled_tokens = self.pool(projected_tokens.reshape(batch_size * num_frames, num_points, -1))
-        tokens = pooled_tokens.reshape(batch_size, num_frames * self.output_tokens_per_frame, -1)
-        time_ids = torch.arange(num_frames, device=face_mesh.device).repeat_interleave(
-            self.output_tokens_per_frame
-        )
+        frame_tokens = self.point_pool(projected_tokens.reshape(batch_size * num_frames, num_points, -1))
+        clip_tokens = frame_tokens.reshape(batch_size, num_frames * POINT_QUERY_TOKENS, -1)
+        tokens = self.clip_pool(clip_tokens)
+        time_ids = torch.arange(self.slot_count, device=face_mesh.device)
         debug = {
             "input_shape": tuple(face_mesh.shape),
             "projected_token_shape": tuple(projected_tokens.shape),
+            "frame_token_shape": tuple(frame_tokens.shape),
+            "clip_token_shape": tuple(clip_tokens.shape),
             "token_shape": tuple(tokens.shape),
             "token_count": tokens.shape[1],
             "num_frames": num_frames,
             "num_points": num_points,
-            "output_tokens_per_frame": self.output_tokens_per_frame,
+            "point_query_tokens": POINT_QUERY_TOKENS,
+            "slot_count": self.slot_count,
         }
         return ModalityOutput(tokens=tokens, time_ids=time_ids, debug=debug)

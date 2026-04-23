@@ -6,20 +6,26 @@ import torch
 import torch.nn as nn
 
 from branches.base import ModalityBranch, ModalityOutput
-from branches.compression import DEFAULT_OUTPUT_TOKENS, LatentQueryPooling, validate_positive_int
+from branches.compression import (
+    DEFAULT_SLOT_COUNTS,
+    LatentQueryPooling,
+    TemporalLatentQueryPooling,
+    validate_positive_int,
+)
+
+
+FRAME_QUERY_TOKENS = 2
 
 
 class FAUBranch(ModalityBranch):
     name = "fau"
 
-    def __init__(self, dim: int, output_tokens_per_frame: int = DEFAULT_OUTPUT_TOKENS["fau"]):
+    def __init__(self, dim: int, slot_count: int = DEFAULT_SLOT_COUNTS["fau"]):
         super().__init__()
-        self.output_tokens_per_frame = validate_positive_int(
-            output_tokens_per_frame,
-            "fau.output_tokens_per_frame",
-        )
+        self.slot_count = validate_positive_int(slot_count, "fau.slot_count")
         self.proj = nn.LazyLinear(dim)
-        self.pool = LatentQueryPooling(dim=dim, output_tokens=self.output_tokens_per_frame)
+        self.frame_pool = LatentQueryPooling(dim=dim, output_tokens=FRAME_QUERY_TOKENS)
+        self.clip_pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
     def required_keys(self) -> Tuple[str, ...]:
         return ("fau_features",)
@@ -36,21 +42,23 @@ class FAUBranch(ModalityBranch):
         au_edge_logits = batch.get("fau_au_edge_logits")
         batch_size, num_frames, num_au, _ = fau_features.shape
         projected_tokens = self.proj(fau_features)
-        pooled_tokens = self.pool(projected_tokens.reshape(batch_size * num_frames, num_au, -1))
-        tokens = pooled_tokens.reshape(batch_size, num_frames * self.output_tokens_per_frame, -1)
-        time_ids = torch.arange(num_frames, device=fau_features.device).repeat_interleave(
-            self.output_tokens_per_frame
-        )
+        frame_tokens = self.frame_pool(projected_tokens.reshape(batch_size * num_frames, num_au, -1))
+        clip_tokens = frame_tokens.reshape(batch_size, num_frames * FRAME_QUERY_TOKENS, -1)
+        tokens = self.clip_pool(clip_tokens)
+        time_ids = torch.arange(self.slot_count, device=fau_features.device)
 
         debug = {
             "input_shape": tuple(fau_features.shape),
             "feature_shape": tuple(fau_features.shape),
             "projected_token_shape": tuple(projected_tokens.shape),
+            "frame_token_shape": tuple(frame_tokens.shape),
+            "clip_token_shape": tuple(clip_tokens.shape),
             "token_shape": tuple(tokens.shape),
             "token_count": tokens.shape[1],
             "num_frames": num_frames,
             "num_au": num_au,
-            "output_tokens_per_frame": self.output_tokens_per_frame,
+            "frame_query_tokens": FRAME_QUERY_TOKENS,
+            "slot_count": self.slot_count,
             "au_logits": au_logits.detach() if isinstance(au_logits, torch.Tensor) else None,
             "au_edge_logits": (
                 au_edge_logits.detach() if isinstance(au_edge_logits, torch.Tensor) else None

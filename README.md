@@ -123,11 +123,12 @@ This is the first point where all modalities become compatible with the shared f
 Key idea:
 
 - `dim` is the common token width
-- `N` can differ by modality
+- `N` is the fixed slot budget for that modality
 
 #### RGB Branch
 
-Projects `rgb_features` into `[B, N_rgb, dim]`.
+Projects `rgb_features`, then applies temporal latent-query pooling into
+`[B, rgb.slot_count, dim]`.
 
 - [branches/rgb.py](/home/comp/ablation_task/branches/rgb.py:21)
 
@@ -135,7 +136,7 @@ Projects `rgb_features` into `[B, N_rgb, dim]`.
 
 Projects per-frame gaze features, adds temporal positional encoding, then applies learned
 latent-query temporal pooling into
-`[B, output_tokens_per_clip, dim]`.
+`[B, eye_gaze.slot_count, dim]`.
 With the current config, this is `[B, 4, dim]`.
 
 - [branches/eye_gaze.py](/home/comp/ablation_task/branches/eye_gaze.py:59)
@@ -144,7 +145,7 @@ With the current config, this is `[B, 4, dim]`.
 
 Projects temporal rPPG features, adds temporal positional encoding, then applies learned
 latent-query temporal pooling into
-`[B, output_tokens_per_clip, dim]`.
+`[B, rppg.slot_count, dim]`.
 With the current config, this is `[B, 4, dim]`.
 
 - [branches/rppg.py](/home/comp/ablation_task/branches/rppg.py:181)
@@ -152,27 +153,31 @@ With the current config, this is `[B, 4, dim]`.
 #### FAU Branch
 
 Projects `[B, T, num_au, F]`, pools AU tokens inside each frame with learned latent queries,
-then reshapes into `[B, T * output_tokens_per_frame, dim]`.
-With the current config, this is `[B, T * 2, dim]`.
+then applies clip-level temporal pooling into `[B, fau.slot_count, dim]`.
+With the current config, this is `[B, 32, dim]`.
 
 - [branches/fau.py](/home/comp/ablation_task/branches/fau.py:133)
 
 #### Face Mesh Branch
 
 Projects `[B, T, num_points, 3]`, pools point tokens inside each frame with learned latent queries,
-then reshapes into `[B, T * output_tokens_per_frame, dim]`.
-With the current config, this is `[B, T, dim]`.
+then applies clip-level temporal pooling into `[B, face_mesh.slot_count, dim]`.
+With the current config, this is `[B, 16, dim]`.
 
 - [branches/face_mesh.py](/home/comp/ablation_task/branches/face_mesh.py:94)
 
 ### 5. Token Bank Assembly
 
-Once each branch has emitted tokens, the model assembles a single token bank.
+Once each enabled branch has emitted tokens, the model assembles a single fixed-layout token bank.
 This happens in `prepare_token_bank()`.
 
 The function:
 
+- iterates over the fixed supported layout `rgb`, `fau`, `rppg`, `eye_gaze`, `face_mesh`
+- inserts real tokens for enabled modalities
+- inserts zero-filled reserved slots for disabled modalities
 - concatenates all modality tokens across the token dimension
+- builds `token_mask`
 - concatenates all `time_ids`
 - builds `modality_ids`
 - builds:
@@ -185,7 +190,8 @@ Relevant code:
 This is the token bank:
 
 - shape: `[B, total_tokens, dim]`
-- all enabled modality tokens live in one shared sequence
+- all supported modality segments live in one shared sequence
+- disabled segments stay present with zero tokens and `False` in `token_mask`
 - tokens still keep identity through `time_ids` and `modality_ids`
 
 Example mental model:
@@ -196,7 +202,7 @@ RGB: 8
 + rPPG: 4
 + Eye Gaze: 4
 + Face Mesh: 16
-= token bank
+= fixed token bank
 ```
 
 With the current YAML defaults, the token bank has `64` tokens per 16-frame clip.
@@ -210,8 +216,9 @@ Fusion does the following:
 1. starts from `tokens`
 2. adds time embeddings using `time_ids`
 3. adds modality embeddings using `modality_ids`
-4. prepends one learned `CLS` token
-5. sends the full sequence through a Transformer encoder
+4. builds a padding mask from `token_mask`
+5. prepends one learned `CLS` token
+6. sends the full sequence through a Transformer encoder
 
 Relevant code:
 
@@ -236,6 +243,7 @@ The fusion path returns `FusionOutput`, which includes:
 - `fused_tokens`: token sequence after transformer mixing, including `CLS`
 - `cls_token`: first token after transformer, shape `[B, dim]`
 - `fused`: same tensor as `cls_token`
+- `token_mask`: boolean validity mask for the fixed slot bank
 - `time_ids`
 - `modality_ids`
 - `modality_names`

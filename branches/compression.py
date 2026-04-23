@@ -8,23 +8,20 @@ import torch.nn as nn
 
 
 OUTPUT_TOKEN_CONFIG_KEYS = {
-    "eye_gaze": "output_tokens_per_clip",
-    "rppg": "output_tokens_per_clip",
-    "face_mesh": "output_tokens_per_frame",
-    "fau": "output_tokens_per_frame",
+    "rgb": "slot_count",
+    "fau": "slot_count",
+    "rppg": "slot_count",
+    "eye_gaze": "slot_count",
+    "face_mesh": "slot_count",
 }
 
-DEFAULT_OUTPUT_TOKENS = {
-    "eye_gaze": 4,
-    "rppg": 4,
-    "face_mesh": 1,
-    "fau": 2,
-}
-
-FIXED_MODALITY_TIME_STEPS = {
+DEFAULT_SLOT_COUNTS = {
     "rgb": 8,
+    "fau": 32,
+    "rppg": 4,
+    "eye_gaze": 4,
+    "face_mesh": 16,
 }
-
 
 def validate_positive_int(value: int, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -32,11 +29,11 @@ def validate_positive_int(value: int, field_name: str) -> int:
     return value
 
 
-def resolve_output_token_count(config: Mapping[str, Any] | None, modality_name: str) -> int:
-    if modality_name not in DEFAULT_OUTPUT_TOKENS:
-        raise KeyError(f"Unsupported output-token config lookup for modality `{modality_name}`.")
+def resolve_slot_count(config: Mapping[str, Any] | None, modality_name: str) -> int:
+    if modality_name not in DEFAULT_SLOT_COUNTS:
+        raise KeyError(f"Unsupported slot-count config lookup for modality `{modality_name}`.")
 
-    default_value = DEFAULT_OUTPUT_TOKENS[modality_name]
+    default_value = DEFAULT_SLOT_COUNTS[modality_name]
     if config is None:
         return default_value
 
@@ -59,26 +56,22 @@ def require_modality_frames(config: Mapping[str, Any]) -> int:
 
 
 def required_fusion_time_steps(config: Mapping[str, Any], modality_name: str) -> int | None:
-    if modality_name in FIXED_MODALITY_TIME_STEPS:
-        return FIXED_MODALITY_TIME_STEPS[modality_name]
-    if modality_name in ("eye_gaze", "rppg"):
-        return resolve_output_token_count(config, modality_name)
-    if modality_name in ("face_mesh", "fau"):
-        return require_modality_frames(config)
-    return None
+    if modality_name not in DEFAULT_SLOT_COUNTS:
+        return None
+    return resolve_slot_count(config, modality_name)
 
 
 def validate_branch_token_config(
     config: Mapping[str, Any] | None,
-    modalities: Sequence[str] = DEFAULT_OUTPUT_TOKENS.keys(),
+    modalities: Sequence[str] = DEFAULT_SLOT_COUNTS.keys(),
     fusion_max_time_steps: int | None = None,
 ) -> None:
     if config is None:
         return
 
     for modality_name in modalities:
-        if modality_name in DEFAULT_OUTPUT_TOKENS:
-            resolve_output_token_count(config, modality_name)
+        if modality_name in DEFAULT_SLOT_COUNTS:
+            resolve_slot_count(config, modality_name)
 
     if fusion_max_time_steps is None:
         return

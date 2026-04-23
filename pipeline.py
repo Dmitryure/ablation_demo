@@ -13,7 +13,7 @@ from branches.compression import validate_branch_token_config
 from encoders import EncoderFactoryResult, build_local_encoders
 from extractors import FeatureExtractor, build_extractors_from_encoders
 from fusion import FusionOutput, TokenBankFusion, prepare_token_bank
-from registry import MODALITY_TO_ID, build_registry
+from registry import FIXED_SLOT_MODALITIES, MODALITY_TO_ID, build_registry, registry_slot_counts
 
 
 OPTIONAL_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
@@ -147,15 +147,19 @@ def fuse_selected_modalities(
         outputs_by_name=outputs_by_name,
         enabled_modalities=enabled_modalities,
         modality_to_id=MODALITY_TO_ID,
+        fixed_slot_modalities=FIXED_SLOT_MODALITIES,
+        slot_counts=registry_slot_counts(registry),
     )
     cls_token, fused_tokens = fusion_module(
         tokens=token_bank.tokens,
+        token_mask=token_bank.token_mask,
         time_ids=token_bank.time_ids,
         modality_ids=token_bank.modality_ids,
     )
     return FusionOutput(
         fused=cls_token,
         tokens=token_bank.tokens,
+        token_mask=token_bank.token_mask,
         time_ids=token_bank.time_ids,
         modality_ids=token_bank.modality_ids,
         modality_names=token_bank.modality_names,
@@ -254,7 +258,7 @@ def build_fusion_pipeline(
     fusion_config = _require_mapping(config, "fusion")
     validate_branch_token_config(
         config,
-        modalities=enabled_modalities,
+        modalities=FIXED_SLOT_MODALITIES,
         fusion_max_time_steps=_require_int(fusion_config, "max_time_steps"),
     )
 

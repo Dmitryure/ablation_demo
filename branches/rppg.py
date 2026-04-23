@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from branches.base import ModalityBranch, ModalityOutput
 from branches.compression import (
-    DEFAULT_OUTPUT_TOKENS,
+    DEFAULT_SLOT_COUNTS,
     TemporalLatentQueryPooling,
     validate_positive_int,
 )
@@ -16,14 +16,11 @@ from branches.compression import (
 class RPPGBranch(ModalityBranch):
     name = "rppg"
 
-    def __init__(self, dim: int, output_tokens_per_clip: int = DEFAULT_OUTPUT_TOKENS["rppg"]):
+    def __init__(self, dim: int, slot_count: int = DEFAULT_SLOT_COUNTS["rppg"]):
         super().__init__()
-        self.output_tokens_per_clip = validate_positive_int(
-            output_tokens_per_clip,
-            "rppg.output_tokens_per_clip",
-        )
+        self.slot_count = validate_positive_int(slot_count, "rppg.slot_count")
         self.proj = nn.LazyLinear(dim)
-        self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.output_tokens_per_clip)
+        self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
     def required_keys(self) -> Tuple[str, ...]:
         return ("rppg_features",)
@@ -40,7 +37,7 @@ class RPPGBranch(ModalityBranch):
         projected_tokens = self.proj(temporal_features)
         tokens = self.pool(projected_tokens)
         num_frames = temporal_features.shape[1]
-        time_ids = torch.arange(self.output_tokens_per_clip, device=temporal_features.device)
+        time_ids = torch.arange(self.slot_count, device=temporal_features.device)
         debug = {
             "input_shape": tuple(temporal_features.shape),
             "waveform_shape": tuple(waveform.shape) if isinstance(waveform, torch.Tensor) else None,
@@ -49,7 +46,7 @@ class RPPGBranch(ModalityBranch):
             "token_shape": tuple(tokens.shape),
             "token_count": tokens.shape[1],
             "num_frames": num_frames,
-            "output_tokens_per_clip": self.output_tokens_per_clip,
+            "slot_count": self.slot_count,
             "time_ids": tuple(time_ids.tolist()),
             "waveform": waveform.detach() if isinstance(waveform, torch.Tensor) else None,
         }

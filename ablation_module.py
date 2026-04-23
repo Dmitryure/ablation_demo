@@ -34,6 +34,7 @@ from pipeline import (
 )
 from registry import (
     CURRENT_MODALITIES,
+    FIXED_SLOT_MODALITIES,
     FULL_MODALITIES,
     MODALITY_TO_ID,
     PENDING_MODALITIES,
@@ -45,6 +46,7 @@ from registry import (
 
 __all__ = [
     "CURRENT_MODALITIES",
+    "FIXED_SLOT_MODALITIES",
     "FULL_MODALITIES",
     "MODALITY_TO_ID",
     "PENDING_MODALITIES",

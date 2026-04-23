@@ -13,6 +13,7 @@ from branches import ModalityOutput
 class FusionOutput:
     fused: torch.Tensor
     tokens: torch.Tensor
+    token_mask: torch.Tensor
     time_ids: torch.Tensor
     modality_ids: torch.Tensor
     modality_names: tuple[str, ...]
@@ -23,6 +24,7 @@ class FusionOutput:
 @dataclass(frozen=True)
 class TokenBankBatch:
     tokens: torch.Tensor
+    token_mask: torch.Tensor
     time_ids: torch.Tensor
     modality_ids: torch.Tensor
     modality_names: tuple[str, ...]
@@ -64,23 +66,49 @@ def prepare_token_bank(
     outputs_by_name: Mapping[str, ModalityOutput],
     enabled_modalities: Sequence[str],
     modality_to_id: Mapping[str, int],
+    fixed_slot_modalities: Sequence[str],
+    slot_counts: Mapping[str, int],
 ) -> TokenBankBatch:
+    unsupported = [name for name in enabled_modalities if name not in fixed_slot_modalities]
+    if unsupported:
+        raise ValueError(f"Fixed-slot token bank does not support modalities: {unsupported}")
+    if not outputs_by_name:
+        raise ValueError("At least one enabled modality output is required to build the token bank.")
+
     tokens_by_modality: list[torch.Tensor] = []
+    token_mask_by_modality: list[torch.Tensor] = []
     time_ids_by_modality: list[torch.Tensor] = []
     modality_ids_by_modality: list[torch.Tensor] = []
+    reference_output = next(iter(outputs_by_name.values()))
+    reference_tokens = reference_output.tokens
+    batch_size, _, token_dim = reference_tokens.shape
 
-    for name in enabled_modalities:
-        output = outputs_by_name[name]
-        validate_modality_output(name, output)
+    for name in fixed_slot_modalities:
+        slot_count = slot_counts[name]
+        if name in outputs_by_name:
+            output = outputs_by_name[name]
+            validate_modality_output(name, output)
 
-        tokens = output.tokens
-        time_ids = output.time_ids.to(device=tokens.device, dtype=torch.long)
+            tokens = output.tokens
+            if tokens.shape[1] != slot_count:
+                raise ValueError(
+                    f"Modality `{name}` must emit exactly {slot_count} slots, got {tokens.shape[1]}"
+                )
+            time_ids = output.time_ids.to(device=tokens.device, dtype=torch.long)
+            token_mask = torch.ones(slot_count, dtype=torch.bool, device=tokens.device)
+        else:
+            device = reference_tokens.device
+            tokens = reference_tokens.new_zeros((batch_size, slot_count, token_dim))
+            time_ids = torch.arange(slot_count, device=device, dtype=torch.long)
+            token_mask = torch.zeros(slot_count, dtype=torch.bool, device=device)
+
         tokens_by_modality.append(tokens)
+        token_mask_by_modality.append(token_mask)
         time_ids_by_modality.append(time_ids)
         modality_ids_by_modality.append(
             build_modality_id_tensor(
                 modality_name=name,
-                token_count=tokens.shape[1],
+                token_count=slot_count,
                 modality_to_id=modality_to_id,
                 device=tokens.device,
             )
@@ -88,9 +116,10 @@ def prepare_token_bank(
 
     return TokenBankBatch(
         tokens=torch.cat(tokens_by_modality, dim=1),
+        token_mask=torch.cat(token_mask_by_modality, dim=0),
         time_ids=torch.cat(time_ids_by_modality, dim=0),
         modality_ids=torch.cat(modality_ids_by_modality, dim=0),
-        modality_names=tuple(enabled_modalities),
+        modality_names=tuple(fixed_slot_modalities),
     )
 
 
@@ -147,19 +176,26 @@ class TokenBankFusion(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
+        token_mask: torch.Tensor,
         time_ids: torch.Tensor,
         modality_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if tokens.ndim != 3:
             raise ValueError(f"`tokens` must have shape [B, N, dim], got {tuple(tokens.shape)}")
+        if token_mask.ndim != 1:
+            raise ValueError(f"`token_mask` must have shape [N], got {tuple(token_mask.shape)}")
         if time_ids.ndim != 1:
             raise ValueError(f"`time_ids` must have shape [N], got {tuple(time_ids.shape)}")
         if modality_ids.ndim != 1:
             raise ValueError(
                 f"`modality_ids` must have shape [N], got {tuple(modality_ids.shape)}"
             )
-        if tokens.shape[1] != time_ids.shape[0] or tokens.shape[1] != modality_ids.shape[0]:
-            raise ValueError("Token bank length must match time_ids and modality_ids length.")
+        if (
+            tokens.shape[1] != token_mask.shape[0]
+            or tokens.shape[1] != time_ids.shape[0]
+            or tokens.shape[1] != modality_ids.shape[0]
+        ):
+            raise ValueError("Token bank length must match token_mask, time_ids, and modality_ids.")
         if tokens.shape[2] != self.dim:
             raise ValueError(f"Token dim mismatch: expected {self.dim}, got {tokens.shape[2]}")
         if time_ids.numel() and int(time_ids.max().item()) >= self.max_time_steps:
@@ -180,11 +216,20 @@ class TokenBankFusion(nn.Module):
         token_states = tokens
         token_states = token_states + self.time_embedding(time_ids).unsqueeze(0)
         token_states = token_states + self.modality_embedding(modality_ids).unsqueeze(0)
+        valid_token_mask = token_mask.to(device=tokens.device, dtype=torch.bool)
 
         batch_size = token_states.shape[0]
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
         fused_tokens = torch.cat([cls_tokens, token_states], dim=1)
-        fused_tokens = self.encoder(fused_tokens)
+        cls_padding = torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device)
+        src_key_padding_mask = torch.cat(
+            [
+                cls_padding,
+                (~valid_token_mask).unsqueeze(0).expand(batch_size, -1),
+            ],
+            dim=1,
+        )
+        fused_tokens = self.encoder(fused_tokens, src_key_padding_mask=src_key_padding_mask)
         fused_tokens = self.output_norm(fused_tokens)
         cls_token = fused_tokens[:, 0, :]
         return cls_token, fused_tokens

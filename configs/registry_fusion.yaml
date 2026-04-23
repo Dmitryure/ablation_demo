@@ -15,20 +15,21 @@ fusion:
   num_heads: 4
   mlp_ratio: 4.0
   dropout: 0.0
-  max_time_steps: 16
+  max_time_steps: 32
   checkpoint_path: null
 eye_gaze:
   model_path: /home/comp/ablation_task/models/face_landmarker_v2_with_blendshapes.task
-  output_tokens_per_clip: 4
+  slot_count: 4
 rgb:
   checkpoint_path: /home/comp/ablation_task/checkpoints/mvit_v2_s-ae3be167.pth
+  slot_count: 8
 fau:
   backbone: swin_transformer_tiny
   num_classes: 12
   checkpoint_path: /home/comp/ablation_task/checkpoints/fau/bp4d/swin_transformer_tiny/MEFARG_swin_tiny_BP4D_fold1.pth
-  output_tokens_per_frame: 2
+  slot_count: 32
 rppg:
   checkpoint_path: /home/comp/ablation_task/checkpoints/PURE_PhysNet_DiffNormalized.pth
-  output_tokens_per_clip: 4
+  slot_count: 4
 face_mesh:
-  output_tokens_per_frame: 1
+  slot_count: 16
