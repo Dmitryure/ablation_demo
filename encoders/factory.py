@@ -6,6 +6,7 @@ from typing import Any, Mapping, Sequence
 
 import torch.nn as nn
 
+from encoders.depth import DEFAULT_DEPTH_FEATURE_DIM, DEFAULT_DEPTH_MODEL_ID, DepthAnythingEncoder
 from encoders.fau import FAUEncoder
 from encoders.rgb import RGBEncoder
 from encoders.rppg import RPPGEncoder
@@ -13,6 +14,7 @@ from encoders.rppg import RPPGEncoder
 
 @dataclass(frozen=True)
 class EncoderFactoryResult:
+    depth_encoder: nn.Module | None
     fau_encoder: nn.Module | None
     rgb_encoder: nn.Module | None
     rppg_encoder: nn.Module | None
@@ -56,12 +58,13 @@ def build_local_encoders(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> EncoderFactoryResult:
-    enabled = set(modalities or ("rgb", "fau", "rppg"))
+    enabled = set(modalities or ("rgb", "fau", "rppg", "depth"))
     frames = _require_int(config, "frames")
 
     rgb_config = _require_mapping(config, "rgb")
     fau_config = _require_mapping(config, "fau")
     rppg_config = _require_mapping(config, "rppg")
+    depth_config = _require_mapping(config, "depth") if "depth" in enabled else {}
 
     rgb_checkpoint_path = _optional_path(rgb_config, "checkpoint_path")
     fau_checkpoint_path = _optional_path(fau_config, "checkpoint_path")
@@ -74,8 +77,16 @@ def build_local_encoders(
         warnings.append("rPPG checkpoint_path omitted; building encoder without pretrained weights.")
 
     rgb_encoder = None
+    depth_encoder = None
     fau_encoder = None
     rppg_encoder = None
+    if "depth" in enabled:
+        depth_encoder = DepthAnythingEncoder(
+            model_id_or_path=_require_str(depth_config, "model_id_or_path")
+            if "model_id_or_path" in depth_config
+            else DEFAULT_DEPTH_MODEL_ID,
+            feature_dim=int(depth_config.get("feature_dim", DEFAULT_DEPTH_FEATURE_DIM)),
+        )
     if "rgb" in enabled:
         if rgb_checkpoint_path is None:
             raise ValueError("RGB checkpoint_path is required when `rgb` modality is enabled.")
@@ -96,6 +107,7 @@ def build_local_encoders(
             checkpoint_path=rppg_checkpoint_path,
         )
     return EncoderFactoryResult(
+        depth_encoder=depth_encoder,
         fau_encoder=fau_encoder,
         rgb_encoder=rgb_encoder,
         rppg_encoder=rppg_encoder,

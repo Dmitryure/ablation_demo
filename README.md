@@ -58,7 +58,7 @@ Relevant code:
 
 Extractors do not all behave the same way:
 
-- `rgb`, `fau`, `rppg`: extractor wraps an encoder/backbone
+- `rgb`, `fau`, `rppg`, `depth`: extractor wraps an encoder/backbone
 - `eye_gaze`, `face_mesh`: extractor computes features directly with MediaPipe
 
 #### RGB
@@ -92,6 +92,18 @@ Relevant code:
 
 - [extractors/rppg.py](/home/comp/ablation_task/extractors/rppg.py:383)
 - [encoders/rppg.py](/home/comp/ablation_task/encoders/rppg.py:28)
+
+#### Depth
+
+`DepthExtractor` reads `video_rgb_frames`, preprocesses all frames as one `[B*T, 3, H, W]`
+batch, and runs DepthAnything V2 Small through `DepthAnythingEncoder`.
+The final hidden feature map is spatially mean-pooled to one vector per frame.
+It returns `depth_features` with shape `[B, T, 384]`.
+
+Relevant code:
+
+- [extractors/depth.py](/home/comp/ablation_task/extractors/depth.py:49)
+- [encoders/depth.py](/home/comp/ablation_task/encoders/depth.py:48)
 
 #### Eye Gaze
 
@@ -166,6 +178,14 @@ With the current config, this is `[B, 16, dim]`.
 
 - [branches/face_mesh.py](/home/comp/ablation_task/branches/face_mesh.py:94)
 
+#### Depth Branch
+
+Projects per-frame DepthAnything features, adds temporal positional encoding, then applies learned
+latent-query temporal pooling into `[B, depth.slot_count, dim]`.
+With the current config, this is `[B, 4, dim]`.
+
+- [branches/depth.py](/home/comp/ablation_task/branches/depth.py:12)
+
 ### 5. Token Bank Assembly
 
 Once each enabled branch has emitted tokens, the model assembles a single fixed-layout token bank.
@@ -173,7 +193,7 @@ This happens in `prepare_token_bank()`.
 
 The function:
 
-- iterates over the fixed supported layout `rgb`, `fau`, `rppg`, `eye_gaze`, `face_mesh`
+- iterates over the fixed supported layout `rgb`, `fau`, `rppg`, `eye_gaze`, `face_mesh`, `depth`
 - inserts real tokens for enabled modalities
 - inserts zero-filled reserved slots for disabled modalities
 - concatenates all modality tokens across the token dimension
@@ -202,10 +222,11 @@ RGB: 8
 + rPPG: 4
 + Eye Gaze: 4
 + Face Mesh: 16
++ Depth: 4
 = fixed token bank
 ```
 
-With the current YAML defaults, the token bank has `64` tokens per 16-frame clip.
+With the current YAML defaults, the token bank has `68` tokens per 16-frame clip.
 
 ### 6. Fusion Transformer
 

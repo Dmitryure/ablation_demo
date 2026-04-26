@@ -4,6 +4,7 @@ modalities:
   - rppg
   - eye_gaze
   - face_mesh
+  - depth
 frames: 16
 image_size: 224
 dim: 128
@@ -33,3 +34,7 @@ rppg:
   slot_count: 4
 face_mesh:
   slot_count: 16
+depth:
+  model_id_or_path: depth-anything/Depth-Anything-V2-Small-hf
+  feature_dim: 384
+  slot_count: 4

@@ -1,4 +1,13 @@
-from branches import EyeGazeBranch, FAUBranch, FaceMeshBranch, ModalityBranch, ModalityOutput, RGBBranch, RPPGBranch
+from branches import (
+    DepthBranch,
+    EyeGazeBranch,
+    FAUBranch,
+    FaceMeshBranch,
+    ModalityBranch,
+    ModalityOutput,
+    RGBBranch,
+    RPPGBranch,
+)
 from dataset import (
     LabeledVideoDataset,
     VideoExample,
@@ -10,9 +19,11 @@ from dataset import (
     summarize_examples,
     write_dataset_manifest,
 )
+from encoders import DEFAULT_DEPTH_FEATURE_DIM, DEFAULT_DEPTH_MODEL_ID, DepthAnythingEncoder
 from extractors import (
     EYE_GAZE_COLUMNS,
     FACE_MESH_CONTOUR_INDICES,
+    DepthExtractor,
     EyeGazeExtractor,
     FAUExtractor,
     FaceMeshExtractor,
@@ -54,6 +65,10 @@ __all__ = [
     "ModalityBranch",
     "ModalityOutput",
     "RGBBranch",
+    "DepthBranch",
+    "DepthAnythingEncoder",
+    "DEFAULT_DEPTH_FEATURE_DIM",
+    "DEFAULT_DEPTH_MODEL_ID",
     "EyeGazeBranch",
     "FaceMeshBranch",
     "FAUBranch",
@@ -61,6 +76,7 @@ __all__ = [
     "RGBExtractor",
     "FAUExtractor",
     "RPPGExtractor",
+    "DepthExtractor",
     "EyeGazeExtractor",
     "FaceMeshExtractor",
     "EYE_GAZE_COLUMNS",

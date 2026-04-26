@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 
 from encoders.factory import EncoderFactoryResult
+from extractors.depth import DepthExtractor
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
 from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.factory import ExtractorFactoryResult
@@ -75,19 +76,51 @@ class ParameterizedDummyRPPGEncoder(nn.Module):
         return waveform, features
 
 
+class ParameterizedDummyDepthEncoder(nn.Module):
+    def __init__(self, feature_dim: int = 384):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        batch_frames = pixel_values.shape[0]
+        base = torch.linspace(-0.25, 0.25, steps=self.feature_dim, device=pixel_values.device)
+        return base.view(1, self.feature_dim).repeat(batch_frames, 1) * self.scale
+
+
+class DummyDepthProcessor:
+    def __call__(self, images, return_tensors: str):
+        if return_tensors != "pt":
+            raise ValueError("DummyDepthProcessor only supports return_tensors='pt'.")
+        pixel_values = torch.stack(
+            [
+                torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).float() / 255.0
+                for image in images
+            ],
+            dim=0,
+        )
+        return {"pixel_values": pixel_values}
+
+
 def build_test_pipeline(
     dim: int = 16,
-    enabled_modalities: tuple[str, ...] = ("rgb", "fau", "rppg", "eye_gaze", "face_mesh"),
+    enabled_modalities: tuple[str, ...] = ("rgb", "fau", "rppg", "eye_gaze", "face_mesh", "depth"),
 ) -> ClipFusionPipeline:
     rgb_encoder = ParameterizedDummyRGBEncoder()
     fau_encoder = ParameterizedDummyFAUEncoder()
     rppg_encoder = ParameterizedDummyRPPGEncoder()
+    depth_encoder = ParameterizedDummyDepthEncoder()
     extractors = {
         "rgb": RGBExtractor(rgb_encoder, image_size=32),
         "fau": FAUExtractor(fau_encoder),
         "rppg": RPPGExtractor(rppg_encoder),
         "eye_gaze": EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector),
         "face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector),
+        "depth": DepthExtractor(
+            depth_encoder,
+            processor=DummyDepthProcessor(),
+            model_id_or_path="unused",
+        ),
     }
     return ClipFusionPipeline(
         registry=build_registry(dim=dim),
@@ -107,6 +140,7 @@ def build_test_pipeline(
                 "rgb": rgb_encoder,
                 "fau": fau_encoder,
                 "rppg": rppg_encoder,
+                "depth": depth_encoder,
             }
         ),
     )
@@ -126,11 +160,11 @@ class PipelineTest(unittest.TestCase):
 
         output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 64, 16))
-        self.assertEqual(tuple(output.token_mask.shape), (64,))
+        self.assertEqual(tuple(output.tokens.shape), (1, 68, 16))
+        self.assertEqual(tuple(output.token_mask.shape), (68,))
         self.assertEqual(tuple(output.fused.shape), (1, 16))
         self.assertEqual(tuple(output.cls_token.shape), (1, 16))
-        self.assertEqual(tuple(output.fused_tokens.shape), (1, 65, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 69, 16))
         self.assertEqual(output.modality_names, FIXED_SLOT_MODALITIES)
 
     def test_prepare_features_reuses_precomputed_modalities(self):
@@ -157,10 +191,11 @@ class PipelineTest(unittest.TestCase):
 
         output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 64, 16))
-        self.assertEqual(tuple(output.fused_tokens.shape), (1, 65, 16))
+        self.assertEqual(tuple(output.tokens.shape), (1, 68, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 69, 16))
         self.assertEqual(int(output.token_mask.sum().item()), 20)
         self.assertTrue(torch.count_nonzero(output.tokens[:, :40]).item() == 0)
+        self.assertTrue(torch.count_nonzero(output.tokens[:, 64:]).item() == 0)
         self.assertTrue(
             torch.equal(
                 output.modality_ids,
@@ -170,6 +205,7 @@ class PipelineTest(unittest.TestCase):
                     + [MODALITY_TO_ID["rppg"]] * 4
                     + [MODALITY_TO_ID["eye_gaze"]] * 4
                     + [MODALITY_TO_ID["face_mesh"]] * 16
+                    + [MODALITY_TO_ID["depth"]] * 4
                 ),
             )
         )
@@ -182,6 +218,7 @@ class PipelineTest(unittest.TestCase):
                     + [True] * 4
                     + [False] * 4
                     + [True] * 16
+                    + [False] * 4
                 ),
             )
         )
@@ -221,6 +258,7 @@ class PipelineTest(unittest.TestCase):
         }
 
         encoder_result = EncoderFactoryResult(
+            depth_encoder=None,
             fau_encoder=None,
             rgb_encoder=None,
             rppg_encoder=None,

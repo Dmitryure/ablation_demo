@@ -1,4 +1,5 @@
 from branches.base import ModalityBranch, ModalityOutput
+from branches.depth import DepthBranch
 from branches.eye_gaze import EyeGazeBranch
 from branches.face_mesh import FaceMeshBranch
 from branches.fau import FAUBranch
@@ -8,6 +9,7 @@ from branches.rppg import RPPGBranch
 __all__ = [
     "ModalityBranch",
     "ModalityOutput",
+    "DepthBranch",
     "EyeGazeBranch",
     "FaceMeshBranch",
     "FAUBranch",

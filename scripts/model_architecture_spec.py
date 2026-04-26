@@ -25,6 +25,7 @@ MODALITY_COLORS: dict[str, tuple[str, str]] = {
     "face_mesh": ("#F4A261", "#FCE1C8"),
     "fau": ("#2E86AB", "#BFDBE8"),
     "rppg": ("#7B5EA7", "#D9CCE9"),
+    "depth": ("#5B8E7D", "#CFE4DC"),
 }
 DEFAULT_COLOR = ("#6C757D", "#D8DDE3")
 DISABLED_COLORS = ("#7B8794", "#F3F4F6")
@@ -269,6 +270,7 @@ def _display_name(name: str) -> str:
         "rppg": "rPPG",
         "eye_gaze": "Eye Gaze",
         "face_mesh": "Face Mesh",
+        "depth": "Depth",
     }
     return labels.get(name, name.replace("_", " ").title())
 
@@ -303,6 +305,9 @@ def _branch_input_summary(name: str, config: Mapping[str, Any]) -> str:
         return f"fau_features [B, {frames}, {num_classes}, F_fau]"
     if name == "rppg":
         return f"rppg_features [B, {frames}, F_rppg] + rppg_waveform [B, {frames}]"
+    if name == "depth":
+        feature_dim = int(config.get("depth", {}).get("feature_dim", 384))
+        return f"depth_features [B, {frames}, {feature_dim}]"
     return "batch features"
 
 
@@ -338,6 +343,8 @@ def _branch_note(name: str) -> str:
         return "FAU features use two-stage pooling: within frame first, then across the clip."
     if name == "rppg":
         return "Waveform is a side output; only temporal features enter projection and pooling."
+    if name == "depth":
+        return "DepthAnything hidden maps are spatially mean-pooled per frame before temporal pooling."
     return "Custom branch."
 
 

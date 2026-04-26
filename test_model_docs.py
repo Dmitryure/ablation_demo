@@ -35,6 +35,10 @@ class ModelDocsTest(unittest.TestCase):
             ["Input", "Project", "Frame Pool", "Flatten Frame Tokens", "Clip Pool"],
         )
         self.assertEqual(
+            [stage.title for stage in components["depth"].stages],
+            ["Input", "Project", "Temporal Pool"],
+        )
+        self.assertEqual(
             [stage.title for stage in components["fusion_core"].stages],
             [
                 "Input",
@@ -55,14 +59,15 @@ class ModelDocsTest(unittest.TestCase):
         spec = build_architecture_spec(config, config_path=DEFAULT_CONFIG)
         components = {component.id: component for component in spec.components}
 
-        self.assertEqual(spec.total_tokens, 64)
+        self.assertEqual(spec.total_tokens, 68)
         self.assertEqual(spec.enabled_token_count, 16)
         self.assertFalse(components["rgb"].enabled)
         self.assertFalse(components["fau"].enabled)
         self.assertFalse(components["rppg"].enabled)
         self.assertFalse(components["eye_gaze"].enabled)
         self.assertTrue(components["face_mesh"].enabled)
-        self.assertEqual(components["token_bank"].token_formula, "enabled_slots=16, fixed_slots=64")
+        self.assertFalse(components["depth"].enabled)
+        self.assertEqual(components["token_bank"].token_formula, "enabled_slots=16, fixed_slots=68")
 
     def test_generated_json_markdown_and_dot_include_live_code_details(self):
         config = load_yaml(DEFAULT_CONFIG)
@@ -73,6 +78,7 @@ class ModelDocsTest(unittest.TestCase):
         dot_source = render_dot(spec, docs_dir=DEFAULT_DOCS_DIR)
 
         self.assertIn('"title": "Eye Gaze Branch"', json_text)
+        self.assertIn('"title": "Depth Branch"', json_text)
         self.assertIn('"title": "Add Time Embedding"', json_text)
         self.assertIn("Project: MLP(8->128->128)", markdown)
         self.assertIn("Point Pool: LatentQueryPooling(output_tokens=1)", markdown)
@@ -82,6 +88,7 @@ class ModelDocsTest(unittest.TestCase):
         self.assertIn("MLP(8-&gt;128-&gt;128)", dot_source)
         self.assertIn("Add Time Embedding", dot_source)
         self.assertIn("Token Bank", dot_source)
+        self.assertIn("Depth Branch", dot_source)
 
     def test_dot_smoke_render_succeeds_when_graphviz_is_available(self):
         if shutil.which("dot") is None:

@@ -13,6 +13,7 @@ OUTPUT_TOKEN_CONFIG_KEYS = {
     "rppg": "slot_count",
     "eye_gaze": "slot_count",
     "face_mesh": "slot_count",
+    "depth": "slot_count",
 }
 
 DEFAULT_SLOT_COUNTS = {
@@ -21,6 +22,7 @@ DEFAULT_SLOT_COUNTS = {
     "rppg": 4,
     "eye_gaze": 4,
     "face_mesh": 16,
+    "depth": 4,
 }
 
 def validate_positive_int(value: int, field_name: str) -> int:

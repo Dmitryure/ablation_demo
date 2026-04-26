@@ -66,6 +66,8 @@ def _require_modalities(config: Mapping[str, Any]) -> tuple[str, ...]:
 
 def _encoder_modules_from_result(encoder_result: EncoderFactoryResult) -> nn.ModuleDict:
     modules = nn.ModuleDict()
+    if encoder_result.depth_encoder is not None:
+        modules["depth"] = encoder_result.depth_encoder
     if encoder_result.rgb_encoder is not None:
         modules["rgb"] = encoder_result.rgb_encoder
     if encoder_result.fau_encoder is not None:
