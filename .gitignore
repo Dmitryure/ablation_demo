@@ -9,3 +9,5 @@ AGENTS.md
 docs
 current
 data
+tests/overfit_videos/
+tests/predict_videos/
