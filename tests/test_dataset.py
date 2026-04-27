@@ -11,6 +11,7 @@ import torch
 from dataset import (
     LabeledVideoDataset,
     VideoExample,
+    build_labeled_folder_examples,
     build_real_fake_examples,
     collate_labeled_video_batch,
     load_dataset_manifest,
@@ -40,6 +41,24 @@ class DummyRGBEncoder(torch.nn.Module):
 
 
 class DatasetTest(unittest.TestCase):
+    def test_build_labeled_folder_examples_reads_flat_real_fake_folders(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            real_dir = root / "real"
+            fake_dir = root / "fake"
+            real_dir.mkdir()
+            fake_dir.mkdir()
+            (real_dir / "a.MP4").touch()
+            (real_dir / "ignored.txt").touch()
+            (fake_dir / "b.webm").touch()
+
+            examples = build_labeled_folder_examples(root, split="train")
+
+            self.assertEqual(len(examples), 2)
+            self.assertEqual([example.class_name for example in examples], ["real", "fake"])
+            self.assertEqual([example.label for example in examples], [0, 1])
+            self.assertEqual({example.split for example in examples}, {"train"})
+
     def test_build_examples_write_and_reload_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

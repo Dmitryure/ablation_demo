@@ -11,6 +11,7 @@ from branches import (
 from dataset import (
     LabeledVideoDataset,
     VideoExample,
+    build_labeled_folder_examples,
     build_real_fake_examples,
     collate_labeled_video_batch,
     discover_real_fake_video_paths,
@@ -54,6 +55,12 @@ from registry import (
     registry_required_keys,
     validate_registry,
 )
+from task_model import (
+    BinaryClassificationOutput,
+    BinaryFusionClassifier,
+    BinaryFusionHead,
+    build_binary_fusion_classifier,
+)
 
 __all__ = [
     "CURRENT_MODALITIES",
@@ -89,6 +96,7 @@ __all__ = [
     "VideoExample",
     "discover_real_fake_video_paths",
     "build_real_fake_examples",
+    "build_labeled_folder_examples",
     "summarize_examples",
     "write_dataset_manifest",
     "load_dataset_manifest",
@@ -104,4 +112,8 @@ __all__ = [
     "fuse_selected_modalities",
     "build_fusion_pipeline",
     "build_fusion_pipeline_from_yaml",
+    "BinaryClassificationOutput",
+    "BinaryFusionHead",
+    "BinaryFusionClassifier",
+    "build_binary_fusion_classifier",
 ]

@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 VALID_SPLITS: tuple[str, ...] = ("train", "val", "test")
+VIDEO_EXTENSIONS: tuple[str, ...] = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,60 @@ def discover_real_fake_video_paths(
     if not fake_paths:
         raise FileNotFoundError(f"No fake videos found in {fake_root}")
     return real_paths, fake_paths
+
+
+def _discover_flat_video_paths(root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    )
+
+
+def build_labeled_folder_examples(
+    root_dir: str | Path,
+    split: str,
+) -> list[VideoExample]:
+    if split not in VALID_SPLITS:
+        raise ValueError(f"`split` must be one of {VALID_SPLITS}, got {split!r}")
+
+    root = Path(root_dir)
+    real_dir = root / "real"
+    fake_dir = root / "fake"
+    if not real_dir.is_dir():
+        raise FileNotFoundError(f"Missing real video folder: {real_dir}")
+    if not fake_dir.is_dir():
+        raise FileNotFoundError(f"Missing fake video folder: {fake_dir}")
+
+    real_paths = _discover_flat_video_paths(real_dir)
+    fake_paths = _discover_flat_video_paths(fake_dir)
+    if not real_paths:
+        raise FileNotFoundError(f"No supported real videos found in {real_dir}")
+    if not fake_paths:
+        raise FileNotFoundError(f"No supported fake videos found in {fake_dir}")
+
+    examples: list[VideoExample] = []
+    for path in real_paths:
+        examples.append(
+            VideoExample(
+                path=path,
+                label=0,
+                class_name="real",
+                source_id=path.stem,
+                split=split,
+            )
+        )
+    for path in fake_paths:
+        examples.append(
+            VideoExample(
+                path=path,
+                label=1,
+                class_name="fake",
+                source_id=path.stem,
+                split=split,
+            )
+        )
+    return examples
 
 
 def _split_groups(
