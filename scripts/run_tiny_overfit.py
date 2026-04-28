@@ -20,15 +20,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset import (  # noqa: E402
+from dataset import (
     LabeledVideoDataset,
     VideoExample,
     build_labeled_folder_examples,
     collate_labeled_video_batch,
 )
-from frame_config import describe_frame_counts, resolve_modality_frame_counts  # noqa: E402
-from pipeline import build_fusion_pipeline, load_pipeline_yaml  # noqa: E402
-from task_model import BinaryFusionClassifier, build_binary_fusion_classifier  # noqa: E402
+from frame_config import describe_frame_counts, resolve_modality_frame_counts
+from pipeline import build_fusion_pipeline, load_pipeline_yaml
+from task_model import BinaryFusionClassifier, build_binary_fusion_classifier
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
 DEFAULT_OVERFIT_DIR = PROJECT_ROOT / "tests" / "overfit_videos"

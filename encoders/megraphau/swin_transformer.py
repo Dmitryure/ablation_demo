@@ -466,10 +466,7 @@ class BasicLayer(nn.Module):
 
     def forward(self, x):
         for blk in self.blocks:
-            if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x)
-            else:
-                x = blk(x)
+            x = checkpoint.checkpoint(blk, x) if self.use_checkpoint else blk(x)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -517,7 +514,7 @@ class PatchEmbed(nn.Module):
             self.norm = None
 
     def forward(self, x):
-        B, C, H, W = x.shape
+        _, _, H, W = x.shape
         # FIXME look at relaxing size constraints
         assert self.img_size[0] == H and self.img_size[1] == W, (
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
@@ -568,8 +565,8 @@ class SwinTransformer(nn.Module):
         in_chans=3,
         num_classes=1000,
         embed_dim=96,
-        depths=[2, 2, 6, 2],
-        num_heads=[3, 6, 12, 24],
+        depths=(2, 2, 6, 2),
+        num_heads=(3, 6, 12, 24),
         window_size=7,
         mlp_ratio=4.0,
         qkv_bias=True,
@@ -686,7 +683,7 @@ class SwinTransformer(nn.Module):
     def flops(self):
         flops = 0
         flops += self.patch_embed.flops()
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             flops += layer.flops()
         flops += (
             self.num_features

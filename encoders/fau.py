@@ -45,7 +45,7 @@ class FAUEncoder(MEFARG):
         f_e = f_e.mean(dim=-2)
         f_v, f_e = self.head.gnn(f_v, f_e)
 
-        batch_size, num_classes, channels = f_v.shape
+        _, num_classes, channels = f_v.shape
         sc = self.head.relu(self.head.sc)
         sc = F.normalize(sc, p=2, dim=-1)
         cl = F.normalize(f_v, p=2, dim=-1)

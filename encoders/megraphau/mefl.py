@@ -149,7 +149,7 @@ class Head(nn.Module):
         self.in_channels = in_channels
         self.num_classes = num_classes
         class_linear_layers = []
-        for i in range(self.num_classes):
+        for _ in range(self.num_classes):
             layer = LinearBlock(self.in_channels, self.in_channels)
             class_linear_layers += [layer]
         self.class_linears = nn.ModuleList(class_linear_layers)
@@ -165,7 +165,7 @@ class Head(nn.Module):
     def forward(self, x):
         # AFG
         f_u = []
-        for i, layer in enumerate(self.class_linears):
+        for layer in self.class_linears:
             f_u.append(layer(x).unsqueeze(1))
         f_u = torch.cat(f_u, dim=1)
         f_v = f_u.mean(dim=-2)
@@ -175,7 +175,7 @@ class Head(nn.Module):
         f_e = f_e.mean(dim=-2)
         f_v, f_e = self.gnn(f_v, f_e)
 
-        b, n, c = f_v.shape
+        _, n, c = f_v.shape
         sc = self.sc
         sc = self.relu(sc)
         sc = F.normalize(sc, p=2, dim=-1)

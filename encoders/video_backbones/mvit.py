@@ -26,7 +26,7 @@ def _extract_token_states(
     x = x.flatten(2).transpose(1, 2)
     x = model.pos_encoding(x)
 
-    thw = (model.pos_encoding.temporal_size,) + model.pos_encoding.spatial_size
+    thw = (model.pos_encoding.temporal_size, *model.pos_encoding.spatial_size)
     for block in model.blocks:
         x, thw = block(x, thw)
     x = model.norm(x)

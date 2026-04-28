@@ -747,9 +747,14 @@ def build_architecture_spec(
         fixed_slot_modalities=FIXED_SLOT_MODALITIES,
         total_tokens=total_tokens,
         enabled_token_count=enabled_token_count,
-        components=(input_component,)
-        + modality_components
-        + (token_bank_component, fusion_component, cls_output, fused_tokens),
+        components=(
+            input_component,
+            *modality_components,
+            token_bank_component,
+            fusion_component,
+            cls_output,
+            fused_tokens,
+        ),
         edges=tuple(edges),
         fusion=dict(config["fusion"]),
     )

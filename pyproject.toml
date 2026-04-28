@@ -31,6 +31,9 @@ ignore = [
 ]
 fixable = ["ALL"]
 
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
@@ -84,8 +87,31 @@ score = false
 
 [tool.pylint."messages control"]
 disable = [
+    "abstract-method",
+    "broad-exception-caught",
+    "consider-using-from-import",
+    "duplicate-code",
+    "fixme",
+    "import-outside-toplevel",
+    "invalid-name",
     "line-too-long",
     "missing-class-docstring",
     "missing-function-docstring",
     "missing-module-docstring",
+    "no-member",
+    "not-callable",
+    "redefined-builtin",
+    "redefined-outer-name",
+    "too-few-public-methods",
+    "too-many-arguments",
+    "too-many-boolean-expressions",
+    "too-many-instance-attributes",
+    "too-many-lines",
+    "too-many-locals",
+    "too-many-positional-arguments",
+    "too-many-public-methods",
+    "too-many-return-statements",
+    "too-many-statements",
+    "unused-argument",
+    "wrong-import-position",
 ]

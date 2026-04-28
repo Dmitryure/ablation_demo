@@ -97,7 +97,7 @@ class PhysNetPaddingEncoderDecoderMax(nn.Module):
 
     def forward(self, x):  # Batch_size*[3, T, 128,128]
         x_visual = x
-        [batch, channel, length, width, height] = x.shape
+        _, _, length, _, _ = x.shape
 
         x = self.ConvBlock1(x)  # x [3, T, 128,128]
         x = self.MaxpoolSpa(x)  # x [16, T, 64,64]
