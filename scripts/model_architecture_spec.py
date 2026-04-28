@@ -207,7 +207,7 @@ def _extract_self_attr(expr: ast.AST) -> str | None:
     return None
 
 
-def _describe_assignment(target: str, expr: ast.AST) -> tuple[str, str, str | None, str | None]:
+def _describe_assignment(_target: str, expr: ast.AST) -> tuple[str, str, str | None, str | None]:
     batch_key = _extract_batch_key(expr)
     if batch_key is not None:
         return "batch_input", f"batch[{batch_key!r}]", None, batch_key

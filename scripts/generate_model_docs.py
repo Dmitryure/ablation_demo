@@ -172,7 +172,7 @@ def _escape_text(text: str) -> str:
     return html.escape(text, quote=False)
 
 
-def _source_href(source: SourceRef | None, docs_dir: Path) -> str | None:
+def _source_href(source: SourceRef | None, _docs_dir: Path) -> str | None:
     if source is None:
         return None
     source_path = PROJECT_ROOT / source.path

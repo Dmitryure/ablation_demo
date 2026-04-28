@@ -57,6 +57,7 @@ exclude = [
 
 [tool.pylint.main]
 py-version = "3.12"
+init-hook = "import sys; from pathlib import Path; sys.path.insert(0, str(Path.cwd()))"
 ignore = [
     ".git",
     ".venv",
