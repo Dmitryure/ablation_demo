@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -176,6 +176,42 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(tuple(sample["video"].shape), (3, 4, 8, 8))
         self.assertEqual(tuple(sample["label"].shape), (1,))
         self.assertEqual(sample["identity_id"], "f1")
+
+    def test_dataset_can_load_modality_specific_frame_counts(self):
+        dataset = LabeledVideoDataset(
+            examples=[
+                VideoExample(
+                    path=Path("/tmp/example.mp4"),
+                    label=1,
+                    class_name="fake",
+                    source_id="clipA",
+                    split="train",
+                    identity_id="f1",
+                )
+            ],
+            num_frames={"rgb": 4, "rppg": 6},
+            image_size=8,
+        )
+
+        def fake_load_video_clip(path, num_frames, image_size):
+            return {
+                "video": torch.full((3, num_frames, image_size, image_size), float(num_frames)),
+                "video_rgb_frames": [
+                    np.full((image_size, image_size, 3), num_frames, dtype=np.uint8)
+                    for _ in range(num_frames)
+                ],
+            }
+
+        with patch("dataset.load_video_clip", side_effect=fake_load_video_clip):
+            sample = dataset[0]
+            batch = collate_labeled_video_batch([sample, sample])
+
+        self.assertEqual(tuple(sample["video_by_modality"]["rgb"].shape), (3, 4, 8, 8))
+        self.assertEqual(tuple(sample["video_by_modality"]["rppg"].shape), (3, 6, 8, 8))
+        self.assertEqual(tuple(batch["video_by_modality"]["rgb"].shape), (2, 3, 4, 8, 8))
+        self.assertEqual(tuple(batch["video_by_modality"]["rppg"].shape), (2, 3, 6, 8, 8))
+        self.assertEqual(len(batch["video_rgb_frames_by_modality"]["rgb"][0]), 4)
+        self.assertEqual(len(batch["video_rgb_frames_by_modality"]["rppg"][0]), 6)
 
 
 if __name__ == "__main__":

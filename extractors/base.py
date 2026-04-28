@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -9,10 +10,10 @@ import torch.nn as nn
 class FeatureExtractor:
     name: str
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         raise NotImplementedError
 
-    def extract(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+    def extract(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
     def close(self) -> None:

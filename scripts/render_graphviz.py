@@ -5,7 +5,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INPUT = PROJECT_ROOT / "docs" / "model_architecture.dot"
 DEFAULT_OUTPUT = PROJECT_ROOT / "docs" / "model_architecture.svg"
@@ -38,9 +37,7 @@ def parse_args() -> argparse.Namespace:
 def require_dot() -> str:
     dot_path = shutil.which("dot")
     if dot_path is None:
-        raise SystemExit(
-            "Missing `dot` executable. Install Graphviz, then rerun this script."
-        )
+        raise SystemExit("Missing `dot` executable. Install Graphviz, then rerun this script.")
     return dot_path
 
 

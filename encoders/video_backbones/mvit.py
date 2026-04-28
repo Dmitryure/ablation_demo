@@ -19,7 +19,9 @@ def _require_torchvision_mvit() -> object:
     return mvit_v2_s
 
 
-def _extract_token_states(model: nn.Module, x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int]]:
+def _extract_token_states(
+    model: nn.Module, x: torch.Tensor
+) -> tuple[torch.Tensor, tuple[int, int, int]]:
     x = model.conv_proj(x)
     x = x.flatten(2).transpose(1, 2)
     x = model.pos_encoding(x)

@@ -1,0 +1,49 @@
+minimum_pre_commit_version: "3.5.0"
+
+ci:
+  skip: [pylint]
+
+default_language_version:
+  python: python3.12
+
+exclude: >-
+  (?x)^(
+    \.git/|
+    \.venv/|
+    venv/|
+    __pycache__/|
+    \.mypy_cache/|
+    \.ruff_cache/|
+    build/|
+    dist/
+  )
+
+repos:
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.3.3
+    hooks:
+      - id: autoflake
+        args:
+          - --in-place
+          - --remove-all-unused-imports
+          - --remove-unused-variables
+          - --recursive
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.11
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: pylint
+        name: pylint
+        entry: pylint
+        language: system
+        types: [python]
+        require_serial: true
+        args:
+          - --reports=n
+          - --score=n

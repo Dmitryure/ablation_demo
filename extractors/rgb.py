@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 import cv2
 import numpy as np
@@ -8,7 +9,6 @@ import torch
 import torch.nn as nn
 
 from extractors.base import FeatureExtractor, module_device
-
 
 MViT_MEAN = torch.tensor([0.45, 0.45, 0.45], dtype=torch.float32).view(3, 1, 1)
 MViT_STD = torch.tensor([0.225, 0.225, 0.225], dtype=torch.float32).view(3, 1, 1)
@@ -43,10 +43,10 @@ class RGBExtractor(FeatureExtractor):
         self.encoder = encoder
         self.image_size = image_size
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("video_rgb_frames",)
 
-    def extract(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+    def extract(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         frames_rgb = batch["video_rgb_frames"]
         if _is_clip_batch(frames_rgb):
             clips_rgb = frames_rgb

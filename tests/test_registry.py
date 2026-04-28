@@ -8,15 +8,16 @@ from branches import ModalityBranch, ModalityOutput
 from branches.compression import DEFAULT_SLOT_COUNTS, validate_branch_token_config
 from encoders import FAUEncoder, RGBEncoder, RPPGEncoder, build_local_encoders
 from extractors import (
-    DepthExtractor,
     EYE_GAZE_COLUMNS,
     FACE_MESH_CONTOUR_INDICES,
+    DepthExtractor,
     EyeGazeExtractor,
-    FAUExtractor,
     FaceMeshExtractor,
+    FAUExtractor,
     RGBExtractor,
     RPPGExtractor,
 )
+from frame_config import resolve_modality_frame_count, resolve_modality_frame_counts
 from fusion import FusionOutput, TokenBankFusion
 from pipeline import build_fusion_from_config, fuse_selected_modalities
 from registry import (
@@ -103,7 +104,9 @@ class DummyMetadataBranch(ModalityBranch):
     def encode(self, batch):
         tokens = batch["metadata_tokens"]
         time_ids = torch.zeros(tokens.shape[1], dtype=torch.long, device=tokens.device)
-        return ModalityOutput(tokens=tokens, time_ids=time_ids, debug={"token_shape": tuple(tokens.shape)})
+        return ModalityOutput(
+            tokens=tokens, time_ids=time_ids, debug={"token_shape": tuple(tokens.shape)}
+        )
 
 
 def fake_eye_gaze_detector(_: np.ndarray):
@@ -382,6 +385,21 @@ class RegistryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rppg.slot_count"):
             build_registry(dim=16, config={"rppg": {"slot_count": 0}})
 
+    def test_resolve_modality_frame_counts_supports_section_and_default_values(self):
+        config = {
+            "frames": {"default": 16, "rppg": 32},
+            "rgb": {"frames": 8},
+            "rppg": {},
+        }
+
+        self.assertEqual(resolve_modality_frame_count(config, "rgb"), 8)
+        self.assertEqual(resolve_modality_frame_count(config, "rppg"), 32)
+        self.assertEqual(resolve_modality_frame_count(config, "face_mesh"), 16)
+        self.assertEqual(
+            resolve_modality_frame_counts(config, ("rgb", "rppg")),
+            {"rgb": 8, "rppg": 32},
+        )
+
     def test_validate_branch_token_config_rejects_fusion_time_step_mismatch(self):
         config = {
             "frames": 16,
@@ -534,7 +552,9 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(tuple(fusion_output.tokens.shape), (1, 68, 12))
         self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 69, 12))
         self.assertEqual(int(fusion_output.token_mask.sum().item()), 4)
-        self.assertTrue(torch.equal(fusion_output.token_mask, torch.tensor([False] * 64 + [True] * 4)))
+        self.assertTrue(
+            torch.equal(fusion_output.token_mask, torch.tensor([False] * 64 + [True] * 4))
+        )
         self.assertTrue(
             torch.equal(
                 fusion_output.modality_ids[64:68],
@@ -579,7 +599,11 @@ class RegistryTest(unittest.TestCase):
             "frames": 16,
             "image_size": 224,
             "rgb": {"checkpoint_path": None},
-            "fau": {"backbone": "swin_transformer_tiny", "num_classes": 12, "checkpoint_path": None},
+            "fau": {
+                "backbone": "swin_transformer_tiny",
+                "num_classes": 12,
+                "checkpoint_path": None,
+            },
             "rppg": {"checkpoint_path": None},
         }
 
@@ -607,16 +631,13 @@ class RegistryTest(unittest.TestCase):
             + [MODALITY_TO_ID["depth"]] * 4
         )
         token_mask = torch.tensor(
-            [True] * 8
-            + [False] * 32
-            + [True] * 4
-            + [False] * 4
-            + [False] * 16
-            + [False] * 4
+            [True] * 8 + [False] * 32 + [True] * 4 + [False] * 4 + [False] * 16 + [False] * 4
         )
         tokens = torch.randn(1, 68, 10)
         perturbed_tokens = tokens.clone()
-        perturbed_tokens[:, ~token_mask, :] = torch.randn_like(perturbed_tokens[:, ~token_mask, :]) * 50.0
+        perturbed_tokens[:, ~token_mask, :] = (
+            torch.randn_like(perturbed_tokens[:, ~token_mask, :]) * 50.0
+        )
 
         cls_token, _ = fusion_module(tokens, token_mask, time_ids, modality_ids)
         perturbed_cls_token, _ = fusion_module(
@@ -639,7 +660,7 @@ class RegistryTest(unittest.TestCase):
                 "dropout": 0.0,
                 "max_time_steps": 32,
                 "checkpoint_path": None,
-            }
+            },
         }
 
         fusion_module = build_fusion_from_config(config)

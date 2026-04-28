@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch.nn as nn
 
@@ -10,6 +11,7 @@ from encoders.depth import DEFAULT_DEPTH_FEATURE_DIM, DEFAULT_DEPTH_MODEL_ID, De
 from encoders.fau import FAUEncoder
 from encoders.rgb import RGBEncoder
 from encoders.rppg import RPPGEncoder
+from frame_config import resolve_modality_frame_count
 
 
 @dataclass(frozen=True)
@@ -59,8 +61,6 @@ def build_local_encoders(
     modalities: Sequence[str] | None = None,
 ) -> EncoderFactoryResult:
     enabled = set(modalities or ("rgb", "fau", "rppg", "depth"))
-    frames = _require_int(config, "frames")
-
     rgb_config = _require_mapping(config, "rgb")
     fau_config = _require_mapping(config, "fau")
     rppg_config = _require_mapping(config, "rppg")
@@ -74,7 +74,9 @@ def build_local_encoders(
     if "fau" in enabled and fau_checkpoint_path is None:
         warnings.append("FAU checkpoint_path omitted; building encoder without pretrained weights.")
     if "rppg" in enabled and rppg_checkpoint_path is None:
-        warnings.append("rPPG checkpoint_path omitted; building encoder without pretrained weights.")
+        warnings.append(
+            "rPPG checkpoint_path omitted; building encoder without pretrained weights."
+        )
 
     rgb_encoder = None
     depth_encoder = None
@@ -91,7 +93,7 @@ def build_local_encoders(
         if rgb_checkpoint_path is None:
             raise ValueError("RGB checkpoint_path is required when `rgb` modality is enabled.")
         rgb_encoder = RGBEncoder(
-            frames=frames,
+            frames=resolve_modality_frame_count(config, "rgb"),
             image_size=_require_int(config, "image_size"),
             checkpoint_path=rgb_checkpoint_path,
         )
@@ -103,7 +105,7 @@ def build_local_encoders(
         )
     if "rppg" in enabled:
         rppg_encoder = RPPGEncoder(
-            frames=frames,
+            frames=resolve_modality_frame_count(config, "rppg"),
             checkpoint_path=rppg_checkpoint_path,
         )
     return EncoderFactoryResult(

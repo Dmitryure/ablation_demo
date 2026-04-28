@@ -4,9 +4,10 @@ import ast
 import inspect
 import json
 import textwrap
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 import torch.nn as nn
 import yaml
@@ -16,6 +17,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
 
 from branches.compression import LatentQueryPooling, TemporalLatentQueryPooling
 from extractors import EYE_GAZE_COLUMNS, FACE_MESH_CONTOUR_INDICES
+from frame_config import resolve_modality_frame_count, resolve_modality_frame_counts
 from fusion import TokenBankFusion, prepare_token_bank
 from registry import FIXED_SLOT_MODALITIES, MODALITY_TO_ID, build_registry
 
@@ -75,7 +77,7 @@ class EdgeSpec:
 @dataclass(frozen=True)
 class ArchitectureSpec:
     config_path: str
-    frames: int
+    frames: Mapping[str, int]
     dim: int
     device: str
     enabled_modalities: tuple[str, ...]
@@ -140,10 +142,7 @@ def describe_module(module: nn.Module) -> str:
         and isinstance(module[1], nn.GELU)
         and isinstance(module[2], nn.Linear)
     ):
-        return (
-            f"MLP({module[0].in_features}->{module[0].out_features}"
-            f"->{module[2].out_features})"
-        )
+        return f"MLP({module[0].in_features}->{module[0].out_features}->{module[2].out_features})"
     if isinstance(module, nn.LazyLinear):
         return f"LazyLinear(*->{module.out_features})"
     if isinstance(module, nn.Linear):
@@ -174,7 +173,11 @@ def describe_module(module: nn.Module) -> str:
 
 
 def _extract_batch_key(expr: ast.AST) -> str | None:
-    if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Name) and expr.value.id == "batch":
+    if (
+        isinstance(expr, ast.Subscript)
+        and isinstance(expr.value, ast.Name)
+        and expr.value.id == "batch"
+    ):
         slice_node = expr.slice
         if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
             return slice_node.value
@@ -293,7 +296,7 @@ def _stage(
 
 
 def _branch_input_summary(name: str, config: Mapping[str, Any]) -> str:
-    frames = int(config["frames"])
+    frames = resolve_modality_frame_count(config, name)
     if name == "rgb":
         return "rgb_features [B, N_rgb, F_rgb]"
     if name == "eye_gaze":
@@ -312,13 +315,13 @@ def _branch_input_summary(name: str, config: Mapping[str, Any]) -> str:
 
 
 def _branch_output_summary(branch: nn.Module, dim: int) -> str:
-    slot_count = int(getattr(branch, "slot_count"))
+    slot_count = int(branch.slot_count)
     return f"tokens [B, {slot_count}, {dim}] + time_ids [0..{slot_count - 1}]"
 
 
 def _branch_token_formula(name: str, branch: nn.Module, config: Mapping[str, Any]) -> str:
-    frames = int(config["frames"])
-    slot_count = int(getattr(branch, "slot_count"))
+    frames = resolve_modality_frame_count(config, name)
+    slot_count = int(branch.slot_count)
     if hasattr(branch, "frame_pool") and hasattr(branch.frame_pool, "output_tokens"):
         return (
             f"frames={frames}, frame_query_tokens={branch.frame_pool.output_tokens}, "
@@ -338,17 +341,23 @@ def _branch_note(name: str) -> str:
     if name == "eye_gaze":
         return "Per-frame gaze blendshapes stay ordered until temporal latent-query pooling."
     if name == "face_mesh":
-        return "Per-point MLP happens before point pooling, then frame tokens compress to clip slots."
+        return (
+            "Per-point MLP happens before point pooling, then frame tokens compress to clip slots."
+        )
     if name == "fau":
         return "FAU features use two-stage pooling: within frame first, then across the clip."
     if name == "rppg":
         return "Waveform is a side output; only temporal features enter projection and pooling."
     if name == "depth":
-        return "DepthAnything hidden maps are spatially mean-pooled per frame before temporal pooling."
+        return (
+            "DepthAnything hidden maps are spatially mean-pooled per frame before temporal pooling."
+        )
     return "Custom branch."
 
 
-def _normalize_branch_stage(branch: nn.Module, component_id: str, event: AssignmentEvent) -> StageSpec | None:
+def _normalize_branch_stage(
+    branch: nn.Module, component_id: str, event: AssignmentEvent
+) -> StageSpec | None:
     component_ref = source_ref(branch.encode, f"{branch.__class__.__name__}.encode")
     if event.kind == "batch_input" and event.batch_key in branch.required_keys():
         return _stage(
@@ -357,7 +366,9 @@ def _normalize_branch_stage(branch: nn.Module, component_id: str, event: Assignm
             "Input",
             f"{event.batch_key} from batch",
             "input",
-            SourceRef(component_ref.path, component_ref.symbol, event.line) if component_ref else None,
+            SourceRef(component_ref.path, component_ref.symbol, event.line)
+            if component_ref
+            else None,
         )
     if event.kind == "module_call" and event.attr is not None:
         module = getattr(branch, event.attr, None)
@@ -375,10 +386,18 @@ def _normalize_branch_stage(branch: nn.Module, component_id: str, event: Assignm
             title = "Temporal Pool"
         else:
             title = event.attr.replace("_", " ").title()
-        source = SourceRef(component_ref.path, component_ref.symbol, event.line) if component_ref else None
+        source = (
+            SourceRef(component_ref.path, component_ref.symbol, event.line)
+            if component_ref
+            else None
+        )
         return _stage(component_id, event.attr, title, describe_module(module), "module", source)
     if event.kind == "tensor_op" and event.target == "clip_tokens" and "reshape" in event.detail:
-        source = SourceRef(component_ref.path, component_ref.symbol, event.line) if component_ref else None
+        source = (
+            SourceRef(component_ref.path, component_ref.symbol, event.line)
+            if component_ref
+            else None
+        )
         return _stage(
             component_id,
             event.target,
@@ -412,8 +431,10 @@ def build_branch_component(
         input_summary=_branch_input_summary(name, config),
         output_summary=_branch_output_summary(branch, int(config["dim"])),
         token_formula=_branch_token_formula(name, branch, config),
-        token_count=int(getattr(branch, "slot_count")),
-        note=_branch_note(name) if enabled else "Disabled modality still reserves slots in the fixed token bank.",
+        token_count=int(branch.slot_count),
+        note=_branch_note(name)
+        if enabled
+        else "Disabled modality still reserves slots in the fixed token bank.",
         stroke_color=stroke_color,
         fill_color=fill_color,
         source=source_ref(branch.encode, f"{branch.__class__.__name__}.encode"),
@@ -422,18 +443,19 @@ def build_branch_component(
 
 
 def build_input_component(config: Mapping[str, Any]) -> ComponentSpec:
-    frames = int(config["frames"])
+    frame_counts = resolve_modality_frame_counts(config, FIXED_SLOT_MODALITIES)
+    frames = ", ".join(f"{name}={count}" for name, count in frame_counts.items())
     return ComponentSpec(
         id="input_clip",
         title="Input Clip",
         kind="input",
         cluster="inputs",
         enabled=True,
-        input_summary=f"video [B, 3, {frames}, H, W] + video_rgb_frames",
-        output_summary=f"{frames} sampled frames",
+        input_summary="video_by_modality + video_rgb_frames_by_modality",
+        output_summary=f"sampled frames per modality: {frames}",
         token_formula="",
         token_count=None,
-        note="Raw video and RGB frame list feed extractors and encoder-backed branches.",
+        note="Raw video and RGB frame lists feed extractors with modality-specific frame counts.",
         stroke_color="#7B8794",
         fill_color="#FFFFFF",
         source=None,
@@ -442,7 +464,7 @@ def build_input_component(config: Mapping[str, Any]) -> ComponentSpec:
                 "input_clip",
                 "sample",
                 "Sample Frames",
-                f"{frames} frames configured in YAML",
+                f"frames configured in YAML: {frames}",
                 "input",
                 None,
             ),
@@ -514,7 +536,14 @@ def _normalize_fusion_stage(
     forward_ref = source_ref(fusion.forward, "TokenBankFusion.forward")
     source = SourceRef(forward_ref.path, forward_ref.symbol, event.line) if forward_ref else None
     if event.kind == "batch_input" and event.batch_key == "tokens":
-        return _stage(component_id, event.target, "Input", "token bank from prepare_token_bank()", "input", source)
+        return _stage(
+            component_id,
+            event.target,
+            "Input",
+            "token bank from prepare_token_bank()",
+            "input",
+            source,
+        )
     if event.kind == "tensor_op" and event.attr == "time_embedding":
         return _stage(
             component_id,
@@ -630,7 +659,9 @@ def build_fusion_component(config: Mapping[str, Any], total_tokens: int) -> Comp
     )
 
 
-def build_output_components(config: Mapping[str, Any], total_tokens: int) -> tuple[ComponentSpec, ComponentSpec]:
+def build_output_components(
+    config: Mapping[str, Any], total_tokens: int
+) -> tuple[ComponentSpec, ComponentSpec]:
     dim = int(config["dim"])
     cls_output = ComponentSpec(
         id="cls_output",
@@ -672,7 +703,9 @@ def build_architecture_spec(
     config_path: Path = DEFAULT_CONFIG,
 ) -> ArchitectureSpec:
     dim = int(config["dim"])
-    enabled_modalities = tuple(str(item).strip() for item in config.get("modalities", []) if str(item).strip())
+    enabled_modalities = tuple(
+        str(item).strip() for item in config.get("modalities", []) if str(item).strip()
+    )
     registry = build_registry(dim=dim, config=config)
 
     input_component = build_input_component(config)
@@ -687,10 +720,16 @@ def build_architecture_spec(
     )
     token_bank_component = build_token_bank_component(config, modality_components)
     fusion_component = build_fusion_component(config, token_bank_component.token_count or 0)
-    cls_output, fused_tokens = build_output_components(config, token_bank_component.token_count or 0)
+    cls_output, fused_tokens = build_output_components(
+        config, token_bank_component.token_count or 0
+    )
 
-    edges = [EdgeSpec(source="input_clip", target=component.id) for component in modality_components]
-    edges.extend(EdgeSpec(source=component.id, target="token_bank") for component in modality_components)
+    edges = [
+        EdgeSpec(source="input_clip", target=component.id) for component in modality_components
+    ]
+    edges.extend(
+        EdgeSpec(source=component.id, target="token_bank") for component in modality_components
+    )
     edges.append(EdgeSpec(source="token_bank", target="fusion_core"))
     edges.append(EdgeSpec(source="fusion_core", target="cls_output"))
     edges.append(EdgeSpec(source="fusion_core", target="fused_tokens"))
@@ -701,14 +740,16 @@ def build_architecture_spec(
     )
     return ArchitectureSpec(
         config_path=_relative_path(config_path),
-        frames=int(config["frames"]),
+        frames=resolve_modality_frame_counts(config, FIXED_SLOT_MODALITIES),
         dim=dim,
         device=str(config.get("device", "unknown")),
         enabled_modalities=enabled_modalities,
         fixed_slot_modalities=FIXED_SLOT_MODALITIES,
         total_tokens=total_tokens,
         enabled_token_count=enabled_token_count,
-        components=(input_component,) + modality_components + (token_bank_component, fusion_component, cls_output, fused_tokens),
+        components=(input_component,)
+        + modality_components
+        + (token_bank_component, fusion_component, cls_output, fused_tokens),
         edges=tuple(edges),
         fusion=dict(config["fusion"]),
     )

@@ -5,7 +5,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-
 DEFAULT_DEPTH_MODEL_ID = "depth-anything/Depth-Anything-V2-Small-hf"
 DEFAULT_DEPTH_FEATURE_DIM = 384
 
@@ -63,8 +62,7 @@ class DepthAnythingEncoder(nn.Module):
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         if pixel_values.ndim != 4:
             raise ValueError(
-                "`pixel_values` must have shape [B*T, 3, H, W], "
-                f"got {tuple(pixel_values.shape)}"
+                f"`pixel_values` must have shape [B*T, 3, H, W], got {tuple(pixel_values.shape)}"
             )
 
         outputs = self.model(pixel_values=pixel_values, output_hidden_states=True, return_dict=True)

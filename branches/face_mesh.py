@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from collections.abc import Mapping
 
 import torch
 
@@ -11,7 +11,6 @@ from branches.compression import (
     TemporalLatentQueryPooling,
     validate_positive_int,
 )
-
 
 POINT_QUERY_TOKENS = 1
 
@@ -26,20 +25,21 @@ class FaceMeshBranch(ModalityBranch):
         self.point_pool = LatentQueryPooling(dim=dim, output_tokens=POINT_QUERY_TOKENS)
         self.clip_pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("face_mesh",)
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:
         face_mesh = batch["face_mesh"]
         if face_mesh.ndim != 4 or face_mesh.shape[-1] != 3:
             raise ValueError(
-                "`face_mesh` must have shape [B, N, num_points, 3], "
-                f"got {tuple(face_mesh.shape)}"
+                f"`face_mesh` must have shape [B, N, num_points, 3], got {tuple(face_mesh.shape)}"
             )
 
         batch_size, num_frames, num_points, _ = face_mesh.shape
         projected_tokens = self.proj(face_mesh)
-        frame_tokens = self.point_pool(projected_tokens.reshape(batch_size * num_frames, num_points, -1))
+        frame_tokens = self.point_pool(
+            projected_tokens.reshape(batch_size * num_frames, num_points, -1)
+        )
         clip_tokens = frame_tokens.reshape(batch_size, num_frames * POINT_QUERY_TOKENS, -1)
         tokens = self.clip_pool(clip_tokens)
         time_ids = torch.arange(self.slot_count, device=face_mesh.device)

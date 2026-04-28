@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
 
 from branches.base import ModalityBranch, ModalityOutput
-from branches.compression import DEFAULT_SLOT_COUNTS, TemporalLatentQueryPooling, validate_positive_int
+from branches.compression import (
+    DEFAULT_SLOT_COUNTS,
+    TemporalLatentQueryPooling,
+    validate_positive_int,
+)
 
 
 class DepthBranch(ModalityBranch):
@@ -18,7 +22,7 @@ class DepthBranch(ModalityBranch):
         self.proj = nn.LazyLinear(dim)
         self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("depth_features",)
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -57,13 +58,15 @@ class DepthExtractor(FeatureExtractor):
         model_id_or_path: str = DEFAULT_DEPTH_MODEL_ID,
     ):
         self.encoder = encoder
-        self.processor = processor if processor is not None else _load_depth_processor(model_id_or_path)
+        self.processor = (
+            processor if processor is not None else _load_depth_processor(model_id_or_path)
+        )
         self.model_id_or_path = model_id_or_path
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("video_rgb_frames",)
 
-    def extract(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+    def extract(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         clips_rgb = _normalize_clips(batch["video_rgb_frames"])
 
         flat_frames: list[np.ndarray] = []
@@ -75,7 +78,9 @@ class DepthExtractor(FeatureExtractor):
                 flat_frames.append(frame_rgb)
 
         if len(set(clip_lengths)) != 1:
-            raise ValueError("All clips in `video_rgb_frames` batch must have the same frame count.")
+            raise ValueError(
+                "All clips in `video_rgb_frames` batch must have the same frame count."
+            )
 
         processed = self.processor(images=flat_frames, return_tensors="pt")
         pixel_values = processed["pixel_values"]

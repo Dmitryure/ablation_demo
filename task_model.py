@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -64,7 +65,9 @@ class BinaryFusionClassifier(nn.Module):
         )
 
 
-def build_binary_fusion_classifier(pipeline: ClipFusionPipeline, dim: int) -> BinaryFusionClassifier:
+def build_binary_fusion_classifier(
+    pipeline: ClipFusionPipeline, dim: int
+) -> BinaryFusionClassifier:
     return BinaryFusionClassifier(
         pipeline=pipeline,
         head=BinaryFusionHead(dim=dim),

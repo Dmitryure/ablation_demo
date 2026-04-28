@@ -63,6 +63,12 @@ def _source_label(source: SourceRef | None) -> str:
     return f"`{source.path}:{source.line}`"
 
 
+def _frame_count_label(frames: object) -> str:
+    if isinstance(frames, dict):
+        return ", ".join(f"{name}={count}" for name, count in frames.items())
+    return str(frames)
+
+
 def render_markdown(spec: ArchitectureSpec) -> str:
     fusion = spec.fusion
     lines = [
@@ -87,7 +93,7 @@ def render_markdown(spec: ArchitectureSpec) -> str:
         f"- Config: `{spec.config_path}`",
         f"- Enabled modalities: `{', '.join(spec.enabled_modalities)}`",
         f"- Fixed slot layout: `{', '.join(spec.fixed_slot_modalities)}`",
-        f"- Frames: `{spec.frames}`",
+        f"- Frames: `{_frame_count_label(spec.frames)}`",
         f"- Token dim: `{spec.dim}`",
         f"- Enabled token count: `{spec.enabled_token_count}`",
         f"- Fixed token bank size: `{spec.total_tokens}`",
@@ -111,9 +117,7 @@ def render_markdown(spec: ArchitectureSpec) -> str:
     ]
 
     for component in _component_rows(spec, "modality"):
-        stage_summary = " -> ".join(
-            f"{stage.title}: {stage.detail}" for stage in component.stages
-        )
+        stage_summary = " -> ".join(f"{stage.title}: {stage.detail}" for stage in component.stages)
         lines.append(
             markdown_table_row(
                 [
@@ -197,7 +201,7 @@ def _card_label(component: ComponentSpec) -> str:
         rows.append(("Note", component.note))
 
     parts = [
-        '<',
+        "<",
         (
             f'<TABLE BORDER="1" CELLBORDER="0" CELLSPACING="0" CELLPADDING="6" '
             f'COLOR="{component.stroke_color}" BGCOLOR="{component.fill_color}">'
@@ -209,11 +213,9 @@ def _card_label(component: ComponentSpec) -> str:
     ]
     for label, value in rows:
         parts.append(
-            (
-                '<TR><TD ALIGN="LEFT" BALIGN="LEFT">'
-                f'<FONT POINT-SIZE="10"><B>{_escape_text(label)}:</B> {_escape_text(value)}</FONT>'
-                "</TD></TR>"
-            )
+            '<TR><TD ALIGN="LEFT" BALIGN="LEFT">'
+            f'<FONT POINT-SIZE="10"><B>{_escape_text(label)}:</B> {_escape_text(value)}</FONT>'
+            "</TD></TR>"
         )
     parts.append("</TABLE>>")
     return "".join(parts)
@@ -247,7 +249,9 @@ def render_dot(spec: ArchitectureSpec, docs_dir: Path) -> str:
         ("outputs", "Outputs", "#C3D7F0", "#F4F8FC"),
     )
     for cluster_name, label, color, fillcolor in cluster_order:
-        cluster_components = [component for component in spec.components if component.cluster == cluster_name]
+        cluster_components = [
+            component for component in spec.components if component.cluster == cluster_name
+        ]
         if not cluster_components:
             continue
         lines.extend(

@@ -37,8 +37,10 @@ class ParameterizedDummyRGBEncoder(nn.Module):
         self.token_count = token_count
         self.feature_dim = feature_dim
         self.scale = nn.Parameter(torch.tensor(1.0))
+        self.last_input: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self.last_input = x.detach().clone()
         batch = x.shape[0]
         token_positions = torch.linspace(-1.0, 1.0, steps=self.token_count, device=x.device)
         features = token_positions.view(1, self.token_count, 1).repeat(batch, 1, self.feature_dim)
@@ -147,7 +149,9 @@ def build_test_pipeline(
 
 
 def build_raw_batch(num_frames: int = 16) -> dict[str, object]:
-    frames = [np.full((16, 16, 3), 64 + frame_index, dtype=np.uint8) for frame_index in range(num_frames)]
+    frames = [
+        np.full((16, 16, 3), 64 + frame_index, dtype=np.uint8) for frame_index in range(num_frames)
+    ]
     return {
         "video": torch.randn(1, 3, num_frames, 16, 16),
         "video_rgb_frames": frames,
@@ -185,6 +189,34 @@ class PipelineTest(unittest.TestCase):
         self.assertIs(features["rppg_features"], batch["rppg_features"])
         self.assertIs(features["rppg_waveform"], batch["rppg_waveform"])
         self.assertEqual(pipeline.last_feature_timings, {"fau": 0.0, "rppg": 0.0})
+
+    def test_prepare_features_uses_modality_specific_raw_batches(self):
+        pipeline = build_test_pipeline(enabled_modalities=("rgb", "rppg"))
+        batch = {
+            "video": torch.randn(1, 3, 4, 16, 16),
+            "video_rgb_frames": [
+                np.full((16, 16, 3), frame_index, dtype=np.uint8) for frame_index in range(4)
+            ],
+            "video_by_modality": {
+                "rgb": torch.randn(1, 3, 4, 16, 16),
+                "rppg": torch.randn(1, 3, 6, 16, 16),
+            },
+            "video_rgb_frames_by_modality": {
+                "rgb": [
+                    np.full((16, 16, 3), frame_index, dtype=np.uint8) for frame_index in range(4)
+                ],
+                "rppg": [
+                    np.full((16, 16, 3), frame_index, dtype=np.uint8) for frame_index in range(6)
+                ],
+            },
+        }
+
+        features = pipeline.prepare_features(batch)
+
+        rgb_encoder = pipeline.encoder_modules["rgb"]
+        self.assertEqual(tuple(rgb_encoder.last_input.shape), (1, 3, 4, 32, 32))
+        self.assertEqual(tuple(features["rppg_waveform"].shape), (1, 6))
+        self.assertEqual(tuple(features["rppg_features"].shape), (1, 6, 9))
 
     def test_modality_subset_keeps_stable_ids_and_expected_token_count(self):
         pipeline = build_test_pipeline(enabled_modalities=("face_mesh", "rppg"))
@@ -265,11 +297,14 @@ class PipelineTest(unittest.TestCase):
             warnings=(),
         )
         extractors_result = ExtractorFactoryResult(
-            extractors={"face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)},
+            extractors={
+                "face_mesh": FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)
+            },
             warnings=(),
         )
-        with patch("pipeline.build_local_encoders", return_value=encoder_result), patch(
-            "pipeline.build_extractors_from_encoders", return_value=extractors_result
+        with (
+            patch("pipeline.build_local_encoders", return_value=encoder_result),
+            patch("pipeline.build_extractors_from_encoders", return_value=extractors_result),
         ):
             build_result = build_fusion_pipeline(config, modalities=("face_mesh",))
 

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import os
 import sys
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -23,14 +26,17 @@ from dataset import (  # noqa: E402
     build_labeled_folder_examples,
     collate_labeled_video_batch,
 )
+from frame_config import describe_frame_counts, resolve_modality_frame_counts  # noqa: E402
 from pipeline import build_fusion_pipeline, load_pipeline_yaml  # noqa: E402
 from task_model import BinaryFusionClassifier, build_binary_fusion_classifier  # noqa: E402
-
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
 DEFAULT_OVERFIT_DIR = PROJECT_ROOT / "tests" / "overfit_videos"
 DEFAULT_PREDICT_DIR = PROJECT_ROOT / "tests" / "predict_videos"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "tests" / "overfit_runs"
+RUN_DIR_PREFIX = "run_"
+FEATURE_CACHE_VERSION = 1
+FEATURE_CACHE_DIRNAME = "_feature_cache"
 
 
 @dataclass(frozen=True)
@@ -50,6 +56,17 @@ class PrecomputedRunData:
     predict_examples: list[VideoExample]
     train_items: list[dict[str, Any]]
     predict_items: list[dict[str, Any]]
+    train_timing_rows: list[dict[str, Any]]
+    predict_timing_rows: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class PrecomputedFeatureResult:
+    items: list[dict[str, Any]]
+    timing_rows: list[dict[str, Any]]
+    cache_status: str
+    cache_path: Path | None
+    elapsed_seconds: float
 
 
 class PrecomputedFeatureDataset(Dataset[dict[str, Any]]):
@@ -64,11 +81,15 @@ class PrecomputedFeatureDataset(Dataset[dict[str, Any]]):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Overfit binary fake/real classifier on tiny local videos.")
+    parser = argparse.ArgumentParser(
+        description="Overfit binary fake/real classifier on tiny local videos."
+    )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--overfit-dir", type=Path, default=DEFAULT_OVERFIT_DIR)
     parser.add_argument("--predict-dir", type=Path, default=DEFAULT_PREDICT_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--feature-cache-dir", type=Path, default=None)
+    parser.add_argument("--no-feature-cache", action="store_true")
     parser.add_argument("--modalities", nargs="*", default=None)
     parser.add_argument(
         "--modality-permutations",
@@ -95,7 +116,9 @@ def build_config(config_path: Path, device: str | None) -> dict[str, Any]:
     return config
 
 
-def resolve_base_modalities(config: Mapping[str, Any], requested: Sequence[str] | None) -> tuple[str, ...]:
+def resolve_base_modalities(
+    config: Mapping[str, Any], requested: Sequence[str] | None
+) -> tuple[str, ...]:
     if requested is not None and len(requested) > 0:
         return tuple(requested)
     modalities = config.get("modalities")
@@ -131,6 +154,39 @@ def build_modality_sets(
 
 def modality_set_name(modalities: Sequence[str]) -> str:
     return "__".join(modalities)
+
+
+def parse_run_index(path: Path) -> int | None:
+    name = path.name
+    if not name.startswith(RUN_DIR_PREFIX):
+        return None
+    suffix = name[len(RUN_DIR_PREFIX) :]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def next_run_index(output_dir: Path) -> int:
+    if not output_dir.exists():
+        return 1
+    indices = [
+        index
+        for child in output_dir.iterdir()
+        if child.is_dir() and (index := parse_run_index(child)) is not None
+    ]
+    return max(indices, default=0) + 1
+
+
+def allocate_indexed_run_dir(output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_index = next_run_index(output_dir)
+    while True:
+        run_dir = output_dir / f"{RUN_DIR_PREFIX}{run_index:03d}"
+        try:
+            run_dir.mkdir()
+            return run_dir
+        except FileExistsError:
+            run_index += 1
 
 
 def should_log_epoch(epoch: int, total_epochs: int) -> bool:
@@ -202,14 +258,204 @@ def split_feature_batch(
     return items
 
 
+def normalize_frame_counts_for_cache(frame_counts: int | Mapping[str, int]) -> dict[str, int]:
+    if isinstance(frame_counts, Mapping):
+        return {str(key): int(value) for key, value in sorted(frame_counts.items())}
+    return {"default": int(frame_counts)}
+
+
+def jsonable_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(config, sort_keys=True, default=str))
+
+
+def example_cache_record(example: VideoExample) -> dict[str, Any]:
+    stat = example.path.stat()
+    return {
+        "path": str(example.path.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "label": example.label,
+        "class_name": example.class_name,
+        "source_id": example.source_id,
+        "split": example.split,
+        "identity_id": example.identity_id,
+    }
+
+
+def feature_cache_fingerprint(
+    *,
+    config: Mapping[str, Any],
+    examples: Sequence[VideoExample],
+    modalities: Sequence[str],
+    frame_counts: int | Mapping[str, int],
+    image_size: int,
+    cache_label: str,
+) -> str:
+    payload = {
+        "version": FEATURE_CACHE_VERSION,
+        "cache_label": cache_label,
+        "modalities": list(modalities),
+        "frame_counts": normalize_frame_counts_for_cache(frame_counts),
+        "image_size": int(image_size),
+        "config": jsonable_config(config),
+        "examples": [example_cache_record(example) for example in examples],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def feature_cache_path(cache_dir: Path, fingerprint: str) -> Path:
+    return cache_dir / f"{fingerprint}.pt"
+
+
+def load_feature_items_from_cache(
+    cache_path: Path, fingerprint: str
+) -> list[dict[str, Any]] | None:
+    if not cache_path.exists():
+        return None
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping) or payload.get("fingerprint") != fingerprint:
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return None
+    return [dict(item) for item in items]
+
+
+def write_feature_items_cache(
+    cache_path: Path,
+    fingerprint: str,
+    items: Sequence[Mapping[str, Any]],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "fingerprint": fingerprint,
+            "version": FEATURE_CACHE_VERSION,
+            "items": [dict(item) for item in items],
+        },
+        cache_path,
+    )
+
+
+def append_timing_rows(
+    timing_rows: list[dict[str, Any]],
+    raw_batch: Mapping[str, Any],
+    feature_timings: Mapping[str, float],
+    cache_status: str,
+    cache_path: Path | None,
+) -> None:
+    paths = raw_batch["path"]
+    class_names = raw_batch["class_name"]
+    splits = raw_batch["split"]
+    labels = raw_batch["label"].view(-1).to(dtype=torch.long)
+    load_timings = raw_batch.get("load_timings_by_modality", {})
+    batch_size = len(paths)
+    for modality_name, elapsed_seconds in feature_timings.items():
+        load_values = load_timings.get(modality_name) if isinstance(load_timings, Mapping) else None
+        if load_values is None and isinstance(load_timings, Mapping):
+            load_values = load_timings.get("default")
+        extract_seconds = float(elapsed_seconds) / batch_size
+        for index in range(batch_size):
+            load_seconds = float(load_values[index]) if isinstance(load_values, list) else 0.0
+            total_seconds = load_seconds + extract_seconds
+            timing_rows.append(
+                {
+                    "path": paths[index],
+                    "class_name": class_names[index],
+                    "label": int(labels[index].item()),
+                    "split": splits[index],
+                    "modality": modality_name,
+                    "elapsed_seconds": f"{total_seconds:.6f}",
+                    "load_seconds": f"{load_seconds:.6f}",
+                    "extract_seconds": f"{extract_seconds:.6f}",
+                    "batch_elapsed_seconds": f"{float(elapsed_seconds):.6f}",
+                    "batch_extract_seconds": f"{float(elapsed_seconds):.6f}",
+                    "batch_size": batch_size,
+                    "cache_status": cache_status,
+                    "cache_path": "" if cache_path is None else str(cache_path),
+                }
+            )
+
+
+def cached_timing_rows(
+    items: Sequence[Mapping[str, Any]],
+    modalities: Sequence[str],
+    cache_path: Path,
+    elapsed_seconds: float,
+) -> list[dict[str, Any]]:
+    per_row_seconds = (
+        0.0 if not items or not modalities else elapsed_seconds / (len(items) * len(modalities))
+    )
+    rows: list[dict[str, Any]] = []
+    for item in items:
+        label = item["label"]
+        label_value = int(label.item()) if isinstance(label, torch.Tensor) else int(label)
+        for modality_name in modalities:
+            rows.append(
+                {
+                    "path": item["path"],
+                    "class_name": item["class_name"],
+                    "label": label_value,
+                    "split": item["split"],
+                    "modality": modality_name,
+                    "elapsed_seconds": f"{per_row_seconds:.6f}",
+                    "load_seconds": "0.000000",
+                    "extract_seconds": "0.000000",
+                    "batch_elapsed_seconds": f"{elapsed_seconds:.6f}",
+                    "batch_extract_seconds": "0.000000",
+                    "batch_size": len(items),
+                    "cache_status": "hit",
+                    "cache_path": str(cache_path),
+                }
+            )
+    return rows
+
+
 def precompute_feature_items(
     pipeline: torch.nn.Module,
     examples: Sequence[VideoExample],
-    num_frames: int,
+    frame_counts: int | Mapping[str, int],
     image_size: int,
     batch_size: int,
-) -> list[dict[str, Any]]:
-    dataset = LabeledVideoDataset(examples=examples, num_frames=num_frames, image_size=image_size)
+    config: Mapping[str, Any] | None = None,
+    modalities: Sequence[str] = (),
+    cache_dir: Path | None = None,
+    cache_label: str = "",
+) -> PrecomputedFeatureResult:
+    start_time = time.perf_counter()
+    if cache_dir is not None and config is not None and modalities:
+        fingerprint = feature_cache_fingerprint(
+            config=config,
+            examples=examples,
+            modalities=modalities,
+            frame_counts=frame_counts,
+            image_size=image_size,
+            cache_label=cache_label,
+        )
+        cache_path = feature_cache_path(cache_dir, fingerprint)
+        cached_items = load_feature_items_from_cache(cache_path, fingerprint)
+        if cached_items is not None:
+            elapsed_seconds = time.perf_counter() - start_time
+            print(f"feature cache hit: {cache_path}")
+            return PrecomputedFeatureResult(
+                items=cached_items,
+                timing_rows=cached_timing_rows(
+                    cached_items,
+                    modalities=modalities,
+                    cache_path=cache_path,
+                    elapsed_seconds=elapsed_seconds,
+                ),
+                cache_status="hit",
+                cache_path=cache_path,
+                elapsed_seconds=elapsed_seconds,
+            )
+        print(f"feature cache miss: {cache_path}")
+    else:
+        fingerprint = None
+        cache_path = None
+
+    dataset = LabeledVideoDataset(examples=examples, num_frames=frame_counts, image_size=image_size)
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -217,12 +463,30 @@ def precompute_feature_items(
         collate_fn=collate_labeled_video_batch,
     )
     items: list[dict[str, Any]] = []
+    timing_rows: list[dict[str, Any]] = []
     pipeline.eval()
     with torch.no_grad():
         for raw_batch in loader:
             feature_batch = pipeline.prepare_features(raw_batch)
             items.extend(split_feature_batch(feature_batch, raw_batch))
-    return items
+            append_timing_rows(
+                timing_rows,
+                raw_batch=raw_batch,
+                feature_timings=getattr(pipeline, "last_feature_timings", {}),
+                cache_status="miss" if cache_path is not None else "disabled",
+                cache_path=cache_path,
+            )
+    if cache_path is not None and fingerprint is not None:
+        write_feature_items_cache(cache_path, fingerprint, items)
+        print(f"feature cache wrote: {cache_path}")
+    elapsed_seconds = time.perf_counter() - start_time
+    return PrecomputedFeatureResult(
+        items=items,
+        timing_rows=timing_rows,
+        cache_status="miss" if cache_path is not None else "disabled",
+        cache_path=cache_path,
+        elapsed_seconds=elapsed_seconds,
+    )
 
 
 def precompute_run_data(
@@ -234,31 +498,54 @@ def precompute_run_data(
     pipeline = build_result.pipeline
     train_examples = build_labeled_folder_examples(args.overfit_dir, split="train")
     predict_examples = build_labeled_folder_examples(args.predict_dir, split="test")
+    frame_counts = resolve_modality_frame_counts(config, modalities)
 
-    print(f"precompute train features: {len(train_examples)} videos")
-    train_items = precompute_feature_items(
+    print(
+        "precompute train features: "
+        f"{len(train_examples)} videos, frames: {describe_frame_counts(frame_counts)}"
+    )
+    train_result = precompute_feature_items(
         pipeline=pipeline,
         examples=train_examples,
-        num_frames=int(config["frames"]),
+        frame_counts=frame_counts,
         image_size=int(config["image_size"]),
         batch_size=args.batch_size,
+        config=config,
+        modalities=modalities,
+        cache_dir=None
+        if getattr(args, "no_feature_cache", False)
+        else getattr(args, "feature_cache_dir", None),
+        cache_label="train",
     )
-    print(f"precompute predict features: {len(predict_examples)} videos")
-    predict_items = precompute_feature_items(
+    print_precompute_timing_summary("precompute train timing", train_result.timing_rows)
+    print(
+        "precompute predict features: "
+        f"{len(predict_examples)} videos, frames: {describe_frame_counts(frame_counts)}"
+    )
+    predict_result = precompute_feature_items(
         pipeline=pipeline,
         examples=predict_examples,
-        num_frames=int(config["frames"]),
+        frame_counts=frame_counts,
         image_size=int(config["image_size"]),
         batch_size=args.batch_size,
+        config=config,
+        modalities=modalities,
+        cache_dir=None
+        if getattr(args, "no_feature_cache", False)
+        else getattr(args, "feature_cache_dir", None),
+        cache_label="predict",
     )
+    print_precompute_timing_summary("precompute predict timing", predict_result.timing_rows)
     pipeline.close()
     if build_result.device.type == "cuda":
         torch.cuda.empty_cache()
     return PrecomputedRunData(
         train_examples=train_examples,
         predict_examples=predict_examples,
-        train_items=train_items,
-        predict_items=predict_items,
+        train_items=train_result.items,
+        predict_items=predict_result.items,
+        train_timing_rows=train_result.timing_rows,
+        predict_timing_rows=predict_result.timing_rows,
     )
 
 
@@ -447,6 +734,95 @@ def write_summary(path: Path, summary: Mapping[str, Any]) -> None:
         handle.write("\n")
 
 
+def write_precompute_timings(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = (
+        "path",
+        "class_name",
+        "label",
+        "split",
+        "modality",
+        "elapsed_seconds",
+        "load_seconds",
+        "extract_seconds",
+        "batch_elapsed_seconds",
+        "batch_extract_seconds",
+        "batch_size",
+        "cache_status",
+        "cache_path",
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def summarize_precompute_timings(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    by_modality: dict[str, dict[str, Any]] = {}
+    total = 0.0
+    for row in rows:
+        modality = str(row["modality"])
+        elapsed = float(row["elapsed_seconds"])
+        total += elapsed
+        current = by_modality.setdefault(
+            modality,
+            {
+                "count": 0,
+                "total_seconds": 0.0,
+                "load_seconds": 0.0,
+                "extract_seconds": 0.0,
+                "max_seconds": 0.0,
+            },
+        )
+        current["count"] += 1
+        current["total_seconds"] += elapsed
+        current["load_seconds"] += float(row.get("load_seconds", 0.0) or 0.0)
+        current["extract_seconds"] += float(row.get("extract_seconds", 0.0) or 0.0)
+        current["max_seconds"] = max(current["max_seconds"], elapsed)
+
+    formatted: dict[str, dict[str, float | int]] = {}
+    for modality, values in by_modality.items():
+        count = int(values["count"])
+        total_seconds = float(values["total_seconds"])
+        formatted[modality] = {
+            "count": count,
+            "total_seconds": total_seconds,
+            "load_seconds": float(values["load_seconds"]),
+            "extract_seconds": float(values["extract_seconds"]),
+            "mean_seconds": 0.0 if count == 0 else total_seconds / count,
+            "max_seconds": float(values["max_seconds"]),
+        }
+    return {
+        "total_seconds": total,
+        "by_modality": formatted,
+    }
+
+
+def print_precompute_timing_summary(
+    title: str,
+    rows: Sequence[Mapping[str, Any]],
+) -> None:
+    summary = summarize_precompute_timings(rows)
+    print(f"{title}: total={summary['total_seconds']:.3f}s")
+    by_modality = summary["by_modality"]
+    if not isinstance(by_modality, Mapping) or not by_modality:
+        print(f"{title}: no timing rows")
+        return
+    for modality_name, values in sorted(by_modality.items()):
+        if not isinstance(values, Mapping):
+            continue
+        print(
+            f"  {modality_name}: "
+            f"count={values['count']} "
+            f"total={values['total_seconds']:.3f}s "
+            f"load={values['load_seconds']:.3f}s "
+            f"extract={values['extract_seconds']:.3f}s "
+            f"mean={values['mean_seconds']:.3f}s/video "
+            f"max={values['max_seconds']:.3f}s/video"
+        )
+
+
 def write_train_accuracy_plot(path: Path, rows: Sequence[Mapping[str, Any]], title: str) -> bool:
     if not rows:
         return False
@@ -557,25 +933,44 @@ def run_tiny_overfit_experiment(
         print(f"warning: {len(overlaps)} predict videos overlap overfit videos by label/name.")
 
     if precomputed is None:
+        frame_counts = resolve_modality_frame_counts(config, modalities)
         print(f"precompute train features: {len(train_examples)} videos")
-        train_items = precompute_feature_items(
+        train_result = precompute_feature_items(
             pipeline=model.pipeline,
             examples=train_examples,
-            num_frames=int(config["frames"]),
+            frame_counts=frame_counts,
             image_size=int(config["image_size"]),
             batch_size=args.batch_size,
+            config=config,
+            modalities=modalities,
+            cache_dir=None
+            if getattr(args, "no_feature_cache", False)
+            else getattr(args, "feature_cache_dir", None),
+            cache_label="train",
         )
+        print_precompute_timing_summary("precompute train timing", train_result.timing_rows)
         print(f"precompute predict features: {len(predict_examples)} videos")
-        predict_items = precompute_feature_items(
+        predict_result = precompute_feature_items(
             pipeline=model.pipeline,
             examples=predict_examples,
-            num_frames=int(config["frames"]),
+            frame_counts=frame_counts,
             image_size=int(config["image_size"]),
             batch_size=args.batch_size,
+            config=config,
+            modalities=modalities,
+            cache_dir=None
+            if getattr(args, "no_feature_cache", False)
+            else getattr(args, "feature_cache_dir", None),
+            cache_label="predict",
         )
+        print_precompute_timing_summary("precompute predict timing", predict_result.timing_rows)
+        train_items = train_result.items
+        predict_items = predict_result.items
+        timing_rows = [*train_result.timing_rows, *predict_result.timing_rows]
     else:
         train_items = precomputed.train_items
         predict_items = precomputed.predict_items
+        timing_rows = [*precomputed.train_timing_rows, *precomputed.predict_timing_rows]
 
     train_loader = build_feature_loader(train_items, batch_size=args.batch_size, shuffle=True)
     predict_loader = build_feature_loader(predict_items, batch_size=args.batch_size, shuffle=False)
@@ -609,7 +1004,9 @@ def run_tiny_overfit_experiment(
         build_feature_loader(train_items, args.batch_size, False),
         seen_keys=train_seen_keys,
     )
-    predict_accuracy, predict_rows_output = predict_rows(model, predict_loader, seen_keys=train_seen_keys)
+    predict_accuracy, predict_rows_output = predict_rows(
+        model, predict_loader, seen_keys=train_seen_keys
+    )
     seen_predict_summary = summarize_seen_predict_rows(predict_rows_output)
     unseen_predict_summary = summarize_unseen_predict_rows(predict_rows_output)
     if train_accuracy < args.target_train_accuracy:
@@ -635,6 +1032,8 @@ def run_tiny_overfit_experiment(
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.csv"
     write_metrics(metrics_path, metrics)
+    precompute_timings_path = output_dir / "precompute_timings.csv"
+    write_precompute_timings(precompute_timings_path, timing_rows)
     train_accuracy_plot = output_dir / "train_accuracy.png"
     plot_written = write_train_accuracy_plot(
         train_accuracy_plot,
@@ -643,8 +1042,11 @@ def run_tiny_overfit_experiment(
     )
     write_predictions(output_dir / "predictions.csv", [*train_rows, *predict_rows_output])
     summary = {
+        "output_dir": str(output_dir),
         "best_checkpoint": str(best_path),
         "metrics_csv": str(metrics_path),
+        "precompute_timings_csv": str(precompute_timings_path),
+        "precompute_timing": summarize_precompute_timings(timing_rows),
         "epochs": args.epochs,
         "lr": args.lr,
         "batch_size": args.batch_size,
@@ -673,6 +1075,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     config = build_config(args.config, args.device)
+    archive_output_dir = args.output_dir
+    run_output_dir = allocate_indexed_run_dir(archive_output_dir)
+    if args.feature_cache_dir is None:
+        args.feature_cache_dir = archive_output_dir / FEATURE_CACHE_DIRNAME
+    print(f"archive_output_dir={archive_output_dir}")
+    print(f"run_output_dir={run_output_dir}")
+    if args.no_feature_cache:
+        print("feature_cache=disabled")
+    else:
+        print(f"feature_cache_dir={args.feature_cache_dir}")
     base_modalities = resolve_base_modalities(config, args.modalities)
     modality_sets = build_modality_sets(base_modalities, args.modality_permutations)
     if len(modality_sets) > 1:
@@ -686,9 +1098,9 @@ def main() -> None:
 
     for modalities in modality_sets:
         if len(modality_sets) == 1 and args.modality_permutations == "none":
-            output_dir = args.output_dir
+            output_dir = run_output_dir
         else:
-            output_dir = args.output_dir / "modality_permutations" / modality_set_name(modalities)
+            output_dir = run_output_dir / "modality_permutations" / modality_set_name(modalities)
         print(f"modalities={','.join(modalities)}")
         summary = run_tiny_overfit_experiment(
             args=args,
@@ -700,18 +1112,32 @@ def main() -> None:
         summaries.append(summary)
 
     if len(modality_sets) > 1:
-        aggregate_plot_path = args.output_dir / "modality_permutations_train_accuracy.png"
+        aggregate_plot_path = run_output_dir / "modality_permutations_train_accuracy.png"
         aggregate_plot_written = write_modality_accuracy_plot(aggregate_plot_path, summaries)
-        aggregate_path = args.output_dir / "modality_permutations_summary.json"
+        aggregate_path = run_output_dir / "modality_permutations_summary.json"
+        aggregate_timing_rows = []
+        if precomputed is not None:
+            aggregate_timing_rows = [
+                *precomputed.train_timing_rows,
+                *precomputed.predict_timing_rows,
+            ]
+        aggregate_timings_path = run_output_dir / "precompute_timings.csv"
+        write_precompute_timings(aggregate_timings_path, aggregate_timing_rows)
         write_summary(
             aggregate_path,
             {
+                "archive_output_dir": str(archive_output_dir),
+                "run_dir": str(run_output_dir),
+                "run_index": parse_run_index(run_output_dir),
                 "mode": args.modality_permutations,
                 "base_modalities": list(base_modalities),
+                "precompute_timings_csv": str(aggregate_timings_path),
+                "precompute_timing": summarize_precompute_timings(aggregate_timing_rows),
                 "train_accuracy_plot": str(aggregate_plot_path) if aggregate_plot_written else None,
                 "runs": summaries,
             },
         )
+        print(f"wrote: {aggregate_timings_path}")
         print(f"wrote: {aggregate_path}")
         if aggregate_plot_written:
             print(f"wrote: {aggregate_plot_path}")

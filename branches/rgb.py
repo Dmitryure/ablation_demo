@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
 
 from branches.base import ModalityBranch, ModalityOutput
-from branches.compression import DEFAULT_SLOT_COUNTS, TemporalLatentQueryPooling, validate_positive_int
+from branches.compression import (
+    DEFAULT_SLOT_COUNTS,
+    TemporalLatentQueryPooling,
+    validate_positive_int,
+)
 
 
 class RGBBranch(ModalityBranch):
@@ -18,15 +22,14 @@ class RGBBranch(ModalityBranch):
         self.proj = nn.LazyLinear(dim)
         self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("rgb_features",)
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:
         rgb_features = batch["rgb_features"]
         if rgb_features.ndim != 3:
             raise ValueError(
-                "RGB features must have shape [B, N, feature_dim], "
-                f"got {tuple(rgb_features.shape)}"
+                f"RGB features must have shape [B, N, feature_dim], got {tuple(rgb_features.shape)}"
             )
 
         projected_tokens = self.proj(rgb_features)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -12,7 +12,6 @@ from branches.compression import (
     TemporalLatentQueryPooling,
     validate_positive_int,
 )
-
 
 FRAME_QUERY_TOKENS = 2
 
@@ -27,7 +26,7 @@ class FAUBranch(ModalityBranch):
         self.frame_pool = LatentQueryPooling(dim=dim, output_tokens=FRAME_QUERY_TOKENS)
         self.clip_pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("fau_features",)
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:
@@ -42,7 +41,9 @@ class FAUBranch(ModalityBranch):
         au_edge_logits = batch.get("fau_au_edge_logits")
         batch_size, num_frames, num_au, _ = fau_features.shape
         projected_tokens = self.proj(fau_features)
-        frame_tokens = self.frame_pool(projected_tokens.reshape(batch_size * num_frames, num_au, -1))
+        frame_tokens = self.frame_pool(
+            projected_tokens.reshape(batch_size * num_frames, num_au, -1)
+        )
         clip_tokens = frame_tokens.reshape(batch_size, num_frames * FRAME_QUERY_TOKENS, -1)
         tokens = self.clip_pool(clip_tokens)
         time_ids = torch.arange(self.slot_count, device=fau_features.device)

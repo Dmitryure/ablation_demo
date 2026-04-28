@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -73,7 +73,9 @@ def prepare_token_bank(
     if unsupported:
         raise ValueError(f"Fixed-slot token bank does not support modalities: {unsupported}")
     if not outputs_by_name:
-        raise ValueError("At least one enabled modality output is required to build the token bank.")
+        raise ValueError(
+            "At least one enabled modality output is required to build the token bank."
+        )
 
     tokens_by_modality: list[torch.Tensor] = []
     token_mask_by_modality: list[torch.Tensor] = []
@@ -187,9 +189,7 @@ class TokenBankFusion(nn.Module):
         if time_ids.ndim != 1:
             raise ValueError(f"`time_ids` must have shape [N], got {tuple(time_ids.shape)}")
         if modality_ids.ndim != 1:
-            raise ValueError(
-                f"`modality_ids` must have shape [N], got {tuple(modality_ids.shape)}"
-            )
+            raise ValueError(f"`modality_ids` must have shape [N], got {tuple(modality_ids.shape)}")
         if (
             tokens.shape[1] != token_mask.shape[0]
             or tokens.shape[1] != time_ids.shape[0]

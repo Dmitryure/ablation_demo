@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
@@ -22,7 +22,7 @@ class RPPGBranch(ModalityBranch):
         self.proj = nn.LazyLinear(dim)
         self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("rppg_features",)
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:

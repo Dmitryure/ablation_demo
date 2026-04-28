@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
 CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
 MODELS_DIR = PROJECT_ROOT / "models"
@@ -241,7 +240,9 @@ def _download_gdrive(entry: WeightEntry) -> Path:
     try:
         import gdown
     except ImportError as exc:
-        raise RuntimeError("Google Drive weights need `gdown`. Install with `pip install gdown`.") from exc
+        raise RuntimeError(
+            "Google Drive weights need `gdown`. Install with `pip install gdown`."
+        ) from exc
 
     entry.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"gdrive: {entry.source} -> {path}")
@@ -333,7 +334,9 @@ def download(category: str, model: str) -> Path:
 
     entries = WEIGHTS_DB[category]
     if normalized_model not in entries:
-        raise ValueError(f"Unknown model `{model}` for `{category}`. Options: {', '.join(sorted(entries))}")
+        raise ValueError(
+            f"Unknown model `{model}` for `{category}`. Options: {', '.join(sorted(entries))}"
+        )
 
     if category.startswith("fau") and normalized_model in BACKBONE_WEIGHTS:
         fetch_entry(BACKBONE_WEIGHTS[normalized_model])
@@ -352,7 +355,9 @@ def parse_args() -> argparse.Namespace:
     if len(legacy_args) == 2 and legacy_args[0] in WEIGHTS_DB:
         return argparse.Namespace(command="download", category=legacy_args[0], model=legacy_args[1])
 
-    parser = argparse.ArgumentParser(description="Download or copy local model weights for this repo.")
+    parser = argparse.ArgumentParser(
+        description="Download or copy local model weights for this repo."
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     download_parser = subparsers.add_parser("download", help="Fetch one weight entry.")

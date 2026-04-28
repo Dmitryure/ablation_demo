@@ -58,16 +58,26 @@ class ModelDocsTest(unittest.TestCase):
 
         spec = build_architecture_spec(config, config_path=DEFAULT_CONFIG)
         components = {component.id: component for component in spec.components}
+        modality_components = [
+            component for component in spec.components if component.kind == "modality"
+        ]
+        expected_total_tokens = sum(component.token_count or 0 for component in modality_components)
+        expected_enabled_tokens = components["face_mesh"].token_count
 
-        self.assertEqual(spec.total_tokens, 68)
-        self.assertEqual(spec.enabled_token_count, 16)
+        self.assertEqual(spec.total_tokens, expected_total_tokens)
+        self.assertEqual(spec.enabled_token_count, expected_enabled_tokens)
+        self.assertEqual(spec.frames["rgb"], 16)
+        self.assertEqual(spec.frames["rppg"], 32)
         self.assertFalse(components["rgb"].enabled)
         self.assertFalse(components["fau"].enabled)
         self.assertFalse(components["rppg"].enabled)
         self.assertFalse(components["eye_gaze"].enabled)
         self.assertTrue(components["face_mesh"].enabled)
         self.assertFalse(components["depth"].enabled)
-        self.assertEqual(components["token_bank"].token_formula, "enabled_slots=16, fixed_slots=68")
+        self.assertEqual(
+            components["token_bank"].token_formula,
+            f"enabled_slots={expected_enabled_tokens}, fixed_slots={expected_total_tokens}",
+        )
 
     def test_generated_json_markdown_and_dot_include_live_code_details(self):
         config = load_yaml(DEFAULT_CONFIG)
@@ -82,9 +92,12 @@ class ModelDocsTest(unittest.TestCase):
         self.assertIn('"title": "Add Time Embedding"', json_text)
         self.assertIn("Project: MLP(8->128->128)", markdown)
         self.assertIn("Point Pool: LatentQueryPooling(output_tokens=1)", markdown)
-        self.assertIn("Transformer Encoder: TransformerEncoderLayer x2 (heads=4, hidden=512)", markdown)
+        self.assertIn(
+            "Transformer Encoder: TransformerEncoderLayer x2 (heads=4, hidden=512)", markdown
+        )
+        self.assertIn("Frames: `rgb=16", markdown)
         self.assertIn("model_architecture.json", markdown)
-        self.assertIn("href=\"../branches/eye_gaze.py\"", dot_source)
+        self.assertIn('href="../branches/eye_gaze.py"', dot_source)
         self.assertIn("MLP(8-&gt;128-&gt;128)", dot_source)
         self.assertIn("Add Time Embedding", dot_source)
         self.assertIn("Token Bank", dot_source)

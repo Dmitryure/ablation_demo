@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-import time
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -15,7 +16,6 @@ from extractors import FeatureExtractor, build_extractors_from_encoders
 from fusion import FusionOutput, TokenBankFusion, prepare_token_bank
 from registry import FIXED_SLOT_MODALITIES, MODALITY_TO_ID, build_registry, registry_slot_counts
 
-
 OPTIONAL_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
     "fau": ("fau_au_logits", "fau_au_edge_logits"),
     "rppg": ("rppg_waveform",),
@@ -24,7 +24,7 @@ OPTIONAL_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
 
 @dataclass(frozen=True)
 class FusionPipelineBuildResult:
-    pipeline: "ClipFusionPipeline"
+    pipeline: ClipFusionPipeline
     device: torch.device
     warnings: tuple[str, ...]
 
@@ -215,6 +215,16 @@ class ClipFusionPipeline(nn.Module):
             if key in batch:
                 feature_batch[key] = batch[key]
 
+    def _batch_for_modality(self, batch: Mapping[str, Any], modality_name: str) -> dict[str, Any]:
+        modality_batch = dict(batch)
+        video_by_modality = batch.get("video_by_modality")
+        if isinstance(video_by_modality, Mapping) and modality_name in video_by_modality:
+            modality_batch["video"] = video_by_modality[modality_name]
+        frames_by_modality = batch.get("video_rgb_frames_by_modality")
+        if isinstance(frames_by_modality, Mapping) and modality_name in frames_by_modality:
+            modality_batch["video_rgb_frames"] = frames_by_modality[modality_name]
+        return modality_batch
+
     def prepare_features(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         feature_batch: dict[str, Any] = {}
         feature_timings: dict[str, float] = {}
@@ -228,7 +238,7 @@ class ClipFusionPipeline(nn.Module):
                     f"Missing extractor for modality `{name}` and precomputed features not provided."
                 )
             extract_start = time.perf_counter()
-            extracted = self.extractors[name].extract(batch)
+            extracted = self.extractors[name].extract(self._batch_for_modality(batch, name))
             feature_timings[name] = time.perf_counter() - extract_start
             feature_batch.update(extracted)
         self.last_feature_timings = feature_timings

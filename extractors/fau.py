@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -14,17 +15,19 @@ class FAUExtractor(FeatureExtractor):
     def __init__(self, encoder: nn.Module):
         self.encoder = encoder
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("video",)
 
-    def extract(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+    def extract(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         video = batch["video"]
         if not isinstance(video, torch.Tensor) or video.ndim != 5:
             raise ValueError(f"`video` must have shape [B, 3, N, H, W], got {tuple(video.shape)}")
 
         batch_size, channels, num_frames, height, width = video.shape
-        frame_batch = video.to(module_device(self.encoder)).permute(0, 2, 1, 3, 4).reshape(
-            batch_size * num_frames, channels, height, width
+        frame_batch = (
+            video.to(module_device(self.encoder))
+            .permute(0, 2, 1, 3, 4)
+            .reshape(batch_size * num_frames, channels, height, width)
         )
         encoded = self.encoder(frame_batch)
 
@@ -43,11 +46,15 @@ class FAUExtractor(FeatureExtractor):
                 f"got {tuple(fau_features.shape)}"
             )
 
-        feature_batch: Dict[str, Any] = {
-            "fau_features": fau_features.view(batch_size, num_frames, fau_features.shape[1], fau_features.shape[2]),
+        feature_batch: dict[str, Any] = {
+            "fau_features": fau_features.view(
+                batch_size, num_frames, fau_features.shape[1], fau_features.shape[2]
+            ),
         }
         if isinstance(au_logits, torch.Tensor):
-            feature_batch["fau_au_logits"] = au_logits.view(batch_size, num_frames, au_logits.shape[1])
+            feature_batch["fau_au_logits"] = au_logits.view(
+                batch_size, num_frames, au_logits.shape[1]
+            )
         if isinstance(au_edge_logits, torch.Tensor):
             feature_batch["fau_au_edge_logits"] = au_edge_logits.view(
                 batch_size,

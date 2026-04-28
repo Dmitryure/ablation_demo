@@ -7,12 +7,12 @@ from branches.rgb import RGBBranch
 from branches.rppg import RPPGBranch
 
 __all__ = [
-    "ModalityBranch",
-    "ModalityOutput",
     "DepthBranch",
     "EyeGazeBranch",
-    "FaceMeshBranch",
     "FAUBranch",
+    "FaceMeshBranch",
+    "ModalityBranch",
+    "ModalityOutput",
     "RGBBranch",
     "RPPGBranch",
 ]

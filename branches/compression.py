@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 
+from frame_config import resolve_modality_frame_count, validate_frame_count
 
 OUTPUT_TOKEN_CONFIG_KEYS = {
     "rgb": "slot_count",
@@ -24,6 +26,7 @@ DEFAULT_SLOT_COUNTS = {
     "face_mesh": 16,
     "depth": 4,
 }
+
 
 def validate_positive_int(value: int, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -53,8 +56,14 @@ def resolve_slot_count(config: Mapping[str, Any] | None, modality_name: str) -> 
 
 
 def require_modality_frames(config: Mapping[str, Any]) -> int:
-    value = config.get("frames")
-    return validate_positive_int(value, "frames")
+    frames = config.get("frames")
+    if isinstance(frames, Mapping):
+        return validate_frame_count(frames.get("default"), "frames.default")
+    return validate_frame_count(frames, "frames")
+
+
+def require_frame_count(config: Mapping[str, Any], modality_name: str) -> int:
+    return resolve_modality_frame_count(config, modality_name)
 
 
 def required_fusion_time_steps(config: Mapping[str, Any], modality_name: str) -> int | None:
@@ -147,7 +156,9 @@ class LatentQueryPooling(nn.Module):
 
         normalized_tokens = self.input_norm(tokens)
         queries = self.latent_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)
-        attention_scores = torch.matmul(queries, normalized_tokens.transpose(1, 2)) / math.sqrt(self.dim)
+        attention_scores = torch.matmul(queries, normalized_tokens.transpose(1, 2)) / math.sqrt(
+            self.dim
+        )
         if attention_bias is not None:
             attention_scores = attention_scores + attention_bias
         attention_weights = attention_scores.softmax(dim=-1)
@@ -171,6 +182,8 @@ class TemporalLatentQueryPooling(nn.Module):
             dtype=tokens.dtype,
         )
         queries = self.pool.latent_queries.to(device=tokens.device, dtype=tokens.dtype)
-        attention_bias = torch.matmul(queries, position_tokens.transpose(0, 1)) / math.sqrt(self.pool.dim)
+        attention_bias = torch.matmul(queries, position_tokens.transpose(0, 1)) / math.sqrt(
+            self.pool.dim
+        )
         attention_bias = attention_bias.unsqueeze(0).expand(tokens.shape[0], -1, -1)
         return self.pool(tokens, attention_bias=attention_bias)

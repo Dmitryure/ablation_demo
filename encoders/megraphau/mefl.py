@@ -15,7 +15,7 @@ from .swin_transformer import swin_transformer_base, swin_transformer_small, swi
 # Gated GCN Used to Learn Multi-dimensional Edge Features and Node Features
 class GNN(nn.Module):
     def __init__(self, in_channels, num_classes):
-        super(GNN, self).__init__()
+        super().__init__()
         self.in_channels = in_channels
         self.num_classes = num_classes
         # GNN Matrix: E x N
@@ -46,7 +46,7 @@ class GNN(nn.Module):
         self.sigmoid = nn.Sigmoid()
         self.softmax = nn.Softmax(2)
         self.bnv1 = nn.BatchNorm1d(num_classes)
-        self.bne1 = nn.BatchNorm1d(num_classes*num_classes)
+        self.bne1 = nn.BatchNorm1d(num_classes * num_classes)
 
         self.bnv2 = nn.BatchNorm1d(num_classes)
         self.bne2 = nn.BatchNorm1d(num_classes * num_classes)
@@ -78,7 +78,7 @@ class GNN(nn.Module):
     def forward(self, x, edge):
         # device
         dev = x.device
-        #if dev >= 0:
+        # if dev >= 0:
         start = self.start.to(dev)
         end = self.end.to(dev)
 
@@ -87,18 +87,24 @@ class GNN(nn.Module):
         Vix = self.A1(x)  # V x d_out
         Vjx = self.B1(x)  # V x d_out
         e = self.E1(edge)  # E x d_out
-        edge = edge + self.act(self.bne1(torch.einsum('ev, bvc -> bec', (end, Vix)) + torch.einsum('ev, bvc -> bec',(start, Vjx)) + e))  # E x d_out
+        edge = edge + self.act(
+            self.bne1(
+                torch.einsum("ev, bvc -> bec", (end, Vix))
+                + torch.einsum("ev, bvc -> bec", (start, Vjx))
+                + e
+            )
+        )  # E x d_out
 
         e = self.sigmoid(edge)
         b, _, c = e.shape
-        e = e.view(b,self.num_classes, self.num_classes, c)
+        e = e.view(b, self.num_classes, self.num_classes, c)
         e = self.softmax(e)
         e = e.view(b, -1, c)
 
         Ujx = self.V1(x)
-        Ujx = torch.einsum('ev, bvc -> bec', (start, Ujx))
+        Ujx = torch.einsum("ev, bvc -> bec", (start, Ujx))
         Uix = self.U1(x)
-        x = Uix + torch.einsum('ve, bec -> bvc', (end.t(), e * Ujx)) / self.num_classes  # V x H_out
+        x = Uix + torch.einsum("ve, bec -> bvc", (end.t(), e * Ujx)) / self.num_classes  # V x H_out
         x = self.act(res + self.bnv1(x))
         res = x
 
@@ -106,7 +112,13 @@ class GNN(nn.Module):
         Vix = self.A2(x)  # V x d_out
         Vjx = self.B2(x)  # V x d_out
         e = self.E2(edge)  # E x d_out
-        edge = edge + self.act(self.bne2(torch.einsum('ev, bvc -> bec', (end, Vix)) + torch.einsum('ev, bvc -> bec', (start, Vjx)) + e))  # E x d_out
+        edge = edge + self.act(
+            self.bne2(
+                torch.einsum("ev, bvc -> bec", (end, Vix))
+                + torch.einsum("ev, bvc -> bec", (start, Vjx))
+                + e
+            )
+        )  # E x d_out
 
         e = self.sigmoid(edge)
         b, _, c = e.shape
@@ -115,16 +127,16 @@ class GNN(nn.Module):
         e = e.view(b, -1, c)
 
         Ujx = self.V2(x)  # V x H_out
-        Ujx = torch.einsum('ev, bvc -> bec', (start, Ujx))  # E x H_out
+        Ujx = torch.einsum("ev, bvc -> bec", (start, Ujx))  # E x H_out
         Uix = self.U2(x)  # V x H_out
-        x = Uix + torch.einsum('ve, bec -> bvc', (end.t(), e * Ujx)) / self.num_classes  # V x H_out
+        x = Uix + torch.einsum("ve, bec -> bvc", (end.t(), e * Ujx)) / self.num_classes  # V x H_out
         x = self.act(res + self.bnv2(x))
         return x, edge
 
 
 class Head(nn.Module):
     def __init__(self, in_channels, num_classes):
-        super(Head, self).__init__()
+        super().__init__()
         # The head of network
         # Input: the feature maps x from backbone
         # Output: the AU recognition probabilities cl And the logits cl_edge of edge features for classification
@@ -174,13 +186,13 @@ class Head(nn.Module):
 
 
 class MEFARG(nn.Module):
-    def __init__(self, num_classes=12, backbone='swin_transformer_base'):
-        super(MEFARG, self).__init__()
-        if backbone == 'swin_transformer_tiny':
+    def __init__(self, num_classes=12, backbone="swin_transformer_base"):
+        super().__init__()
+        if backbone == "swin_transformer_tiny":
             self.backbone = swin_transformer_tiny(pretrained=False)
-        elif backbone == 'swin_transformer_small':
+        elif backbone == "swin_transformer_small":
             self.backbone = swin_transformer_small(pretrained=False)
-        elif backbone == 'swin_transformer_base':
+        elif backbone == "swin_transformer_base":
             self.backbone = swin_transformer_base(pretrained=False)
         else:
             raise ValueError(

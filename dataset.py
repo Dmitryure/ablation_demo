@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import csv
 import random
+import time
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
@@ -274,7 +275,9 @@ def load_video_clip(
         cap.release()
         raise RuntimeError(f"Video has only {total_frames} frames, need at least {num_frames}")
 
-    indices = torch.linspace(0, total_frames - 1, steps=num_frames).round().to(dtype=torch.int64).tolist()
+    indices = (
+        torch.linspace(0, total_frames - 1, steps=num_frames).round().to(dtype=torch.int64).tolist()
+    )
     clip_frames: list[torch.Tensor] = []
     rgb_frames: list[np.ndarray] = []
 
@@ -303,39 +306,93 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         examples: Sequence[VideoExample],
-        num_frames: int,
+        num_frames: int | Mapping[str, int],
         image_size: int = 224,
     ) -> None:
         self.examples = list(examples)
         self.num_frames = num_frames
         self.image_size = image_size
+        if isinstance(num_frames, Mapping):
+            if not num_frames:
+                raise ValueError("`num_frames` mapping must not be empty.")
+            self.frame_counts_by_modality = dict(num_frames)
+        else:
+            self.frame_counts_by_modality = None
 
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         example = self.examples[index]
-        clip = load_video_clip(
-            path=example.path,
-            num_frames=self.num_frames,
-            image_size=self.image_size,
-        )
-        return {
-            "video": clip["video"],
-            "video_rgb_frames": clip["video_rgb_frames"],
+        if self.frame_counts_by_modality is None:
+            load_start = time.perf_counter()
+            clip = load_video_clip(
+                path=example.path,
+                num_frames=int(self.num_frames),
+                image_size=self.image_size,
+            )
+            load_seconds = time.perf_counter() - load_start
+            video = clip["video"]
+            video_rgb_frames = clip["video_rgb_frames"]
+            video_by_modality = None
+            video_rgb_frames_by_modality = None
+            load_timings_by_modality = {"default": load_seconds}
+        else:
+            clips_by_count: dict[int, dict[str, Any]] = {}
+            load_seconds_by_count: dict[int, float] = {}
+            video_by_modality = {}
+            video_rgb_frames_by_modality = {}
+            for modality_name, frame_count in self.frame_counts_by_modality.items():
+                if frame_count not in clips_by_count:
+                    load_start = time.perf_counter()
+                    clips_by_count[frame_count] = load_video_clip(
+                        path=example.path,
+                        num_frames=frame_count,
+                        image_size=self.image_size,
+                    )
+                    load_seconds_by_count[frame_count] = time.perf_counter() - load_start
+                clip = clips_by_count[frame_count]
+                video_by_modality[modality_name] = clip["video"]
+                video_rgb_frames_by_modality[modality_name] = clip["video_rgb_frames"]
+
+            count_usage = {
+                frame_count: sum(
+                    1 for value in self.frame_counts_by_modality.values() if value == frame_count
+                )
+                for frame_count in load_seconds_by_count
+            }
+            load_timings_by_modality = {
+                modality_name: load_seconds_by_count[frame_count] / count_usage[frame_count]
+                for modality_name, frame_count in self.frame_counts_by_modality.items()
+            }
+
+            first_modality = next(iter(self.frame_counts_by_modality))
+            video = video_by_modality[first_modality]
+            video_rgb_frames = video_rgb_frames_by_modality[first_modality]
+
+        item = {
+            "video": video,
+            "video_rgb_frames": video_rgb_frames,
             "label": torch.tensor([float(example.label)], dtype=torch.float32),
             "path": str(example.path),
             "source_id": example.source_id,
             "split": example.split,
             "class_name": example.class_name,
             "identity_id": example.identity_id,
+            "load_timings_by_modality": load_timings_by_modality,
+        }
+        if video_by_modality is not None and video_rgb_frames_by_modality is not None:
+            item["video_by_modality"] = video_by_modality
+            item["video_rgb_frames_by_modality"] = video_rgb_frames_by_modality
+        return {
+            **item,
         }
 
 
 def collate_labeled_video_batch(items: Sequence[dict[str, Any]]) -> dict[str, Any]:
     if not items:
         raise ValueError("Cannot collate an empty batch.")
-    return {
+    batch = {
         "video": torch.stack([item["video"] for item in items], dim=0),
         "video_rgb_frames": [item["video_rgb_frames"] for item in items],
         "label": torch.stack([item["label"] for item in items], dim=0),
@@ -345,3 +402,22 @@ def collate_labeled_video_batch(items: Sequence[dict[str, Any]]) -> dict[str, An
         "class_name": [item["class_name"] for item in items],
         "identity_id": [item["identity_id"] for item in items],
     }
+    if "load_timings_by_modality" in items[0]:
+        batch["load_timings_by_modality"] = {
+            modality_name: [item["load_timings_by_modality"][modality_name] for item in items]
+            for modality_name in items[0]["load_timings_by_modality"]
+        }
+    if "video_by_modality" in items[0]:
+        modality_names = tuple(items[0]["video_by_modality"].keys())
+        batch["video_by_modality"] = {
+            modality_name: torch.stack(
+                [item["video_by_modality"][modality_name] for item in items],
+                dim=0,
+            )
+            for modality_name in modality_names
+        }
+        batch["video_rgb_frames_by_modality"] = {
+            modality_name: [item["video_rgb_frames_by_modality"][modality_name] for item in items]
+            for modality_name in modality_names
+        }
+    return batch

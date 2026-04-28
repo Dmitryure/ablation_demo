@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -19,13 +20,13 @@ def mlp(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
 class ModalityOutput:
     tokens: torch.Tensor
     time_ids: torch.Tensor
-    debug: Dict[str, Any]
+    debug: dict[str, Any]
 
 
 class ModalityBranch(nn.Module):
     name: str
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         raise NotImplementedError
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:

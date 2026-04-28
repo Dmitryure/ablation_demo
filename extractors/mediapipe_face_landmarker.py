@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "face_landmarker_v2_with_blendshapes.task"
 DEFAULT_MODEL_CANDIDATES: tuple[Path, ...] = (

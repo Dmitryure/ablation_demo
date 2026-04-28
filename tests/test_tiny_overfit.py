@@ -1,25 +1,33 @@
 from __future__ import annotations
 
-from pathlib import Path
 import unittest
+from io import StringIO
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
-from tempfile import TemporaryDirectory
 
 from dataset import VideoExample
 from fusion import FusionOutput
 from scripts.run_tiny_overfit import (
     PredictionRow,
+    allocate_indexed_run_dir,
     build_feature_loader,
     build_modality_sets,
     find_label_name_overlaps,
     format_miss_line,
     miss_rate_percent,
     modality_set_name,
+    next_run_index,
+    parse_run_index,
+    precompute_feature_items,
     predict_rows,
+    print_precompute_timing_summary,
     resolve_base_modalities,
     should_log_epoch,
+    summarize_precompute_timings,
     summarize_seen_predict_rows,
     summarize_unseen_predict_rows,
     train_one_epoch,
@@ -49,6 +57,16 @@ def build_fusion_output(fused: torch.Tensor) -> FusionOutput:
 class FeaturePipeline(nn.Module):
     def forward(self, batch):
         return build_fusion_output(batch["feature"])
+
+
+class CountingPrecomputePipeline(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def prepare_features(self, batch):
+        self.calls += 1
+        return {"feature": batch["label"].to(dtype=torch.float32)}
 
 
 def build_feature_items() -> list[dict[str, object]]:
@@ -107,6 +125,113 @@ class TinyOverfitTest(unittest.TestCase):
         self.assertTrue(should_log_epoch(10, 50))
         self.assertTrue(should_log_epoch(7, 7))
 
+    def test_allocate_indexed_run_dir_preserves_existing_runs(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "run_001").mkdir()
+            (root / "run_010").mkdir()
+            (root / "summary.json").write_text("legacy", encoding="utf-8")
+
+            self.assertEqual(parse_run_index(root / "run_010"), 10)
+            self.assertIsNone(parse_run_index(root / "summary.json"))
+            self.assertEqual(next_run_index(root), 11)
+
+            first = allocate_indexed_run_dir(root)
+            second = allocate_indexed_run_dir(root)
+
+            self.assertEqual(first.name, "run_011")
+            self.assertEqual(second.name, "run_012")
+            self.assertTrue((root / "summary.json").exists())
+
+    def test_precompute_feature_items_uses_persistent_cache(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video_path = root / "a.mp4"
+            video_path.write_bytes(b"fake-video")
+            examples = [
+                VideoExample(
+                    path=video_path,
+                    label=1,
+                    class_name="fake",
+                    source_id="a",
+                    split="train",
+                )
+            ]
+
+            def fake_load_video_clip(path, num_frames, image_size):
+                return {
+                    "video": torch.ones(3, num_frames, image_size, image_size),
+                    "video_rgb_frames": [object() for _ in range(num_frames)],
+                }
+
+            first_pipeline = CountingPrecomputePipeline()
+            with patch("dataset.load_video_clip", side_effect=fake_load_video_clip):
+                first_result = precompute_feature_items(
+                    pipeline=first_pipeline,
+                    examples=examples,
+                    frame_counts=4,
+                    image_size=4,
+                    batch_size=1,
+                    config={"frames": 4, "image_size": 4},
+                    modalities=("rppg",),
+                    cache_dir=root / "cache",
+                    cache_label="train",
+                )
+
+            second_pipeline = CountingPrecomputePipeline()
+            with patch("dataset.load_video_clip", side_effect=AssertionError("cache miss")):
+                second_result = precompute_feature_items(
+                    pipeline=second_pipeline,
+                    examples=examples,
+                    frame_counts=4,
+                    image_size=4,
+                    batch_size=1,
+                    config={"frames": 4, "image_size": 4},
+                    modalities=("rppg",),
+                    cache_dir=root / "cache",
+                    cache_label="train",
+                )
+
+            self.assertEqual(first_pipeline.calls, 1)
+            self.assertEqual(second_pipeline.calls, 0)
+            self.assertEqual(first_result.cache_status, "miss")
+            self.assertEqual(second_result.cache_status, "hit")
+            self.assertEqual(len(first_result.timing_rows), 0)
+            self.assertEqual(second_result.timing_rows[0]["cache_status"], "hit")
+            first_items = first_result.items
+            second_items = second_result.items
+            self.assertEqual(first_items[0]["path"], second_items[0]["path"])
+            self.assertTrue(torch.equal(first_items[0]["feature"], second_items[0]["feature"]))
+
+    def test_summarize_precompute_timings_groups_by_modality(self):
+        summary = summarize_precompute_timings(
+            [
+                {"modality": "rppg", "elapsed_seconds": "1.5"},
+                {"modality": "rppg", "elapsed_seconds": "0.5"},
+                {"modality": "face_mesh", "elapsed_seconds": "2.0"},
+            ]
+        )
+
+        self.assertEqual(summary["total_seconds"], 4.0)
+        self.assertEqual(summary["by_modality"]["rppg"]["count"], 2)
+        self.assertEqual(summary["by_modality"]["rppg"]["mean_seconds"], 1.0)
+        self.assertEqual(summary["by_modality"]["face_mesh"]["max_seconds"], 2.0)
+
+    def test_print_precompute_timing_summary_outputs_modality_lines(self):
+        output = StringIO()
+        rows = [
+            {"modality": "rppg", "elapsed_seconds": "1.5"},
+            {"modality": "face_mesh", "elapsed_seconds": "2.0"},
+        ]
+
+        with patch("sys.stdout", output):
+            print_precompute_timing_summary("precompute train timing", rows)
+
+        text = output.getvalue()
+        self.assertIn("precompute train timing: total=3.500s", text)
+        self.assertIn("face_mesh: count=1 total=2.000s", text)
+        self.assertIn("rppg: count=1 total=1.500s", text)
+
     def test_find_label_name_overlaps_matches_class_and_filename(self):
         train_examples = [
             VideoExample(Path("tests/overfit_videos/real/a.mp4"), 0, "real", "a", "train"),
@@ -136,7 +261,9 @@ class TinyOverfitTest(unittest.TestCase):
         last_loss = first_loss
         for _ in range(30):
             last_loss, _ = train_one_epoch(classifier, loader, optimizer, loss_fn)
-        accuracy, rows = predict_rows(classifier, build_feature_loader(items, batch_size=4, shuffle=False))
+        accuracy, rows = predict_rows(
+            classifier, build_feature_loader(items, batch_size=4, shuffle=False)
+        )
 
         self.assertLess(last_loss, first_loss)
         self.assertEqual(accuracy, 1.0)
@@ -238,8 +365,12 @@ class TinyOverfitTest(unittest.TestCase):
     def test_miss_rate_percent_and_formatting(self):
         self.assertEqual(miss_rate_percent(1, 4), 25.0)
         self.assertIsNone(miss_rate_percent(0, 0))
-        self.assertEqual(format_miss_line("predict_seen_misses", 1, 4), "predict_seen_misses=1 of 4 (25.00%)")
-        self.assertEqual(format_miss_line("predict_unseen_misses", 0, 0), "predict_unseen_misses=0 of 0 (n/a)")
+        self.assertEqual(
+            format_miss_line("predict_seen_misses", 1, 4), "predict_seen_misses=1 of 4 (25.00%)"
+        )
+        self.assertEqual(
+            format_miss_line("predict_unseen_misses", 0, 0), "predict_unseen_misses=0 of 0 (n/a)"
+        )
 
     def test_write_train_accuracy_plot_writes_png(self):
         rows = [

@@ -1,4 +1,4 @@
-""" PhysNet
+"""PhysNet
 We repulicate the net pipeline of the orginal paper, but set the input as diffnormalized data.
 orginal source:
 Remote Photoplethysmograph Signal Measurement from Facial Videos Using Spatio-Temporal Networks
@@ -9,7 +9,6 @@ MIT License
 Copyright (c) 2019
 """
 
-import torch
 import torch.nn as nn
 
 
@@ -66,14 +65,24 @@ class PhysNetPaddingEncoderDecoderMax(nn.Module):
         )
 
         self.upsample = nn.Sequential(
-            nn.ConvTranspose3d(in_channels=64, out_channels=64, kernel_size=[
-                4, 1, 1], stride=[2, 1, 1], padding=[1, 0, 0]),  # [1, 128, 32]
+            nn.ConvTranspose3d(
+                in_channels=64,
+                out_channels=64,
+                kernel_size=[4, 1, 1],
+                stride=[2, 1, 1],
+                padding=[1, 0, 0],
+            ),  # [1, 128, 32]
             nn.BatchNorm3d(64),
             nn.ELU(),
         )
         self.upsample2 = nn.Sequential(
-            nn.ConvTranspose3d(in_channels=64, out_channels=64, kernel_size=[
-                4, 1, 1], stride=[2, 1, 1], padding=[1, 0, 0]),  # [1, 128, 32]
+            nn.ConvTranspose3d(
+                in_channels=64,
+                out_channels=64,
+                kernel_size=[4, 1, 1],
+                stride=[2, 1, 1],
+                padding=[1, 0, 0],
+            ),  # [1, 128, 32]
             nn.BatchNorm3d(64),
             nn.ELU(),
         )

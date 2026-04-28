@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping, Tuple
+from collections.abc import Mapping
 
 import torch
 
@@ -21,7 +21,7 @@ class EyeGazeBranch(ModalityBranch):
         self.proj = mlp(8, dim, dim)
         self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("eye_gaze",)
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:

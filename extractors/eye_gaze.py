@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -13,7 +13,6 @@ from extractors.mediapipe_face_landmarker import (
     optional_model_path,
     resolve_face_landmarker_model_path,
 )
-
 
 EYE_GAZE_COLUMNS: tuple[str, ...] = (
     "eyeLookDownLeft",
@@ -58,7 +57,7 @@ class EyeGazeExtractor(FeatureExtractor):
             if len(result.face_blendshapes) != 1:
                 return None
 
-            features = {name: 0.0 for name in EYE_GAZE_COLUMNS}
+            features = dict.fromkeys(EYE_GAZE_COLUMNS, 0.0)
             for blendshape in result.face_blendshapes[0]:
                 if blendshape.category_name in features:
                     features[blendshape.category_name] = float(blendshape.score)
@@ -72,20 +71,33 @@ class EyeGazeExtractor(FeatureExtractor):
     def extract_tensor(self, frames_rgb: Sequence[np.ndarray]) -> torch.Tensor:
         rows: list[list[float]] = []
         for frame_rgb in frames_rgb:
-            if not isinstance(frame_rgb, np.ndarray) or frame_rgb.ndim != 3 or frame_rgb.shape[-1] != 3:
+            if (
+                not isinstance(frame_rgb, np.ndarray)
+                or frame_rgb.ndim != 3
+                or frame_rgb.shape[-1] != 3
+            ):
                 raise ValueError(
                     "Each eye-gaze frame must be an RGB numpy array with shape [H, W, 3], "
                     f"got {type(frame_rgb)}"
                 )
             features = self._detect_features(frame_rgb)
-            rows.append([0.0 if features is None else float(features.get(name, 0.0)) for name in EYE_GAZE_COLUMNS])
+            rows.append(
+                [
+                    0.0 if features is None else float(features.get(name, 0.0))
+                    for name in EYE_GAZE_COLUMNS
+                ]
+            )
         return torch.tensor(rows, dtype=torch.float32)
 
     def extract(self, batch: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         frames_rgb = batch["video_rgb_frames"]
         if not isinstance(frames_rgb, Sequence) or isinstance(frames_rgb, (str, bytes)):
             raise ValueError("`video_rgb_frames` must be a sequence of RGB frame arrays.")
-        if frames_rgb and isinstance(frames_rgb[0], Sequence) and not isinstance(frames_rgb[0], np.ndarray):
+        if (
+            frames_rgb
+            and isinstance(frames_rgb[0], Sequence)
+            and not isinstance(frames_rgb[0], np.ndarray)
+        ):
             return {
                 "eye_gaze": torch.stack(
                     [self.extract_tensor(clip_frames) for clip_frames in frames_rgb],

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -14,10 +15,10 @@ class RPPGExtractor(FeatureExtractor):
     def __init__(self, encoder: nn.Module):
         self.encoder = encoder
 
-    def required_keys(self) -> Tuple[str, ...]:
+    def required_keys(self) -> tuple[str, ...]:
         return ("video",)
 
-    def extract(self, batch: Mapping[str, Any]) -> Dict[str, Any]:
+    def extract(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         video = batch["video"]
         if not isinstance(video, torch.Tensor) or video.ndim != 5:
             raise ValueError(f"`video` must have shape [B, 3, N, H, W], got {tuple(video.shape)}")
