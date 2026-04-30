@@ -11,6 +11,7 @@ from extractors.depth import DepthExtractor
 from extractors.eye_gaze import build_eye_gaze_extractor
 from extractors.face_mesh import build_face_mesh_extractor
 from extractors.fau import FAUExtractor
+from extractors.fft import FFTExtractor
 from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
 
@@ -61,6 +62,17 @@ def _build_extractors_from_encoder_result(
             encoder_result.depth_encoder,
             model_id_or_path=model_id_or_path.strip(),
         )
+    if "fft" in enabled_set:
+        fft_config = config.get("fft", {})
+        if not isinstance(fft_config, Mapping):
+            raise ValueError("`fft` must be a YAML mapping.")
+        num_bins = fft_config.get("num_bins", 32)
+        if not isinstance(num_bins, int) or isinstance(num_bins, bool) or num_bins <= 0:
+            raise ValueError("`fft.num_bins` must be a positive integer.")
+        extractors["fft"] = FFTExtractor(
+            image_size=int(config.get("image_size", 224)),
+            num_bins=num_bins,
+        )
 
     return extractors
 
@@ -69,7 +81,7 @@ def build_extractors(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft"))
     encoder_result = build_local_encoders(config, modalities=enabled)
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
@@ -86,7 +98,7 @@ def build_extractors_from_encoders(
     encoder_result,
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft"))
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
             config=config,

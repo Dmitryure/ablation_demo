@@ -12,6 +12,7 @@ from extractors.factory import (
     build_extractors_from_encoders,
 )
 from extractors.fau import FAUExtractor
+from extractors.fft import FFTExtractor
 from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
 
@@ -22,6 +23,7 @@ __all__ = [
     "ExtractorFactoryResult",
     "EyeGazeExtractor",
     "FAUExtractor",
+    "FFTExtractor",
     "FaceMeshExtractor",
     "FeatureExtractor",
     "RGBExtractor",

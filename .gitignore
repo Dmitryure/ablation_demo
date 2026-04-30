@@ -12,3 +12,10 @@ data
 tests/overfit_videos/
 tests/predict_videos/
 tests/overfit_runs/
+.venv/
+__pycache__/
+.pytest_cache/
+*.log
+*.pt
+*.pth
+*.ckpt
