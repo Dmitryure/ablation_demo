@@ -19,3 +19,8 @@ __pycache__/
 *.pt
 *.pth
 *.ckpt
+tests/overfit_videos/
+tests/predict_videos/
+tests/overfit_runs/
+overfit_videos.zip
+predict_videos.zip
