@@ -190,6 +190,22 @@ class PipelineTest(unittest.TestCase):
         self.assertIs(features["rppg_waveform"], batch["rppg_waveform"])
         self.assertEqual(pipeline.last_feature_timings, {"fau": 0.0, "rppg": 0.0})
 
+    def test_prepare_features_does_not_call_extractor_for_cached_keys(self):
+        pipeline = build_test_pipeline(enabled_modalities=("rgb",))
+
+        class FailingExtractor:
+            def extract(self, batch):
+                del batch
+                raise AssertionError("extractor should not run")
+
+        pipeline.extractors["rgb"] = FailingExtractor()
+        batch = {"rgb_features": torch.randn(1, 8, 12)}
+
+        features = pipeline.prepare_features(batch)
+
+        self.assertIs(features["rgb_features"], batch["rgb_features"])
+        self.assertEqual(pipeline.last_feature_timings, {"rgb": 0.0})
+
     def test_prepare_features_uses_modality_specific_raw_batches(self):
         pipeline = build_test_pipeline(enabled_modalities=("rgb", "rppg"))
         batch = {
