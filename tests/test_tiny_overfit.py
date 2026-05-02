@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from scripts.run_tiny_overfit import (
     PredictionRow,
     allocate_indexed_run_dir,
     build_feature_loader,
+    build_head_config,
     build_modality_sets,
     find_label_name_overlaps,
     format_miss_line,
@@ -35,7 +37,7 @@ from scripts.run_tiny_overfit import (
     write_modality_accuracy_plot,
     write_train_accuracy_plot,
 )
-from task_model import BinaryFusionClassifier, BinaryFusionHead
+from task_models import BinaryFusionClassifier, BinaryFusionHead
 
 
 def build_fusion_output(fused: torch.Tensor) -> FusionOutput:
@@ -158,7 +160,8 @@ class TinyOverfitTest(unittest.TestCase):
                 )
             ]
 
-            def fake_load_video_clip(_path, num_frames, image_size):
+            def fake_load_video_clip(path, num_frames, image_size):
+                del path
                 return {
                     "video": torch.ones(3, num_frames, image_size, image_size),
                     "video_rgb_frames": [object() for _ in range(num_frames)],
@@ -246,6 +249,20 @@ class TinyOverfitTest(unittest.TestCase):
 
         self.assertEqual(overlaps, [("real", "a.mp4")])
 
+    def test_build_head_config_merges_cli_overrides(self):
+        args = argparse.Namespace(
+            head_type="modality_gated_mil",
+            head_hidden_dim=64,
+            head_dropout=0.2,
+        )
+
+        head_config = build_head_config({"head": {"type": "cls_mlp", "dropout": 0.1}}, args)
+
+        self.assertEqual(
+            head_config,
+            {"type": "modality_gated_mil", "dropout": 0.2, "hidden_dim": 64},
+        )
+
     def test_train_loop_can_overfit_dummy_fused_features(self):
         torch.manual_seed(0)
         classifier = BinaryFusionClassifier(
@@ -257,18 +274,21 @@ class TinyOverfitTest(unittest.TestCase):
         optimizer = torch.optim.AdamW(classifier.parameters(), lr=0.2)
         loss_fn = torch.nn.BCEWithLogitsLoss()
 
-        first_loss, _ = train_one_epoch(classifier, loader, optimizer, loss_fn)
-        last_loss = first_loss
+        first_result = train_one_epoch(classifier, loader, optimizer, loss_fn)
+        last_loss = first_result.loss
         for _ in range(30):
-            last_loss, _ = train_one_epoch(classifier, loader, optimizer, loss_fn)
+            last_loss = train_one_epoch(classifier, loader, optimizer, loss_fn).loss
         accuracy, rows = predict_rows(
             classifier, build_feature_loader(items, batch_size=4, shuffle=False)
         )
 
-        self.assertLess(last_loss, first_loss)
+        self.assertLess(last_loss, first_result.loss)
         self.assertEqual(accuracy, 1.0)
         self.assertEqual(len(rows), 4)
         self.assertEqual({row.prediction for row in rows}, {0, 1})
+        self.assertGreater(first_result.elapsed_seconds, 0.0)
+        self.assertGreater(first_result.videos_per_second, 0.0)
+        self.assertGreater(first_result.seconds_per_video, 0.0)
 
     def test_summarize_seen_predict_rows_counts_only_seen_test_misses(self):
         rows = [
@@ -388,8 +408,22 @@ class TinyOverfitTest(unittest.TestCase):
 
     def test_write_modality_accuracy_plot_writes_subplots_png(self):
         rows = [
-            {"epoch": 1, "train_loss": "0.70000000", "train_accuracy": "0.50000000"},
-            {"epoch": 2, "train_loss": "0.10000000", "train_accuracy": "1.00000000"},
+            {
+                "epoch": 1,
+                "train_loss": "0.70000000",
+                "train_accuracy": "0.50000000",
+                "train_elapsed_seconds": "2.000000",
+                "train_videos_per_second": "2.000000",
+                "train_seconds_per_video": "0.500000",
+            },
+            {
+                "epoch": 2,
+                "train_loss": "0.10000000",
+                "train_accuracy": "1.00000000",
+                "train_elapsed_seconds": "1.000000",
+                "train_videos_per_second": "4.000000",
+                "train_seconds_per_video": "0.250000",
+            },
         ]
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

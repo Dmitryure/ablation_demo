@@ -193,7 +193,8 @@ class DatasetTest(unittest.TestCase):
             image_size=8,
         )
 
-        def fake_load_video_clip(_path, num_frames, image_size):
+        def fake_load_video_clip(path, num_frames, image_size):
+            del path
             return {
                 "video": torch.full((3, num_frames, image_size, image_size), float(num_frames)),
                 "video_rgb_frames": [

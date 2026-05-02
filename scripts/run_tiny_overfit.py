@@ -28,7 +28,7 @@ from dataset import (
 )
 from frame_config import describe_frame_counts, resolve_modality_frame_counts
 from pipeline import build_fusion_pipeline, load_pipeline_yaml
-from task_model import BinaryFusionClassifier, build_binary_fusion_classifier
+from task_models import BinaryFusionClassifier, build_binary_fusion_classifier
 
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
 DEFAULT_OVERFIT_DIR = PROJECT_ROOT / "tests" / "overfit_videos"
@@ -37,6 +37,7 @@ DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "tests" / "overfit_runs"
 RUN_DIR_PREFIX = "run_"
 FEATURE_CACHE_VERSION = 1
 FEATURE_CACHE_DIRNAME = "_feature_cache"
+HEAD_TYPES = ("cls_linear", "cls_mlp", "attention_mil", "modality_gated_mil")
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,15 @@ class PrecomputedFeatureResult:
     cache_status: str
     cache_path: Path | None
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class EpochTrainResult:
+    loss: float
+    accuracy: float
+    elapsed_seconds: float
+    videos_per_second: float
+    seconds_per_video: float
 
 
 class PrecomputedFeatureDataset(Dataset[dict[str, Any]]):
@@ -105,6 +115,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--target-train-accuracy", type=float, default=1.0)
+    parser.add_argument("--head-type", choices=HEAD_TYPES, default=None)
+    parser.add_argument("--head-hidden-dim", type=int, default=None)
+    parser.add_argument("--head-dropout", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
@@ -114,6 +127,27 @@ def build_config(config_path: Path, device: str | None) -> dict[str, Any]:
     if device is not None:
         config["device"] = device
     return config
+
+
+def build_head_config(config: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
+    raw_config = config.get("head")
+    if raw_config is None:
+        head_config: dict[str, Any] = {}
+    elif isinstance(raw_config, Mapping):
+        head_config = dict(raw_config)
+    else:
+        raise ValueError("Config `head` must be a mapping when provided.")
+
+    head_type = getattr(args, "head_type", None)
+    hidden_dim = getattr(args, "head_hidden_dim", None)
+    dropout = getattr(args, "head_dropout", None)
+    if head_type is not None:
+        head_config["type"] = head_type
+    if hidden_dim is not None:
+        head_config["hidden_dim"] = hidden_dim
+    if dropout is not None:
+        head_config["dropout"] = dropout
+    return head_config or None
 
 
 def resolve_base_modalities(
@@ -586,12 +620,13 @@ def train_one_epoch(
     loader: DataLoader[dict[str, Any]],
     optimizer: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
-) -> tuple[float, float]:
+) -> EpochTrainResult:
     device = model_device(model)
     model.train()
     total_loss = 0.0
     total_correct = 0.0
     total_count = 0
+    start = time.perf_counter()
     for batch in loader:
         labels = batch["label"].to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -604,7 +639,16 @@ def train_one_epoch(
         total_loss += float(loss.item()) * batch_count
         total_correct += binary_accuracy(output.logits.detach(), labels) * batch_count
         total_count += batch_count
-    return total_loss / total_count, total_correct / total_count
+    elapsed_seconds = time.perf_counter() - start
+    videos_per_second = 0.0 if elapsed_seconds <= 0.0 else total_count / elapsed_seconds
+    seconds_per_video = 0.0 if total_count == 0 else elapsed_seconds / total_count
+    return EpochTrainResult(
+        loss=total_loss / total_count,
+        accuracy=total_correct / total_count,
+        elapsed_seconds=elapsed_seconds,
+        videos_per_second=videos_per_second,
+        seconds_per_video=seconds_per_video,
+    )
 
 
 def predict_rows(
@@ -686,7 +730,17 @@ def format_miss_line(name: str, misses: int | float | None, count: int | float |
 def write_metrics(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=("epoch", "train_loss", "train_accuracy"))
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "epoch",
+                "train_loss",
+                "train_accuracy",
+                "train_elapsed_seconds",
+                "train_videos_per_second",
+                "train_seconds_per_video",
+            ),
+        )
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -916,7 +970,11 @@ def run_tiny_overfit_experiment(
     precomputed: PrecomputedRunData | None = None,
 ) -> dict[str, Any]:
     build_result = build_fusion_pipeline(config=config, modalities=modalities)
-    model = build_binary_fusion_classifier(build_result.pipeline, dim=int(config["dim"]))
+    model = build_binary_fusion_classifier(
+        build_result.pipeline,
+        dim=int(config["dim"]),
+        head_config=build_head_config(config, args),
+    )
     freeze_encoder_modules(model)
     device = build_result.device
     model = model.to(device)
@@ -983,21 +1041,35 @@ def run_tiny_overfit_experiment(
     metrics: list[dict[str, Any]] = []
     best_accuracy = -1.0
     best_path = output_dir / "best.pt"
+    print(
+        "training: "
+        f"epochs={args.epochs} train_videos={len(train_items)} batch_size={args.batch_size}"
+    )
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_accuracy = train_one_epoch(model, train_loader, optimizer, loss_fn)
+        train_result = train_one_epoch(model, train_loader, optimizer, loss_fn)
         metrics.append(
             {
                 "epoch": epoch,
-                "train_loss": f"{train_loss:.8f}",
-                "train_accuracy": f"{train_accuracy:.8f}",
+                "train_loss": f"{train_result.loss:.8f}",
+                "train_accuracy": f"{train_result.accuracy:.8f}",
+                "train_elapsed_seconds": f"{train_result.elapsed_seconds:.6f}",
+                "train_videos_per_second": f"{train_result.videos_per_second:.6f}",
+                "train_seconds_per_video": f"{train_result.seconds_per_video:.6f}",
             }
         )
-        if train_accuracy > best_accuracy:
-            best_accuracy = train_accuracy
+        if train_result.accuracy > best_accuracy:
+            best_accuracy = train_result.accuracy
             best_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), best_path)
-        if should_log_epoch(epoch, args.epochs):
-            print(f"epoch={epoch} train_loss={train_loss:.6f} train_accuracy={train_accuracy:.4f}")
+        print(
+            f"epoch={epoch}/{args.epochs} "
+            f"train_loss={train_result.loss:.6f} "
+            f"train_accuracy={train_result.accuracy:.4f} "
+            f"elapsed={train_result.elapsed_seconds:.3f}s "
+            f"per_video={train_result.seconds_per_video:.4f}s "
+            f"videos_per_s={train_result.videos_per_second:.2f}",
+            flush=True,
+        )
 
     train_accuracy, train_rows = predict_rows(
         model,
@@ -1047,6 +1119,15 @@ def run_tiny_overfit_experiment(
         "metrics_csv": str(metrics_path),
         "precompute_timings_csv": str(precompute_timings_path),
         "precompute_timing": summarize_precompute_timings(timing_rows),
+        "train_timing": {
+            "total_seconds": sum(float(row["train_elapsed_seconds"]) for row in metrics),
+            "mean_epoch_seconds": 0.0
+            if not metrics
+            else sum(float(row["train_elapsed_seconds"]) for row in metrics) / len(metrics),
+            "mean_seconds_per_video": 0.0
+            if not metrics
+            else sum(float(row["train_seconds_per_video"]) for row in metrics) / len(metrics),
+        },
         "epochs": args.epochs,
         "lr": args.lr,
         "batch_size": args.batch_size,

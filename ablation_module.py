@@ -55,11 +55,16 @@ from registry import (
     registry_required_keys,
     validate_registry,
 )
-from task_model import (
+from task_models import (
+    AttentionMILBinaryHead,
     BinaryClassificationOutput,
     BinaryFusionClassifier,
     BinaryFusionHead,
+    BinaryHeadResult,
+    CLSMLPBinaryHead,
+    ModalityGatedMILBinaryHead,
     build_binary_fusion_classifier,
+    build_binary_head,
 )
 
 __all__ = [
@@ -73,9 +78,12 @@ __all__ = [
     "MODALITY_TO_ID",
     "PENDING_MODALITIES",
     "SUPPORTED_FRAME_COUNTS",
+    "AttentionMILBinaryHead",
     "BinaryClassificationOutput",
     "BinaryFusionClassifier",
     "BinaryFusionHead",
+    "BinaryHeadResult",
+    "CLSMLPBinaryHead",
     "ClipFusionPipeline",
     "DepthAnythingEncoder",
     "DepthBranch",
@@ -90,6 +98,7 @@ __all__ = [
     "FusionPipelineBuildResult",
     "LabeledVideoDataset",
     "ModalityBranch",
+    "ModalityGatedMILBinaryHead",
     "ModalityOutput",
     "RGBBranch",
     "RGBExtractor",
@@ -97,6 +106,7 @@ __all__ = [
     "RPPGExtractor",
     "VideoExample",
     "build_binary_fusion_classifier",
+    "build_binary_head",
     "build_extractors",
     "build_fusion_from_config",
     "build_fusion_pipeline",
