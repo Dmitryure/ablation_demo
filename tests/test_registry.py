@@ -429,13 +429,13 @@ class RegistryTest(unittest.TestCase):
         )
 
         self.assertIsInstance(fusion_output, FusionOutput)
-        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 72, 16))
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 76, 16))
         self.assertEqual(tuple(fusion_output.fused.shape), (1, 16))
         self.assertEqual(tuple(fusion_output.cls_token.shape), (1, 16))
-        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 73, 16))
-        self.assertEqual(tuple(fusion_output.token_mask.shape), (72,))
-        self.assertEqual(tuple(fusion_output.time_ids.shape), (72,))
-        self.assertEqual(tuple(fusion_output.modality_ids.shape), (72,))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 77, 16))
+        self.assertEqual(tuple(fusion_output.token_mask.shape), (76,))
+        self.assertEqual(tuple(fusion_output.time_ids.shape), (76,))
+        self.assertEqual(tuple(fusion_output.modality_ids.shape), (76,))
         self.assertEqual(fusion_output.modality_names, FIXED_SLOT_MODALITIES)
         self.assertTrue(torch.equal(fusion_output.time_ids[:8], torch.arange(8)))
         self.assertTrue(torch.equal(fusion_output.time_ids[8:40], torch.arange(32)))
@@ -444,6 +444,7 @@ class RegistryTest(unittest.TestCase):
         self.assertTrue(torch.equal(fusion_output.time_ids[48:64], torch.arange(16)))
         self.assertTrue(torch.equal(fusion_output.time_ids[64:68], torch.arange(4)))
         self.assertTrue(torch.equal(fusion_output.time_ids[68:72], torch.arange(4)))
+        self.assertTrue(torch.equal(fusion_output.time_ids[72:76], torch.arange(4)))
         self.assertTrue(
             torch.equal(
                 fusion_output.token_mask,
@@ -453,6 +454,7 @@ class RegistryTest(unittest.TestCase):
                     + [True] * 4
                     + [False] * 4
                     + [False] * 16
+                    + [False] * 4
                     + [False] * 4
                     + [False] * 4
                 ),
@@ -505,6 +507,7 @@ class RegistryTest(unittest.TestCase):
                     + [False] * 16
                     + [False] * 4
                     + [False] * 4
+                    + [False] * 4
                 ),
             )
         )
@@ -524,8 +527,8 @@ class RegistryTest(unittest.TestCase):
             fusion_module,
         )
 
-        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 72, 12))
-        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 73, 12))
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 76, 12))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 77, 12))
         self.assertTrue(
             torch.equal(
                 fusion_output.token_mask,
@@ -535,6 +538,7 @@ class RegistryTest(unittest.TestCase):
                     + [False] * 4
                     + [False] * 4
                     + [False] * 16
+                    + [False] * 4
                     + [False] * 4
                     + [False] * 4
                 ),
@@ -553,13 +557,13 @@ class RegistryTest(unittest.TestCase):
             fusion_module,
         )
 
-        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 72, 12))
-        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 73, 12))
+        self.assertEqual(tuple(fusion_output.tokens.shape), (1, 76, 12))
+        self.assertEqual(tuple(fusion_output.fused_tokens.shape), (1, 77, 12))
         self.assertEqual(int(fusion_output.token_mask.sum().item()), 4)
         self.assertTrue(
             torch.equal(
                 fusion_output.token_mask,
-                torch.tensor([False] * 64 + [True] * 4 + [False] * 4),
+                torch.tensor([False] * 64 + [True] * 4 + [False] * 4 + [False] * 4),
             )
         )
         self.assertTrue(
@@ -589,6 +593,7 @@ class RegistryTest(unittest.TestCase):
         self.assertTrue(torch.equal(fusion_output.token_mask[8:64], torch.tensor([False] * 56)))
         self.assertTrue(torch.equal(fusion_output.token_mask[64:68], torch.tensor([True] * 4)))
         self.assertTrue(torch.equal(fusion_output.token_mask[68:72], torch.tensor([False] * 4)))
+        self.assertTrue(torch.equal(fusion_output.token_mask[72:76], torch.tensor([False] * 4)))
 
     def test_face_mesh_branch_emits_fixed_time_ids(self):
         registry = build_registry(dim=12)
@@ -629,6 +634,7 @@ class RegistryTest(unittest.TestCase):
                 torch.arange(16),
                 torch.arange(4),
                 torch.arange(4),
+                torch.arange(4),
             ]
         )
         modality_ids = torch.tensor(
@@ -639,6 +645,7 @@ class RegistryTest(unittest.TestCase):
             + [MODALITY_TO_ID["face_mesh"]] * 16
             + [MODALITY_TO_ID["depth"]] * 4
             + [MODALITY_TO_ID["fft"]] * 4
+            + [MODALITY_TO_ID["stft"]] * 4
         )
         token_mask = torch.tensor(
             [True] * 8
@@ -648,8 +655,9 @@ class RegistryTest(unittest.TestCase):
             + [False] * 16
             + [False] * 4
             + [False] * 4
+            + [False] * 4
         )
-        tokens = torch.randn(1, 72, 10)
+        tokens = torch.randn(1, 76, 10)
         perturbed_tokens = tokens.clone()
         perturbed_tokens[:, ~token_mask, :] = (
             torch.randn_like(perturbed_tokens[:, ~token_mask, :]) * 50.0

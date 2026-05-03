@@ -14,6 +14,7 @@ from extractors.fau import FAUExtractor
 from extractors.fft import FFTExtractor
 from extractors.rgb import RGBExtractor
 from extractors.rppg import RPPGExtractor
+from extractors.stft import STFTExtractor
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,19 @@ def _build_extractors_from_encoder_result(
             image_size=int(config.get("image_size", 224)),
             num_bins=num_bins,
         )
+    if "stft" in enabled_set:
+        stft_config = config.get("stft", {})
+        if not isinstance(stft_config, Mapping):
+            raise ValueError("`stft` must be a YAML mapping.")
+        n_fft = stft_config.get("n_fft", 8)
+        if not isinstance(n_fft, int) or isinstance(n_fft, bool) or n_fft <= 1:
+            raise ValueError("`stft.n_fft` must be an integer greater than 1.")
+        hop_length = stft_config.get("hop_length", None)
+        if hop_length is not None and (
+            not isinstance(hop_length, int) or isinstance(hop_length, bool) or hop_length <= 0
+        ):
+            raise ValueError("`stft.hop_length` must be a positive integer if set.")
+        extractors["stft"] = STFTExtractor(n_fft=n_fft, hop_length=hop_length)
 
     return extractors
 
@@ -81,7 +95,7 @@ def build_extractors(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft", "stft"))
     encoder_result = build_local_encoders(config, modalities=enabled)
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
@@ -98,7 +112,7 @@ def build_extractors_from_encoders(
     encoder_result,
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft"))
+    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft", "stft"))
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
             config=config,

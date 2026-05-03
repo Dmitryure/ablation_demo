@@ -14,6 +14,7 @@ from branches import (
     ModalityBranch,
     RGBBranch,
     RPPGBranch,
+    STFTBranch,
 )
 from branches.compression import resolve_slot_count, validate_branch_token_config
 
@@ -26,6 +27,7 @@ FULL_MODALITIES: tuple[str, ...] = (
     "eye_gaze",
     "fau",
     "fft",
+    "stft",
     "text",
     "manipulation_mask",
 )
@@ -40,6 +42,7 @@ FIXED_SLOT_MODALITIES: tuple[str, ...] = (
     "face_mesh",
     "depth",
     "fft",
+    "stft",
 )
 CURRENT_MODALITIES: tuple[str, ...] = FIXED_SLOT_MODALITIES
 PENDING_MODALITIES: tuple[str, ...] = tuple(
@@ -61,6 +64,7 @@ def build_registry(dim: int, config: Mapping[str, Any] | None = None) -> nn.Modu
             ),
             "depth": DepthBranch(dim=dim, slot_count=resolve_slot_count(config, "depth")),
             "fft": FFTBranch(dim=dim, slot_count=resolve_slot_count(config, "fft")),
+            "stft": STFTBranch(dim=dim, slot_count=resolve_slot_count(config, "stft")),
         }
     )
 

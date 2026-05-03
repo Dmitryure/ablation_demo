@@ -17,6 +17,7 @@ OUTPUT_TOKEN_CONFIG_KEYS = {
     "face_mesh": "slot_count",
     "depth": "slot_count",
     "fft": "slot_count",
+    "stft": "slot_count",
 }
 
 DEFAULT_SLOT_COUNTS = {
@@ -27,6 +28,7 @@ DEFAULT_SLOT_COUNTS = {
     "face_mesh": 16,
     "depth": 4,
     "fft": 4,
+    "stft": 4,
 }
 
 

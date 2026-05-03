@@ -6,6 +6,7 @@ modalities:
   - face_mesh
   - depth
   - fft
+  - stft
 frames:
   default: 16
 image_size: 224
@@ -49,4 +50,9 @@ depth:
 fft:
   frames: 16
   num_bins: 32
+  slot_count: 4
+stft:
+  frames: 16
+  n_fft: 8
+  hop_length: 2
   slot_count: 4

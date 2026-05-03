@@ -6,6 +6,7 @@ from branches.fau import FAUBranch
 from branches.fft import FFTBranch
 from branches.rgb import RGBBranch
 from branches.rppg import RPPGBranch
+from branches.stft import STFTBranch
 
 __all__ = [
     "DepthBranch",
@@ -17,4 +18,5 @@ __all__ = [
     "ModalityOutput",
     "RGBBranch",
     "RPPGBranch",
+    "STFTBranch",
 ]
