@@ -164,11 +164,11 @@ class PipelineTest(unittest.TestCase):
 
         output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 68, 16))
-        self.assertEqual(tuple(output.token_mask.shape), (68,))
+        self.assertEqual(tuple(output.tokens.shape), (1, 76, 16))
+        self.assertEqual(tuple(output.token_mask.shape), (76,))
         self.assertEqual(tuple(output.fused.shape), (1, 16))
         self.assertEqual(tuple(output.cls_token.shape), (1, 16))
-        self.assertEqual(tuple(output.fused_tokens.shape), (1, 69, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 77, 16))
         self.assertEqual(output.modality_names, FIXED_SLOT_MODALITIES)
 
     def test_prepare_features_reuses_precomputed_modalities(self):
@@ -239,8 +239,8 @@ class PipelineTest(unittest.TestCase):
 
         output = pipeline(build_raw_batch())
 
-        self.assertEqual(tuple(output.tokens.shape), (1, 68, 16))
-        self.assertEqual(tuple(output.fused_tokens.shape), (1, 69, 16))
+        self.assertEqual(tuple(output.tokens.shape), (1, 76, 16))
+        self.assertEqual(tuple(output.fused_tokens.shape), (1, 77, 16))
         self.assertEqual(int(output.token_mask.sum().item()), 20)
         self.assertTrue(torch.count_nonzero(output.tokens[:, :40]).item() == 0)
         self.assertTrue(torch.count_nonzero(output.tokens[:, 64:]).item() == 0)
@@ -254,6 +254,8 @@ class PipelineTest(unittest.TestCase):
                     + [MODALITY_TO_ID["eye_gaze"]] * 4
                     + [MODALITY_TO_ID["face_mesh"]] * 16
                     + [MODALITY_TO_ID["depth"]] * 4
+                    + [MODALITY_TO_ID["fft"]] * 4
+                    + [MODALITY_TO_ID["stft"]] * 4
                 ),
             )
         )
@@ -266,6 +268,8 @@ class PipelineTest(unittest.TestCase):
                     + [True] * 4
                     + [False] * 4
                     + [True] * 16
+                    + [False] * 4
+                    + [False] * 4
                     + [False] * 4
                 ),
             )

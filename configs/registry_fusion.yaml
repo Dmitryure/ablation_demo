@@ -5,6 +5,8 @@ modalities:
   - eye_gaze
   - face_mesh
   - depth
+  - fft
+  - stft
 frames:
   default: 16
 image_size: 224
@@ -17,7 +19,7 @@ fusion:
   num_heads: 4
   mlp_ratio: 4.0
   dropout: 0.0
-  max_time_steps: 32
+  max_time_steps: 64
   checkpoint_path: null
 eye_gaze:
   frames: 16
@@ -44,4 +46,15 @@ depth:
   frames: 16
   model_id_or_path: depth-anything/Depth-Anything-V2-Small-hf
   feature_dim: 384
+  slot_count: 4
+fft:
+  frames: 16
+  num_bins: 32
+  slot_count: 4
+stft:
+  frames: 16
+  n_fft: 8
+  hop_length: 1
+  grid_size: 4
+  include_chrominance: false
   slot_count: 4

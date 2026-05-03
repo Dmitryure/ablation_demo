@@ -16,6 +16,8 @@ OUTPUT_TOKEN_CONFIG_KEYS = {
     "eye_gaze": "slot_count",
     "face_mesh": "slot_count",
     "depth": "slot_count",
+    "fft": "slot_count",
+    "stft": "slot_count",
 }
 
 DEFAULT_SLOT_COUNTS = {
@@ -25,6 +27,8 @@ DEFAULT_SLOT_COUNTS = {
     "eye_gaze": 4,
     "face_mesh": 16,
     "depth": 4,
+    "fft": 4,
+    "stft": 4,
 }
 
 
