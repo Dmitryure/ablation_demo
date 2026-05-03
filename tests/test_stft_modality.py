@@ -16,12 +16,6 @@ from registry import FIXED_SLOT_MODALITIES, MODALITY_TO_ID  # noqa: E402
 
 
 def make_fake_clip_batch(batch_size: int = 2, num_frames: int = 16, image_size: int = 32):
-    """Build clips with deliberately different temporal dynamics.
-
-    Clip 0: smooth temporal evolution (low temporal frequency, "real-ish").
-    Clip 1: rapid frame-to-frame jumps (high temporal frequency, "fake-ish"
-    flicker artifact).
-    """
     np_rng = np.random.default_rng(0)
     clips = []
     for clip_idx in range(batch_size):
@@ -41,13 +35,16 @@ def make_fake_clip_batch(batch_size: int = 2, num_frames: int = 16, image_size: 
 
 def check_extractor():
     print("== 1. extractor ==")
-    extractor = STFTExtractor(n_fft=8, hop_length=2)
+    extractor = STFTExtractor(n_fft=8, hop_length=1, grid_size=4, include_chrominance=True)
     clips = make_fake_clip_batch(batch_size=2, num_frames=16, image_size=32)
     out = extractor.extract({"video_rgb_frames": clips})
     stft_features = out["stft_features"]
     assert stft_features.ndim == 3, f"got {stft_features.shape}"
-    assert stft_features.shape[0] == 2
-    assert stft_features.shape[2] == 5  # n_fft=8 -> 5 frequency bins
+    assert stft_features.shape[0] == 2, f"expected batch=2, got {stft_features.shape}"
+    expected_feature_dim = 32 * 5  # num_signals * num_freq_bins
+    assert stft_features.shape[2] == expected_feature_dim, (
+        f"expected feature_dim={expected_feature_dim}, got {stft_features.shape[2]}"
+    )
     assert torch.isfinite(stft_features).all(), "non-finite values in stft_features"
     real_spectrum = stft_features[0].mean(dim=0)
     fake_spectrum = stft_features[1].mean(dim=0)

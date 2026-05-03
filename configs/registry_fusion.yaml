@@ -54,5 +54,7 @@ fft:
 stft:
   frames: 16
   n_fft: 8
-  hop_length: 2
+  hop_length: 1
+  grid_size: 4
+  include_chrominance: false
   slot_count: 4

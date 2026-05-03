@@ -86,7 +86,18 @@ def _build_extractors_from_encoder_result(
             not isinstance(hop_length, int) or isinstance(hop_length, bool) or hop_length <= 0
         ):
             raise ValueError("`stft.hop_length` must be a positive integer if set.")
-        extractors["stft"] = STFTExtractor(n_fft=n_fft, hop_length=hop_length)
+        grid_size = stft_config.get("grid_size", 4)
+        if not isinstance(grid_size, int) or isinstance(grid_size, bool) or grid_size <= 0:
+            raise ValueError("`stft.grid_size` must be a positive integer.")
+        include_chrominance = stft_config.get("include_chrominance", True)
+        if not isinstance(include_chrominance, bool):
+            raise ValueError("`stft.include_chrominance` must be a boolean.")
+        extractors["stft"] = STFTExtractor(
+            n_fft=n_fft,
+            hop_length=hop_length,
+            grid_size=grid_size,
+            include_chrominance=include_chrominance,
+        )
 
     return extractors
 
