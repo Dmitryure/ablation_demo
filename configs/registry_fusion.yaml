@@ -13,6 +13,16 @@ image_size: 224
 dim: 128
 seed: 0
 device: cuda
+training:
+  cached_loader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+  modality_dropout:
+    default_probability: 0.0
+    modality_probabilities: {}
+  gate_entropy_weight: 0.0
 fusion:
   type: token_transformer
   num_layers: 2

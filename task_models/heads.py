@@ -60,7 +60,7 @@ class AttentionMILBinaryHead(nn.Module):
         logits = self.classifier(torch.cat([cls_token, pooled], dim=1))
         return BinaryHeadResult(
             logits=logits,
-            diagnostics={"token_attention_weights": weights.detach()},
+            diagnostics={"token_attention_weights": weights},
         )
 
 
@@ -110,10 +110,10 @@ class ModalityGatedMILBinaryHead(nn.Module):
         return BinaryHeadResult(
             logits=logits,
             diagnostics={
-                "modality_gate_weights": gate_weights.detach(),
-                "modality_expert_logits": expert_logits.detach(),
-                "modality_valid_mask": modality_valid_mask.detach(),
-                "token_attention_weights": token_attention.detach(),
+                "modality_gate_weights": gate_weights,
+                "modality_expert_logits": expert_logits,
+                "modality_valid_mask": modality_valid_mask,
+                "token_attention_weights": token_attention,
             },
         )
 
@@ -184,7 +184,7 @@ def _masked_softmax(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     masked_scores = scores.masked_fill(~valid_mask, torch.finfo(scores.dtype).min)
     max_scores = masked_scores.max(dim=1, keepdim=True).values
     max_scores = torch.where(has_valid, max_scores, torch.zeros_like(max_scores))
-    shifted = scores - max_scores
+    shifted = masked_scores - max_scores
     exp_scores = torch.exp(shifted) * valid_mask.to(dtype=scores.dtype)
     return exp_scores / exp_scores.sum(dim=1, keepdim=True).clamp_min(
         torch.finfo(scores.dtype).tiny

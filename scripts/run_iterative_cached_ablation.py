@@ -28,6 +28,7 @@ from dataset import (
     collate_labeled_video_batch,
     format_split_audit,
     summarize_examples,
+    summarize_split_audit,
     write_dataset_manifest,
 )
 from feature_cache import (
@@ -74,6 +75,22 @@ class PredictionRow:
 
 
 @dataclass(frozen=True)
+class DiagnosticRow:
+    path: str
+    class_name: str
+    label: int
+    probability: float
+    prediction: int
+    split: str
+    generator_id: str
+    modality_name: str
+    modality_gate_weight: float
+    modality_expert_logit: float
+    modality_mixed_logit_contribution: float
+    token_attention_sum: float | None
+
+
+@dataclass(frozen=True)
 class BinaryMetrics:
     accuracy: float = 0.0
     balanced_accuracy: float = 0.0
@@ -105,6 +122,26 @@ class EpochEvalResult:
     accuracy: float
     elapsed_seconds: float
     metrics: BinaryMetrics = field(default_factory=BinaryMetrics)
+
+
+@dataclass(frozen=True)
+class CachedLoaderConfig:
+    num_workers: int = 0
+    pin_memory: bool = False
+    persistent_workers: bool = False
+    prefetch_factor: int | None = None
+
+
+@dataclass(frozen=True)
+class ModalityDropoutConfig:
+    default_probability: float = 0.0
+    modality_probabilities: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TrainingRegularizationConfig:
+    modality_dropout: ModalityDropoutConfig = field(default_factory=ModalityDropoutConfig)
+    gate_entropy_weight: float = 0.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -157,6 +194,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional branch LR overrides, e.g. rgb=0.0003 fau=0.0001.",
     )
+    parser.add_argument(
+        "--modality-dropout",
+        type=float,
+        default=None,
+        help="Training-only probability for dropping each enabled modality from a batch.",
+    )
+    parser.add_argument(
+        "--depth-dropout",
+        type=float,
+        default=None,
+        help="Training-only depth dropout probability. Overrides --modality-dropout for depth.",
+    )
+    parser.add_argument(
+        "--gate-entropy-weight",
+        type=float,
+        default=None,
+        help="Weight for gated-head entropy regularization. Positive values discourage gate collapse.",
+    )
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
     parser.add_argument("--head-type", choices=HEAD_TYPES, default=None)
     parser.add_argument("--head-hidden-dim", type=int, default=None)
@@ -208,6 +263,160 @@ def build_config(config_path: Path, device: str | None) -> dict[str, Any]:
     return config
 
 
+def _optional_bool(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ValueError(f"`{field_name}` must be a boolean.")
+    return value
+
+
+def _optional_nonnegative_int(value: Any, field_name: str, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"`{field_name}` must be a non-negative integer.")
+    return value
+
+
+def _optional_positive_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"`{field_name}` must be a positive integer.")
+    return value
+
+
+def _optional_probability(
+    value: Any, field_name: str, default: float | None = None
+) -> float | None:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"`{field_name}` must be a probability in [0.0, 1.0).")
+    probability = float(value)
+    if probability < 0.0 or probability >= 1.0:
+        raise ValueError(f"`{field_name}` must be in [0.0, 1.0), got {probability}.")
+    return probability
+
+
+def _optional_nonnegative_float(value: Any, field_name: str, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) < 0.0:
+        raise ValueError(f"`{field_name}` must be a non-negative number.")
+    return float(value)
+
+
+def resolve_cached_loader_config(config: Mapping[str, Any]) -> CachedLoaderConfig:
+    training = config.get("training", {})
+    if training is None:
+        training = {}
+    if not isinstance(training, Mapping):
+        raise ValueError("Config `training` must be a mapping when provided.")
+    loader = training.get("cached_loader", {})
+    if loader is None:
+        loader = {}
+    if not isinstance(loader, Mapping):
+        raise ValueError("Config `training.cached_loader` must be a mapping when provided.")
+
+    num_workers = _optional_nonnegative_int(
+        loader.get("num_workers"),
+        "training.cached_loader.num_workers",
+        0,
+    )
+    pin_memory = _optional_bool(
+        loader.get("pin_memory"),
+        "training.cached_loader.pin_memory",
+        False,
+    )
+    persistent_workers = _optional_bool(
+        loader.get("persistent_workers"),
+        "training.cached_loader.persistent_workers",
+        False,
+    )
+    prefetch_factor = _optional_positive_int(
+        loader.get("prefetch_factor"),
+        "training.cached_loader.prefetch_factor",
+    )
+    if num_workers == 0:
+        persistent_workers = False
+        prefetch_factor = None
+    return CachedLoaderConfig(
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
+
+
+def resolve_training_regularization_config(
+    config: Mapping[str, Any],
+    args: argparse.Namespace,
+) -> TrainingRegularizationConfig:
+    training = config.get("training", {})
+    if training is None:
+        training = {}
+    if not isinstance(training, Mapping):
+        raise ValueError("Config `training` must be a mapping when provided.")
+    dropout = training.get("modality_dropout", {})
+    if dropout is None:
+        dropout = {}
+    if not isinstance(dropout, Mapping):
+        raise ValueError("Config `training.modality_dropout` must be a mapping when provided.")
+
+    default_probability = _optional_probability(
+        dropout.get("default_probability"),
+        "training.modality_dropout.default_probability",
+        0.0,
+    )
+    modality_probabilities_raw = dropout.get("modality_probabilities", {})
+    if modality_probabilities_raw is None:
+        modality_probabilities_raw = {}
+    if not isinstance(modality_probabilities_raw, Mapping):
+        raise ValueError(
+            "Config `training.modality_dropout.modality_probabilities` must be a mapping."
+        )
+    modality_probabilities = {
+        str(modality): float(
+            _optional_probability(
+                probability,
+                f"training.modality_dropout.modality_probabilities.{modality}",
+                0.0,
+            )
+        )
+        for modality, probability in modality_probabilities_raw.items()
+    }
+    if args.modality_dropout is not None:
+        default_probability = float(
+            _optional_probability(args.modality_dropout, "--modality-dropout", 0.0)
+        )
+    if args.depth_dropout is not None:
+        modality_probabilities["depth"] = float(
+            _optional_probability(args.depth_dropout, "--depth-dropout", 0.0)
+        )
+
+    gate_entropy_weight = _optional_nonnegative_float(
+        training.get("gate_entropy_weight"),
+        "training.gate_entropy_weight",
+        0.0,
+    )
+    if args.gate_entropy_weight is not None:
+        gate_entropy_weight = _optional_nonnegative_float(
+            args.gate_entropy_weight,
+            "--gate-entropy-weight",
+            0.0,
+        )
+
+    return TrainingRegularizationConfig(
+        modality_dropout=ModalityDropoutConfig(
+            default_probability=float(default_probability or 0.0),
+            modality_probabilities=modality_probabilities,
+        ),
+        gate_entropy_weight=gate_entropy_weight,
+    )
+
+
 def resolve_video_root(dataset_root: Path) -> Path:
     if (dataset_root / "real").is_dir() and (dataset_root / "fake").is_dir():
         return dataset_root
@@ -255,6 +464,10 @@ def class_counts(examples: Sequence[VideoExample]) -> dict[str, int]:
     for example in examples:
         counts[example.class_name] += 1
     return counts
+
+
+def video_metadata_summary(examples: Sequence[VideoExample]) -> dict[str, Any]:
+    return summarize_split_audit(examples)
 
 
 def _random_rank_by_path(items: Sequence[VideoExample], seed: int) -> dict[str, float]:
@@ -720,14 +933,74 @@ def metrics_row_values(prefix: str, metrics: BinaryMetrics) -> dict[str, Any]:
     }
 
 
+def modality_dropout_probability(modality: str, config: ModalityDropoutConfig) -> float:
+    return float(config.modality_probabilities.get(modality, config.default_probability))
+
+
+def sample_dropped_modalities(
+    modalities: Sequence[str],
+    config: ModalityDropoutConfig,
+) -> tuple[str, ...]:
+    if not modalities:
+        return ()
+    dropped = [
+        modality
+        for modality in modalities
+        if modality_dropout_probability(modality, config) > 0.0
+        and float(torch.rand(()).item()) < modality_dropout_probability(modality, config)
+    ]
+    if len(dropped) >= len(modalities):
+        keep_index = int(torch.randint(len(modalities), (1,)).item())
+        dropped = [modality for index, modality in enumerate(modalities) if index != keep_index]
+    return tuple(dropped)
+
+
+def apply_training_modality_dropout(
+    batch: Mapping[str, Any],
+    modalities: Sequence[str],
+    config: ModalityDropoutConfig,
+) -> dict[str, Any]:
+    dropped = sample_dropped_modalities(modalities, config)
+    if not dropped:
+        return dict(batch)
+    return {**batch, "dropped_modalities": dropped}
+
+
+def gate_entropy_regularization(
+    output: Any,
+    weight: float,
+) -> torch.Tensor | None:
+    if weight <= 0.0:
+        return None
+    gate_weights = output.diagnostics.get("modality_gate_weights")
+    valid_mask = output.diagnostics.get("modality_valid_mask")
+    if not isinstance(gate_weights, torch.Tensor) or not isinstance(valid_mask, torch.Tensor):
+        return None
+    if gate_weights.ndim != 2 or valid_mask.ndim != 1:
+        return None
+    valid_mask = valid_mask.to(device=gate_weights.device, dtype=torch.bool)
+    valid_count = int(valid_mask.sum().item())
+    if valid_count <= 1:
+        return None
+    valid_weights = gate_weights * valid_mask.to(dtype=gate_weights.dtype).unsqueeze(0)
+    entropy = -(valid_weights * valid_weights.clamp_min(torch.finfo(gate_weights.dtype).tiny).log())
+    entropy = entropy.sum(dim=1)
+    normalized_entropy = entropy / torch.log(gate_weights.new_tensor(float(valid_count))).clamp_min(
+        torch.finfo(gate_weights.dtype).tiny
+    )
+    return -float(weight) * normalized_entropy.mean()
+
+
 def train_one_epoch(
     model: BinaryFusionClassifier,
     loader: DataLoader[dict[str, Any]],
     optimizer: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
+    regularization_config: TrainingRegularizationConfig | None = None,
 ) -> EpochTrainResult:
     device = model_device(model)
     model.train()
+    resolved_regularization = regularization_config or TrainingRegularizationConfig()
     total_loss = 0.0
     total_count = 0
     true_positive = 0
@@ -738,8 +1011,19 @@ def train_one_epoch(
     for batch in loader:
         labels = batch["label"].to(device)
         optimizer.zero_grad(set_to_none=True)
-        output = model(move_tensor_batch_to_device(batch, device))
+        training_batch = apply_training_modality_dropout(
+            batch,
+            model.pipeline.enabled_modalities,
+            resolved_regularization.modality_dropout,
+        )
+        output = model(move_tensor_batch_to_device(training_batch, device))
         loss = loss_fn(output.logits, labels)
+        entropy_loss = gate_entropy_regularization(
+            output,
+            resolved_regularization.gate_entropy_weight,
+        )
+        if entropy_loss is not None:
+            loss = loss + entropy_loss
         loss.backward()
         optimizer.step()
         count = int(labels.numel())
@@ -845,6 +1129,7 @@ def is_metric_improvement(
 def predict_rows(
     model: BinaryFusionClassifier,
     loader: DataLoader[dict[str, Any]],
+    diagnostic_rows: list[DiagnosticRow] | None = None,
 ) -> tuple[float, list[PredictionRow]]:
     device = model_device(model)
     correct = 0
@@ -859,6 +1144,15 @@ def predict_rows(
             predictions = (probabilities >= 0.5).to(dtype=torch.long)
             correct += int((predictions == labels).sum().item())
             total += int(labels.numel())
+            if diagnostic_rows is not None:
+                append_diagnostic_rows(
+                    diagnostic_rows=diagnostic_rows,
+                    output=output,
+                    batch=batch,
+                    labels=labels,
+                    probabilities=probabilities,
+                    predictions=predictions,
+                )
             for index, probability in enumerate(probabilities.tolist()):
                 rows.append(
                     PredictionRow(
@@ -871,6 +1165,104 @@ def predict_rows(
                     )
                 )
     return correct / total, rows
+
+
+def append_diagnostic_rows(
+    diagnostic_rows: list[DiagnosticRow],
+    output: Any,
+    batch: Mapping[str, Any],
+    labels: torch.Tensor,
+    probabilities: torch.Tensor,
+    predictions: torch.Tensor,
+) -> None:
+    gate_weights = output.diagnostics.get("modality_gate_weights")
+    expert_logits = output.diagnostics.get("modality_expert_logits")
+    if not isinstance(gate_weights, torch.Tensor) or not isinstance(expert_logits, torch.Tensor):
+        return
+    gate_weights = gate_weights.detach().cpu()
+    expert_logits = expert_logits.detach().cpu()
+    if gate_weights.ndim != 2 or expert_logits.shape != gate_weights.shape:
+        return
+
+    modality_names = tuple(str(name) for name in output.fusion.modality_names)
+    if gate_weights.shape[1] > len(modality_names):
+        return
+    token_attention_sums = diagnostic_token_attention_sums(
+        output=output,
+        modality_count=gate_weights.shape[1],
+    )
+    paths = tuple(str(path) for path in batch["path"])
+    class_names = tuple(str(class_name) for class_name in batch["class_name"])
+    splits = tuple(str(split) for split in batch["split"])
+    labels_list = [int(value) for value in labels.view(-1).tolist()]
+    predictions_list = [int(value) for value in predictions.view(-1).tolist()]
+    probabilities_list = [float(value) for value in probabilities.view(-1).tolist()]
+
+    for batch_index, path in enumerate(paths):
+        generator_id = infer_prediction_generator(path, class_names[batch_index])
+        for modality_index in range(gate_weights.shape[1]):
+            gate_weight = float(gate_weights[batch_index, modality_index].item())
+            expert_logit = float(expert_logits[batch_index, modality_index].item())
+            token_attention_sum = (
+                None
+                if token_attention_sums is None
+                else float(token_attention_sums[batch_index, modality_index].item())
+            )
+            diagnostic_rows.append(
+                DiagnosticRow(
+                    path=path,
+                    class_name=class_names[batch_index],
+                    label=labels_list[batch_index],
+                    probability=probabilities_list[batch_index],
+                    prediction=predictions_list[batch_index],
+                    split=splits[batch_index],
+                    generator_id=generator_id,
+                    modality_name=modality_names[modality_index],
+                    modality_gate_weight=gate_weight,
+                    modality_expert_logit=expert_logit,
+                    modality_mixed_logit_contribution=gate_weight * expert_logit,
+                    token_attention_sum=token_attention_sum,
+                )
+            )
+
+
+def diagnostic_token_attention_sums(
+    output: Any,
+    modality_count: int,
+) -> torch.Tensor | None:
+    token_attention = output.diagnostics.get("token_attention_weights")
+    if not isinstance(token_attention, torch.Tensor) or token_attention.ndim != 2:
+        return None
+    token_attention = token_attention.detach().cpu()
+    modality_ids = output.fusion.modality_ids.detach().cpu()
+    if modality_ids.ndim != 1 or modality_ids.numel() != token_attention.shape[1]:
+        return None
+    ordered_ids: list[int] = []
+    for modality_id in modality_ids.tolist():
+        int_id = int(modality_id)
+        if int_id not in ordered_ids:
+            ordered_ids.append(int_id)
+        if len(ordered_ids) == modality_count:
+            break
+    if len(ordered_ids) != modality_count:
+        return None
+    attention_sums = []
+    for modality_id in ordered_ids:
+        mask = modality_ids == modality_id
+        attention_sums.append(token_attention[:, mask].sum(dim=1))
+    return torch.stack(attention_sums, dim=1)
+
+
+def infer_prediction_generator(path: str, class_name: str) -> str:
+    if class_name == "real":
+        return "real"
+    parts = Path(path).parts
+    if "fake" not in parts:
+        return "unknown"
+    index = parts.index("fake")
+    if index + 1 >= len(parts):
+        return "unknown"
+    return parts[index + 1]
 
 
 def prediction_rows_metrics(rows: Sequence[PredictionRow]) -> BinaryMetrics:
@@ -888,7 +1280,9 @@ def build_cached_loader(
     batch_size: int,
     shuffle: bool,
     dataset_root: Path,
+    loader_config: CachedLoaderConfig | None = None,
 ) -> DataLoader[dict[str, Any]]:
+    resolved_loader_config = loader_config or CachedLoaderConfig()
     dataset = CachedFeatureDataset(
         examples=examples,
         cache_dir=cache_dir,
@@ -897,11 +1291,20 @@ def build_cached_loader(
         strict=True,
         dataset_root=dataset_root,
     )
+    loader_kwargs: dict[str, Any] = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "collate_fn": collate_cached_feature_batch,
+        "num_workers": resolved_loader_config.num_workers,
+        "pin_memory": resolved_loader_config.pin_memory,
+    }
+    if resolved_loader_config.num_workers > 0:
+        loader_kwargs["persistent_workers"] = resolved_loader_config.persistent_workers
+        if resolved_loader_config.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = resolved_loader_config.prefetch_factor
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_cached_feature_batch,
+        **loader_kwargs,
     )
 
 
@@ -954,13 +1357,16 @@ def update_scan_progress(
     progress_interval: int,
     label: str,
     modality: str,
+    cache_from: Path,
+    spec_id: str,
 ) -> None:
     if progress is not None:
         progress.update(1)
         return
     if index == total or index % progress_interval == 0:
         print(
-            f"scan {label}: modality={modality} checked={index}/{total} missing={missing_count}",
+            f"scan {label}: modality={modality} checked={index}/{total} missing={missing_count} "
+            f"cache_from={cache_from} spec_id={spec_id}",
             flush=True,
         )
 
@@ -1026,6 +1432,8 @@ def missing_examples_for_modality(
                 progress_interval=progress_interval,
                 label=label,
                 modality=spec.modality,
+                cache_from=modality_cache_root,
+                spec_id=spec_id,
             )
         return missing
     finally:
@@ -1130,6 +1538,132 @@ def cache_score_summary(
         "cached_modalities": total_cached_modalities,
         "possible_modalities": len(examples) * modality_count,
     }
+
+
+def cache_key_for_example(example: VideoExample, dataset_root: Path) -> str:
+    path = example.path.resolve()
+    root = dataset_root.resolve()
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def metadata_matches_example(
+    metadata: Mapping[str, Any],
+    example: VideoExample,
+    spec: FeatureCacheSpec,
+    dataset_root: Path,
+) -> bool:
+    if metadata.get("spec_id") != feature_cache_spec_id(spec):
+        return False
+    video = metadata.get("video")
+    if not isinstance(video, Mapping):
+        return False
+    if str(video.get("relative_path", "")) != cache_key_for_example(example, dataset_root):
+        return False
+    try:
+        stat = example.path.stat()
+    except OSError:
+        return False
+    return int(video.get("size", -1)) == int(stat.st_size) and int(
+        video.get("mtime_ns", -1)
+    ) == int(stat.st_mtime_ns)
+
+
+def cached_example_keys_for_modality(
+    examples_by_cache_key: Mapping[str, VideoExample],
+    cache_dir: Path,
+    spec: FeatureCacheSpec,
+    dataset_root: Path,
+    progress_every: int | None = None,
+) -> set[str]:
+    spec_dir = feature_cache_spec_dir(cache_dir, spec)
+    if not spec_dir.is_dir():
+        return set()
+    cached_keys: set[str] = set()
+    checked = 0
+    start = time.perf_counter()
+    for metadata_path in spec_dir.glob("*.json"):
+        checked += 1
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(metadata, Mapping):
+            continue
+        video = metadata.get("video")
+        if not isinstance(video, Mapping):
+            continue
+        key = str(video.get("relative_path", ""))
+        example = examples_by_cache_key.get(key)
+        if example is None:
+            continue
+        if metadata_matches_example(metadata, example, spec, dataset_root):
+            cached_keys.add(key)
+        if progress_every is not None and checked % progress_every == 0:
+            elapsed = time.perf_counter() - start
+            print(
+                f"cache selection: modality={spec.modality} "
+                f"metadata_checked={checked} matched={len(cached_keys)} "
+                f"elapsed={elapsed:.1f}s cache_from={spec_dir} spec_id={feature_cache_spec_id(spec)}",
+                flush=True,
+            )
+    return cached_keys
+
+
+def select_fully_cached_examples(
+    examples: Sequence[VideoExample],
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+    dataset_root: Path,
+    progress_every: int | None = None,
+) -> tuple[list[VideoExample], dict[str, int]]:
+    examples_by_cache_key = {
+        cache_key_for_example(example, dataset_root): example for example in examples
+    }
+    cached_key_sets: dict[str, set[str]] = {}
+    for modality in modalities:
+        spec = specs[modality]
+        spec_dir = feature_cache_spec_dir(cache_dir, spec)
+        spec_id = feature_cache_spec_id(spec)
+        print(
+            f"cache selection: scan metadata modality={modality} "
+            f"cache_from={spec_dir} spec_id={spec_id}",
+            flush=True,
+        )
+        cached_key_sets[modality] = cached_example_keys_for_modality(
+            examples_by_cache_key=examples_by_cache_key,
+            cache_dir=cache_dir,
+            spec=spec,
+            dataset_root=dataset_root,
+            progress_every=progress_every,
+        )
+        print(
+            f"cache selection: modality={modality} matched={len(cached_key_sets[modality])} "
+            f"cache_from={spec_dir} spec_id={spec_id}",
+            flush=True,
+        )
+
+    if not cached_key_sets:
+        cached_keys: set[str] = set()
+    else:
+        cached_keys = set.intersection(*cached_key_sets.values())
+    selected = [
+        example
+        for example in examples
+        if cache_key_for_example(example, dataset_root) in cached_keys
+    ]
+    counts = {f"{modality}_cached": len(keys) for modality, keys in sorted(cached_key_sets.items())}
+    counts.update(
+        {
+            "dataset_examples": len(examples),
+            "fully_cached_examples": len(selected),
+            "modalities": len(modalities),
+        }
+    )
+    return selected, counts
 
 
 def missing_modalities_for_example(
@@ -1376,6 +1910,8 @@ def initialize_feature_cache_progress(
     missing_by_modality: dict[str, list[VideoExample]] = {}
     for modality in modalities:
         spec = specs[modality]
+        spec_id = feature_cache_spec_id(spec)
+        cache_from = feature_cache_spec_dir(cache_dir, spec)
         missing = missing_examples_for_modality(
             examples=examples,
             cache_dir=cache_dir,
@@ -1395,6 +1931,8 @@ def initialize_feature_cache_progress(
             "skipped_failed": 0,
             "written": 0,
             "failed": 0,
+            "cache_from": str(cache_from),
+            "spec_id": spec_id,
         }
         cached_before, skipped_failed = count_cached_and_skipped(
             examples=examples,
@@ -1407,7 +1945,8 @@ def initialize_feature_cache_progress(
         progress[modality]["skipped_failed"] = skipped_failed
         print(
             f"cache {label}: modality={modality} requested={len(examples)} "
-            f"cached={cached_before} skipped_failed={skipped_failed} missing={len(missing)}",
+            f"cached={cached_before} skipped_failed={skipped_failed} missing={len(missing)} "
+            f"cache_from={cache_from} spec_id={spec_id}",
             flush=True,
         )
     return missing_by_modality, progress
@@ -1765,6 +2304,160 @@ def write_predictions(path: Path, rows: Sequence[PredictionRow]) -> None:
             )
 
 
+def write_diagnostics(path: Path, rows: Sequence[DiagnosticRow]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "path",
+                "class_name",
+                "label",
+                "prediction",
+                "probability",
+                "split",
+                "generator_id",
+                "modality_name",
+                "modality_gate_weight",
+                "modality_expert_logit",
+                "modality_mixed_logit_contribution",
+                "token_attention_sum",
+            ),
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "path": row.path,
+                    "class_name": row.class_name,
+                    "label": row.label,
+                    "prediction": row.prediction,
+                    "probability": f"{row.probability:.8f}",
+                    "split": row.split,
+                    "generator_id": row.generator_id,
+                    "modality_name": row.modality_name,
+                    "modality_gate_weight": f"{row.modality_gate_weight:.8f}",
+                    "modality_expert_logit": f"{row.modality_expert_logit:.8f}",
+                    "modality_mixed_logit_contribution": (
+                        f"{row.modality_mixed_logit_contribution:.8f}"
+                    ),
+                    "token_attention_sum": ""
+                    if row.token_attention_sum is None
+                    else f"{row.token_attention_sum:.8f}",
+                }
+            )
+
+
+def summarize_diagnostic_rows(rows: Sequence[DiagnosticRow]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        correctness = "correct" if row.label == row.prediction else "incorrect"
+        key = (row.split, row.class_name, correctness, row.generator_id, row.modality_name)
+        group = groups.setdefault(
+            key,
+            {
+                "split": row.split,
+                "class_name": row.class_name,
+                "correctness": correctness,
+                "generator_id": row.generator_id,
+                "modality_name": row.modality_name,
+                "count": 0,
+                "gate_weight_sum": 0.0,
+                "expert_logit_sum": 0.0,
+                "mixed_logit_contribution_sum": 0.0,
+                "mixed_logit_abs_contribution_sum": 0.0,
+                "token_attention_sum": 0.0,
+                "token_attention_count": 0,
+            },
+        )
+        group["count"] += 1
+        group["gate_weight_sum"] += row.modality_gate_weight
+        group["expert_logit_sum"] += row.modality_expert_logit
+        group["mixed_logit_contribution_sum"] += row.modality_mixed_logit_contribution
+        group["mixed_logit_abs_contribution_sum"] += abs(row.modality_mixed_logit_contribution)
+        if row.token_attention_sum is not None:
+            group["token_attention_sum"] += row.token_attention_sum
+            group["token_attention_count"] += 1
+
+    summaries = []
+    for group in groups.values():
+        count = int(group["count"])
+        token_attention_count = int(group["token_attention_count"])
+        summaries.append(
+            {
+                "split": group["split"],
+                "class_name": group["class_name"],
+                "correctness": group["correctness"],
+                "generator_id": group["generator_id"],
+                "modality_name": group["modality_name"],
+                "count": count,
+                "mean_gate_weight": group["gate_weight_sum"] / count,
+                "mean_expert_logit": group["expert_logit_sum"] / count,
+                "mean_mixed_logit_contribution": group["mixed_logit_contribution_sum"] / count,
+                "mean_abs_mixed_logit_contribution": (
+                    group["mixed_logit_abs_contribution_sum"] / count
+                ),
+                "mean_token_attention_sum": None
+                if token_attention_count == 0
+                else group["token_attention_sum"] / token_attention_count,
+            }
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (
+            item["split"],
+            item["class_name"],
+            item["correctness"],
+            item["generator_id"],
+            -float(item["mean_abs_mixed_logit_contribution"]),
+            item["modality_name"],
+        ),
+    )
+
+
+def write_diagnostic_summary(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "split",
+                "class_name",
+                "correctness",
+                "generator_id",
+                "modality_name",
+                "count",
+                "mean_gate_weight",
+                "mean_expert_logit",
+                "mean_mixed_logit_contribution",
+                "mean_abs_mixed_logit_contribution",
+                "mean_token_attention_sum",
+            ),
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    **row,
+                    "mean_gate_weight": f"{float(row['mean_gate_weight']):.8f}",
+                    "mean_expert_logit": f"{float(row['mean_expert_logit']):.8f}",
+                    "mean_mixed_logit_contribution": (
+                        f"{float(row['mean_mixed_logit_contribution']):.8f}"
+                    ),
+                    "mean_abs_mixed_logit_contribution": (
+                        f"{float(row['mean_abs_mixed_logit_contribution']):.8f}"
+                    ),
+                    "mean_token_attention_sum": ""
+                    if row["mean_token_attention_sum"] is None
+                    else f"{float(row['mean_token_attention_sum']):.8f}",
+                }
+            )
+
+
 def run_training_round(
     args: argparse.Namespace,
     config: Mapping[str, Any],
@@ -1802,6 +2495,8 @@ def run_training_round(
         model.load_state_dict(state)
         print(f"loaded warm-start checkpoint: {warm_start_checkpoint}", flush=True)
     modality_lrs = parse_modality_lrs(args.modality_lr)
+    loader_config = resolve_cached_loader_config(config)
+    regularization_config = resolve_training_regularization_config(config, args)
     optimizer = build_optimizer(
         model,
         base_lr=args.lr,
@@ -1818,6 +2513,7 @@ def run_training_round(
         args.batch_size,
         shuffle=True,
         dataset_root=dataset_root,
+        loader_config=loader_config,
     )
     val_loader = build_cached_loader(
         val_examples,
@@ -1827,6 +2523,7 @@ def run_training_round(
         args.batch_size,
         shuffle=False,
         dataset_root=dataset_root,
+        loader_config=loader_config,
     )
     test_loader = build_cached_loader(
         test_examples,
@@ -1836,6 +2533,7 @@ def run_training_round(
         args.batch_size,
         shuffle=False,
         dataset_root=dataset_root,
+        loader_config=loader_config,
     )
 
     metrics: list[dict[str, Any]] = []
@@ -1847,6 +2545,8 @@ def run_training_round(
         f"modalities={','.join(modalities)} epochs={args.epochs} "
         f"train={len(train_examples)} val={len(val_examples)} test={len(test_examples)} "
         f"batch_size={args.batch_size} device={build_result.device} "
+        f"loader={asdict(loader_config)} "
+        f"regularization={asdict(regularization_config)} "
         f"lr={args.lr} modality_lrs={modality_lrs} "
         f"weight_decay={args.weight_decay} "
         f"checkpoint_metric={args.checkpoint_metric} "
@@ -1854,7 +2554,13 @@ def run_training_round(
         flush=True,
     )
     for epoch in range(1, args.epochs + 1):
-        result = train_one_epoch(model, train_loader, optimizer, loss_fn)
+        result = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            loss_fn,
+            regularization_config=regularization_config,
+        )
         val_result = evaluate_loss_accuracy(model, val_loader, loss_fn)
         metric_value = checkpoint_metric_value(args.checkpoint_metric, result, val_result)
         improved = is_metric_improvement(
@@ -1917,9 +2623,10 @@ def run_training_round(
     best_state = torch.load(best_path, map_location=build_result.device, weights_only=False)
     model.load_state_dict(best_state)
     print(f"loaded best checkpoint for eval: {best_path}", flush=True)
-    train_accuracy, train_rows = predict_rows(model, train_loader)
-    val_accuracy, val_rows = predict_rows(model, val_loader)
-    test_accuracy, test_rows = predict_rows(model, test_loader)
+    diagnostic_rows: list[DiagnosticRow] = []
+    train_accuracy, train_rows = predict_rows(model, train_loader, diagnostic_rows=diagnostic_rows)
+    val_accuracy, val_rows = predict_rows(model, val_loader, diagnostic_rows=diagnostic_rows)
+    test_accuracy, test_rows = predict_rows(model, test_loader, diagnostic_rows=diagnostic_rows)
     train_metrics = prediction_rows_metrics(train_rows)
     val_metrics = prediction_rows_metrics(val_rows)
     test_metrics = prediction_rows_metrics(test_rows)
@@ -1935,6 +2642,9 @@ def run_training_round(
     output_dir.mkdir(parents=True, exist_ok=True)
     write_metrics(output_dir / "metrics.csv", metrics)
     write_predictions(output_dir / "predictions.csv", [*train_rows, *val_rows, *test_rows])
+    diagnostic_summary_rows = summarize_diagnostic_rows(diagnostic_rows)
+    write_diagnostics(output_dir / "diagnostics.csv", diagnostic_rows)
+    write_diagnostic_summary(output_dir / "diagnostics_summary.csv", diagnostic_summary_rows)
     summary = {
         "modalities": list(modalities),
         "train_count": len(train_examples),
@@ -1943,12 +2653,15 @@ def run_training_round(
         "train_class_counts": class_counts(train_examples),
         "val_class_counts": class_counts(val_examples),
         "test_class_counts": class_counts(test_examples),
+        "video_metadata": video_metadata_summary([*train_examples, *val_examples, *test_examples]),
         "epochs": args.epochs,
         "epochs_ran": len(metrics),
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "modality_lrs": modality_lrs,
         "batch_size": args.batch_size,
+        "cached_loader": asdict(loader_config),
+        "regularization": asdict(regularization_config),
         "checkpoint_metric": args.checkpoint_metric,
         "best_checkpoint_metric_value": best_metric_value,
         "early_stopping_patience": args.early_stopping_patience,
@@ -1963,6 +2676,10 @@ def run_training_round(
         "train_metrics": asdict(train_metrics),
         "val_metrics": asdict(val_metrics),
         "test_metrics": asdict(test_metrics),
+        "diagnostics_csv": None if not diagnostic_rows else str(output_dir / "diagnostics.csv"),
+        "diagnostics_summary_csv": None
+        if not diagnostic_summary_rows
+        else str(output_dir / "diagnostics_summary.csv"),
         "best_checkpoint": str(best_path),
     }
     write_json(output_dir / "summary.json", summary)
@@ -1993,6 +2710,7 @@ def run_sanity_check(
     output_dir: Path,
 ) -> list[dict[str, Any]]:
     sanity_results: list[dict[str, Any]] = []
+    loader_config = resolve_cached_loader_config(config)
     for summary in summaries:
         modalities = tuple(str(modality) for modality in summary["modalities"])
         name = f"train_{int(summary['round_target']):05d}_{modality_set_name(modalities)}"
@@ -2028,17 +2746,28 @@ def run_sanity_check(
             args.batch_size,
             shuffle=False,
             dataset_root=dataset_root,
+            loader_config=loader_config,
         )
-        accuracy, rows = predict_rows(model, loader)
+        diagnostic_rows: list[DiagnosticRow] = []
+        accuracy, rows = predict_rows(model, loader, diagnostic_rows=diagnostic_rows)
         run_dir = output_dir / "sanity_check" / name
         write_predictions(run_dir / "predictions.csv", rows)
+        diagnostic_summary_rows = summarize_diagnostic_rows(diagnostic_rows)
+        write_diagnostics(run_dir / "diagnostics.csv", diagnostic_rows)
+        write_diagnostic_summary(run_dir / "diagnostics_summary.csv", diagnostic_summary_rows)
         result = {
             "round_target": int(summary["round_target"]),
             "modalities": list(modalities),
             "best_checkpoint": str(summary["best_checkpoint"]),
             "sanity_count": len(cached_examples),
             "sanity_accuracy": accuracy,
+            "video_metadata": video_metadata_summary(cached_examples),
+            "cached_loader": asdict(loader_config),
             "predictions_csv": str(run_dir / "predictions.csv"),
+            "diagnostics_csv": None if not diagnostic_rows else str(run_dir / "diagnostics.csv"),
+            "diagnostics_summary_csv": None
+            if not diagnostic_summary_rows
+            else str(run_dir / "diagnostics_summary.csv"),
         }
         write_json(run_dir / "summary.json", result)
         sanity_results.append(result)
@@ -2087,6 +2816,7 @@ def main() -> None:
     modality_sets = build_modality_sets(base_modalities, args.modality_permutations)
     specs = build_feature_cache_specs(config, base_modalities)
 
+    print("dataset selection: loading examples", flush=True)
     examples = build_real_fake_examples(
         real_dir=video_root / "real",
         fake_dir=video_root / "fake",
@@ -2094,23 +2824,28 @@ def main() -> None:
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
-    cache_score_by_path = (
-        build_cache_score_by_path(
+    dataset_examples = examples
+    cached_selection_summary: dict[str, int] | None = None
+    if args.prefer_cached_selection:
+        examples, cached_selection_summary = select_fully_cached_examples(
             examples=examples,
             cache_dir=cache_dir,
             specs=specs,
             modalities=base_modalities,
             dataset_root=dataset_root,
+            progress_every=args.progress_every,
         )
-        if args.prefer_cached_selection
-        else None
-    )
-    if cache_score_by_path is not None:
         print(
             "cache selection: "
-            f"enabled summary={cache_score_summary(examples, cache_score_by_path, len(base_modalities))}",
+            f"metadata_only summary={cached_selection_summary} counts={class_counts(examples)}",
             flush=True,
         )
+        if not examples:
+            raise ValueError(
+                "No examples have valid cached features for all requested modalities. "
+                "Generate cache first or disable --prefer-cached-selection."
+            )
+    cache_score_by_path = None
     if args.balanced_total is None:
         split_mode = "dataset_splits"
         train_pool, val_examples, test_examples = split_examples(
@@ -2147,29 +2882,34 @@ def main() -> None:
     print(f"video_root={video_root}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(f"modalities={','.join(base_modalities)}", flush=True)
+    print(f"cached_loader={asdict(resolve_cached_loader_config(config))}", flush=True)
+    print(
+        f"regularization={asdict(resolve_training_regularization_config(config, args))}",
+        flush=True,
+    )
     print(
         f"modality_sets={','.join(modality_set_name(item) for item in modality_sets)}", flush=True
     )
-    print(f"dataset_total={len(examples)} summary={summarize_examples(examples)}", flush=True)
-    for line in format_split_audit(examples):
+    print(
+        f"dataset_total={len(dataset_examples)} summary={summarize_examples(dataset_examples)}",
+        flush=True,
+    )
+    if args.prefer_cached_selection:
+        print(
+            f"cached_selection_total={len(examples)} summary={summarize_examples(examples)}",
+            flush=True,
+        )
+    for line in format_split_audit(dataset_examples):
         print(line, flush=True)
     print(f"split_mode={split_mode}", flush=True)
     print(f"train_pool={len(train_pool)} counts={class_counts(train_pool)}", flush=True)
     print(f"val_fixed={len(val_examples)} counts={class_counts(val_examples)}", flush=True)
     print(f"test_fixed={len(test_examples)} counts={class_counts(test_examples)}", flush=True)
-    if cache_score_by_path is not None:
-        print(
-            "cache selection: "
-            f"train={cache_score_summary(train_order, cache_score_by_path, len(base_modalities))} "
-            f"val={cache_score_summary(val_examples, cache_score_by_path, len(base_modalities))} "
-            f"test={cache_score_summary(test_examples, cache_score_by_path, len(base_modalities))}",
-            flush=True,
-        )
     print(f"round_targets={','.join(str(target) for target in round_targets)}", flush=True)
 
     if args.dry_run:
         write_dry_run(
-            examples,
+            dataset_examples,
             train_pool,
             val_examples,
             test_examples,
@@ -2201,6 +2941,10 @@ def main() -> None:
             "val_ratio": args.val_ratio,
             "seed": args.seed,
             "prefer_cached_selection": args.prefer_cached_selection,
+            "cached_selection_summary": cached_selection_summary,
+            "cached_loader": asdict(resolve_cached_loader_config(config)),
+            "regularization": asdict(resolve_training_regularization_config(config, args)),
+            "dataset_metadata": video_metadata_summary(manifest_examples),
             "spec_ids": {modality: feature_cache_spec_id(spec) for modality, spec in specs.items()},
         },
     )

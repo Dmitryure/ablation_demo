@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,18 +22,29 @@ from feature_cache import (
 )
 from scripts.run_iterative_cached_ablation import (
     BinaryMetrics,
+    CachedLoaderConfig,
+    DiagnosticRow,
     EpochEvalResult,
     EpochTrainResult,
+    ModalityDropoutConfig,
+    TrainingRegularizationConfig,
     binary_metrics_from_counts,
     build_balanced_train_order,
     checkpoint_metric_value,
+    gate_entropy_regularization,
     is_metric_improvement,
     metrics_row_values,
     rebalance_eval_examples,
+    resolve_cached_loader_config,
     resolve_round_targets,
+    resolve_training_regularization_config,
     resolve_warm_start_checkpoint,
+    sample_dropped_modalities,
     select_balanced_subset,
+    select_fully_cached_examples,
     split_balanced_total_examples,
+    summarize_diagnostic_rows,
+    video_metadata_summary,
 )
 
 
@@ -380,6 +392,207 @@ class FeatureCacheTest(unittest.TestCase):
             self.assertGreaterEqual(scores[str(ordered[0].path)], 3)
             self.assertGreaterEqual(scores[str(ordered[1].path)], 3)
 
+    def test_select_fully_cached_examples_uses_cache_metadata_intersection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            config = {"frames": {"default": 4}, "rgb": {}, "fau": {}}
+            specs = build_feature_cache_specs(config, ("rgb", "fau"))
+            full = root / "videos" / "fake" / "gen" / "full.mp4"
+            rgb_only = root / "videos" / "fake" / "gen" / "rgb_only.mp4"
+            real_full = root / "videos" / "real" / "real.mp4"
+            for path in (full, rgb_only, real_full):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"video")
+            examples = [
+                build_example(full, source_id="full", identity_id="gen"),
+                build_example(rgb_only, source_id="rgb_only", identity_id="gen"),
+                build_example(
+                    real_full,
+                    label=0,
+                    class_name="real",
+                    source_id="real",
+                    identity_id=None,
+                ),
+            ]
+
+            for example in (examples[0], examples[2]):
+                write_feature_cache_item(
+                    cache_dir,
+                    example,
+                    specs["rgb"],
+                    {"rgb_features": torch.ones(1, 2)},
+                    dataset_root=root,
+                )
+                write_feature_cache_item(
+                    cache_dir,
+                    example,
+                    specs["fau"],
+                    {"fau_features": torch.ones(1, 2, 3)},
+                    dataset_root=root,
+                )
+            write_feature_cache_item(
+                cache_dir,
+                examples[1],
+                specs["rgb"],
+                {"rgb_features": torch.ones(1, 2)},
+                dataset_root=root,
+            )
+
+            selected, summary = select_fully_cached_examples(
+                examples,
+                cache_dir,
+                specs,
+                ("rgb", "fau"),
+                dataset_root=root,
+            )
+
+            self.assertEqual({example.path for example in selected}, {full, real_full})
+            self.assertEqual(summary["fully_cached_examples"], 2)
+            self.assertEqual(summary["rgb_cached"], 3)
+            self.assertEqual(summary["fau_cached"], 2)
+
+    def test_resolve_cached_loader_config_from_training_yaml(self):
+        config = {
+            "training": {
+                "cached_loader": {
+                    "num_workers": 4,
+                    "pin_memory": True,
+                    "persistent_workers": True,
+                    "prefetch_factor": 2,
+                }
+            }
+        }
+
+        self.assertEqual(
+            resolve_cached_loader_config(config),
+            CachedLoaderConfig(
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True,
+                prefetch_factor=2,
+            ),
+        )
+
+    def test_resolve_cached_loader_config_disables_worker_only_options_without_workers(self):
+        config = {
+            "training": {
+                "cached_loader": {
+                    "num_workers": 0,
+                    "pin_memory": True,
+                    "persistent_workers": True,
+                    "prefetch_factor": 2,
+                }
+            }
+        }
+
+        self.assertEqual(
+            resolve_cached_loader_config(config),
+            CachedLoaderConfig(
+                num_workers=0,
+                pin_memory=True,
+                persistent_workers=False,
+                prefetch_factor=None,
+            ),
+        )
+
+    def test_video_metadata_summary_counts_available_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            examples = [
+                build_example(
+                    root / "real-a.mp4",
+                    label=0,
+                    class_name="real",
+                    source_id="source-a",
+                    split="train",
+                    identity_id=None,
+                ),
+                build_example(
+                    root / "fake-dlc-a.mp4",
+                    source_id="fake-a",
+                    split="train",
+                    identity_id="dlc",
+                ),
+                VideoExample(
+                    path=root / "fake-liveavatar-a.mp4",
+                    label=1,
+                    class_name="fake",
+                    source_id="fake-b",
+                    split="val",
+                    identity_id="liveavatar",
+                    generator_id="liveavatar",
+                    source_id_kind="clip",
+                    age_bin="30-39",
+                    gender="female",
+                    ethnicity="asian",
+                    emotion="happy",
+                ),
+            ]
+
+            summary = video_metadata_summary(examples)
+
+            self.assertEqual(summary["summary"]["train"]["total"], 2)
+            self.assertEqual(summary["summary"]["val"]["fake"], 1)
+            self.assertEqual(summary["fake_generators"]["val"]["liveavatar"], 1)
+            self.assertEqual(summary["metadata"]["gender"]["val"]["female"], 1)
+            self.assertEqual(summary["metadata"]["age_bin"]["val"]["30-39"], 1)
+
+    def test_resolve_training_regularization_config_with_cli_overrides(self):
+        config = {
+            "training": {
+                "modality_dropout": {
+                    "default_probability": 0.05,
+                    "modality_probabilities": {"rgb": 0.1},
+                },
+                "gate_entropy_weight": 0.02,
+            }
+        }
+        args = Namespace(
+            modality_dropout=0.1,
+            depth_dropout=0.35,
+            gate_entropy_weight=0.01,
+        )
+
+        resolved = resolve_training_regularization_config(config, args)
+
+        self.assertEqual(
+            resolved,
+            TrainingRegularizationConfig(
+                modality_dropout=ModalityDropoutConfig(
+                    default_probability=0.1,
+                    modality_probabilities={"rgb": 0.1, "depth": 0.35},
+                ),
+                gate_entropy_weight=0.01,
+            ),
+        )
+
+    def test_sample_dropped_modalities_keeps_at_least_one_modality(self):
+        torch.manual_seed(0)
+        dropped = sample_dropped_modalities(
+            ("rgb", "depth"),
+            ModalityDropoutConfig(default_probability=0.99),
+        )
+
+        self.assertLess(len(dropped), 2)
+
+    def test_gate_entropy_regularization_penalizes_gate_collapse(self):
+        class Output:
+            def __init__(self) -> None:
+                self.diagnostics = {
+                    "modality_gate_weights": torch.tensor(
+                        [[0.5, 0.5], [1.0, 0.0]],
+                        requires_grad=True,
+                    ),
+                    "modality_valid_mask": torch.tensor([True, True]),
+                }
+
+        regularization = gate_entropy_regularization(Output(), weight=0.1)
+
+        self.assertIsNotNone(regularization)
+        assert regularization is not None
+        self.assertLess(float(regularization.item()), 0.0)
+
     def test_balanced_total_selection_forms_own_splits_from_cached_examples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -480,6 +693,47 @@ class FeatureCacheTest(unittest.TestCase):
         self.assertEqual(row["val_false_positive"], 2)
         self.assertEqual(row["val_false_negative"], 1)
         self.assertEqual(row["val_f1"], f"{metrics.f1:.8f}")
+
+    def test_summarize_diagnostic_rows_groups_modality_contributions(self):
+        rows = [
+            DiagnosticRow(
+                path="/tmp/fake/dlc/a.mp4",
+                class_name="fake",
+                label=1,
+                probability=0.2,
+                prediction=0,
+                split="test",
+                generator_id="dlc",
+                modality_name="rgb",
+                modality_gate_weight=0.6,
+                modality_expert_logit=-1.0,
+                modality_mixed_logit_contribution=-0.6,
+                token_attention_sum=0.4,
+            ),
+            DiagnosticRow(
+                path="/tmp/fake/dlc/a.mp4",
+                class_name="fake",
+                label=1,
+                probability=0.2,
+                prediction=0,
+                split="test",
+                generator_id="dlc",
+                modality_name="fau",
+                modality_gate_weight=0.4,
+                modality_expert_logit=-0.5,
+                modality_mixed_logit_contribution=-0.2,
+                token_attention_sum=0.6,
+            ),
+        ]
+
+        summary = summarize_diagnostic_rows(rows)
+
+        self.assertEqual(len(summary), 2)
+        self.assertEqual(summary[0]["modality_name"], "rgb")
+        self.assertEqual(summary[0]["correctness"], "incorrect")
+        self.assertEqual(summary[0]["generator_id"], "dlc")
+        self.assertAlmostEqual(summary[0]["mean_mixed_logit_contribution"], -0.6)
+        self.assertAlmostEqual(summary[0]["mean_token_attention_sum"], 0.4)
 
     def test_rebalance_eval_examples_removes_class_skew_after_cache_filtering(self):
         with tempfile.TemporaryDirectory() as tmpdir:

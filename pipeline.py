@@ -225,10 +225,26 @@ class ClipFusionPipeline(nn.Module):
             modality_batch["video_rgb_frames"] = frames_by_modality[modality_name]
         return modality_batch
 
-    def prepare_features(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+    def _enabled_modalities_for_batch(self, batch: Mapping[str, Any]) -> tuple[str, ...]:
+        dropped = batch.get("dropped_modalities")
+        if dropped is None:
+            return self.enabled_modalities
+        if not isinstance(dropped, (list, tuple, set, frozenset)):
+            raise TypeError("`dropped_modalities` must be a sequence of modality names.")
+        dropped_set = {str(name) for name in dropped}
+        enabled = tuple(name for name in self.enabled_modalities if name not in dropped_set)
+        if not enabled:
+            raise ValueError("Modality dropout removed every enabled modality.")
+        return enabled
+
+    def prepare_features(
+        self,
+        batch: Mapping[str, Any],
+        enabled_modalities: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         feature_batch: dict[str, Any] = {}
         feature_timings: dict[str, float] = {}
-        for name in self.enabled_modalities:
+        for name in enabled_modalities or self.enabled_modalities:
             if self._has_precomputed_features(batch, name):
                 self._copy_feature_keys(batch, feature_batch, name)
                 feature_timings[name] = 0.0
@@ -245,11 +261,14 @@ class ClipFusionPipeline(nn.Module):
         return feature_batch
 
     def fuse(self, batch: Mapping[str, Any]) -> FusionOutput:
-        feature_batch = self._move_feature_batch_to_device(self.prepare_features(batch))
+        enabled_modalities = self._enabled_modalities_for_batch(batch)
+        feature_batch = self._move_feature_batch_to_device(
+            self.prepare_features(batch, enabled_modalities=enabled_modalities)
+        )
         return fuse_selected_modalities(
             registry=self.registry,
             batch=dict(feature_batch),
-            enabled_modalities=self.enabled_modalities,
+            enabled_modalities=enabled_modalities,
             fusion_module=self.fusion_module,
         )
 

@@ -14,6 +14,7 @@ from task_models import (
     ModalityGatedMILBinaryHead,
     build_binary_head,
 )
+from task_models.heads import _masked_softmax
 
 
 def build_fusion_output(fused: torch.Tensor) -> FusionOutput:
@@ -150,6 +151,15 @@ class TaskModelTest(unittest.TestCase):
         self.assertTrue(
             torch.allclose(output.diagnostics["modality_gate_weights"][:, 1], torch.zeros(2))
         )
+
+    def test_masked_softmax_ignores_large_masked_scores(self):
+        weights = _masked_softmax(
+            scores=torch.tensor([[0.0, 1000.0]]),
+            mask=torch.tensor([True, False]),
+        )
+
+        self.assertTrue(torch.isfinite(weights).all())
+        self.assertTrue(torch.allclose(weights, torch.tensor([[1.0, 0.0]])))
 
     def test_binary_classifier_returns_probabilities_labels_and_paths(self):
         classifier = BinaryFusionClassifier(

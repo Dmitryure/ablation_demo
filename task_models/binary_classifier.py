@@ -36,7 +36,7 @@ class BinaryFusionClassifier(nn.Module):
             if isinstance(self.head, BinaryFusionHead)
             else self.head(fusion)
         )
-        head_result = _head_result(head_output)
+        head_result = _head_result(head_output, detach=not self.training)
         return BinaryClassificationOutput(
             logits=head_result.logits,
             probabilities=torch.sigmoid(head_result.logits),
@@ -63,11 +63,12 @@ def build_binary_fusion_classifier(
     )
 
 
-def _head_result(output: torch.Tensor | BinaryHeadResult) -> BinaryHeadResult:
+def _head_result(output: torch.Tensor | BinaryHeadResult, detach: bool) -> BinaryHeadResult:
     if isinstance(output, BinaryHeadResult):
+        diagnostics = detach_diagnostics(output.diagnostics) if detach else output.diagnostics
         return BinaryHeadResult(
             logits=output.logits,
-            diagnostics=detach_diagnostics(output.diagnostics),
+            diagnostics=diagnostics,
         )
     return BinaryHeadResult(logits=output)
 

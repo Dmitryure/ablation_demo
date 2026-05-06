@@ -13,7 +13,7 @@ from branches.compression import (
     validate_positive_int,
 )
 
-FRAME_QUERY_TOKENS = 2
+FRAME_QUERY_TOKENS = 4
 
 
 class FAUBranch(ModalityBranch):
