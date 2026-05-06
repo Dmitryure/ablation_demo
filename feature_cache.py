@@ -14,9 +14,8 @@ from torch.utils.data import Dataset
 from dataset import VideoExample
 from frame_config import resolve_modality_frame_count
 
-FEATURE_CACHE_VERSION = 1
+FEATURE_CACHE_VERSION = 2
 SPEC_IGNORED_MODALITY_KEYS = frozenset({"frames", "slot_count"})
-ITEM_METADATA_KEYS = frozenset({"label", "path", "source_id", "split", "class_name", "identity_id"})
 MODALITY_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
     "rgb": ("rgb_features",),
     "fau": ("fau_features", "fau_au_logits", "fau_au_edge_logits"),
@@ -24,6 +23,8 @@ MODALITY_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
     "eye_gaze": ("eye_gaze",),
     "face_mesh": ("face_mesh",),
     "depth": ("depth_features",),
+    "fft": ("fft_features",),
+    "stft": ("stft_features",),
 }
 
 
@@ -102,22 +103,22 @@ def _cache_key_path(example: VideoExample, dataset_root: str | Path | None) -> s
         return str(path)
 
 
-def example_cache_record(
+def video_cache_record(
     example: VideoExample,
     dataset_root: str | Path | None = None,
 ) -> dict[str, Any]:
     stat = example.path.stat()
     return {
-        "path": str(example.path.resolve()),
         "relative_path": _cache_key_path(example, dataset_root),
         "size": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
-        "label": int(example.label),
-        "class_name": example.class_name,
-        "source_id": example.source_id,
-        "split": example.split,
-        "identity_id": example.identity_id,
     }
+
+
+def feature_cache_spec_dir(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
+    return (
+        Path(cache_dir) / spec.modality / f"frames_{spec.frame_count}" / feature_cache_spec_id(spec)
+    )
 
 
 def feature_cache_item_path(
@@ -126,11 +127,27 @@ def feature_cache_item_path(
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None = None,
 ) -> Path:
-    spec_id = feature_cache_spec_id(spec)
     cache_key = _cache_key_path(example, dataset_root)
     digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:20]
     filename = f"{_safe_stem(example.path)}-{digest}.pt"
-    return Path(cache_dir) / spec_id / spec.modality / example.split / example.class_name / filename
+    return feature_cache_spec_dir(cache_dir, spec) / filename
+
+
+def feature_cache_metadata_path(cache_path: str | Path) -> Path:
+    return Path(cache_path).with_suffix(".json")
+
+
+def feature_cache_metadata(
+    example: VideoExample,
+    spec: FeatureCacheSpec,
+    dataset_root: str | Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": FEATURE_CACHE_VERSION,
+        "spec_id": feature_cache_spec_id(spec),
+        "spec": asdict(spec),
+        "video": video_cache_record(example, dataset_root=dataset_root),
+    }
 
 
 def _feature_tensors_for_modality(
@@ -157,15 +174,17 @@ def write_feature_cache_item(
 ) -> Path:
     cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata = feature_cache_metadata(example, spec, dataset_root=dataset_root)
     torch.save(
         {
-            "version": FEATURE_CACHE_VERSION,
-            "spec_id": feature_cache_spec_id(spec),
-            "spec": asdict(spec),
-            "example": example_cache_record(example, dataset_root=dataset_root),
+            **metadata,
             "features": _feature_tensors_for_modality(item, spec.modality),
         },
         cache_path,
+    )
+    feature_cache_metadata_path(cache_path).write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     return cache_path
 
@@ -180,16 +199,14 @@ def _payload_matches_example(
         return False
     if payload.get("spec_id") != feature_cache_spec_id(spec):
         return False
-    stored = payload.get("example")
+    stored = payload.get("video")
     if not isinstance(stored, Mapping):
         return False
-    current = example_cache_record(example, dataset_root=dataset_root)
+    current = video_cache_record(example, dataset_root=dataset_root)
     return (
         stored.get("relative_path") == current["relative_path"]
         and stored.get("size") == current["size"]
         and stored.get("mtime_ns") == current["mtime_ns"]
-        and stored.get("label") == current["label"]
-        and stored.get("class_name") == current["class_name"]
     )
 
 
@@ -217,12 +234,29 @@ def load_feature_cache_item(
     return result
 
 
+def _load_feature_cache_metadata(cache_path: Path) -> Mapping[str, Any] | None:
+    metadata_path = feature_cache_metadata_path(cache_path)
+    if not metadata_path.exists():
+        return None
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
 def feature_cache_item_exists(
     cache_dir: str | Path,
     example: VideoExample,
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None = None,
 ) -> bool:
+    cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
+    if not cache_path.exists():
+        return False
+    metadata = _load_feature_cache_metadata(cache_path)
+    if metadata is not None:
+        return _payload_matches_example(metadata, example, spec, dataset_root)
     return load_feature_cache_item(cache_dir, example, spec, dataset_root=dataset_root) is not None
 
 
@@ -242,6 +276,9 @@ def split_feature_batch(
             "class_name": raw_batch["class_name"][index],
             "identity_id": raw_batch["identity_id"][index],
         }
+        for key in ("generator_id", "source_id_kind", "age_bin", "gender", "ethnicity", "emotion"):
+            if key in raw_batch:
+                item[key] = raw_batch[key][index]
         for key, value in feature_batch.items():
             if isinstance(value, torch.Tensor):
                 item[key] = value[index].detach().cpu()
@@ -278,6 +315,12 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "split": example.split,
             "class_name": example.class_name,
             "identity_id": example.identity_id,
+            "generator_id": example.generator_id,
+            "source_id_kind": example.source_id_kind,
+            "age_bin": example.age_bin,
+            "gender": example.gender,
+            "ethnicity": example.ethnicity,
+            "emotion": example.emotion,
         }
         missing: list[str] = []
         for modality in self.modalities:

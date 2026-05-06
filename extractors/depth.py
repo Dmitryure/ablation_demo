@@ -82,7 +82,11 @@ class DepthExtractor(FeatureExtractor):
                 "All clips in `video_rgb_frames` batch must have the same frame count."
             )
 
-        processed = self.processor(images=flat_frames, return_tensors="pt")
+        processed = self.processor(
+            images=flat_frames,
+            return_tensors="pt",
+            keep_aspect_ratio=False,
+        )
         pixel_values = processed["pixel_values"]
         if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 4:
             raise ValueError(

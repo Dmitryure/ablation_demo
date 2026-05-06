@@ -26,3 +26,6 @@ tests/predict_videos/
 tests/overfit_runs/
 overfit_videos.zip
 predict_videos.zip
+cached_feature_probes/
+feature_cache_runs/
+logs

@@ -39,9 +39,7 @@ def _frame_to_regional_signals(frame_rgb: np.ndarray, grid_size: int) -> np.ndar
     frame_float = frame_float[:trimmed_h, :trimmed_w, :]
 
     luminance = (
-        0.299 * frame_float[..., 0]
-        + 0.587 * frame_float[..., 1]
-        + 0.114 * frame_float[..., 2]
+        0.299 * frame_float[..., 0] + 0.587 * frame_float[..., 1] + 0.114 * frame_float[..., 2]
     )
     chrominance = frame_float[..., 0] - frame_float[..., 2]  # R - B
 
@@ -54,7 +52,6 @@ def _frame_to_regional_signals(frame_rgb: np.ndarray, grid_size: int) -> np.ndar
 
 
 class STFTExtractor(FeatureExtractor):
-
     name = "stft"
 
     def __init__(
@@ -104,7 +101,7 @@ class STFTExtractor(FeatureExtractor):
             center=True,
             return_complex=True,
         )
-        magnitude = torch.log1p(spectrum.abs()) 
+        magnitude = torch.log1p(spectrum.abs())
         magnitude = magnitude.permute(2, 0, 1).reshape(magnitude.shape[2], -1)
         return magnitude.contiguous()
 

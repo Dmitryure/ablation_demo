@@ -9,12 +9,13 @@ import sys
 import time
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,6 +26,7 @@ from dataset import (
     VideoExample,
     build_real_fake_examples,
     collate_labeled_video_batch,
+    format_split_audit,
     summarize_examples,
     write_dataset_manifest,
 )
@@ -34,6 +36,7 @@ from feature_cache import (
     build_feature_cache_specs,
     collate_cached_feature_batch,
     feature_cache_item_exists,
+    feature_cache_spec_dir,
     feature_cache_spec_id,
     split_feature_batch,
     write_feature_cache_item,
@@ -48,6 +51,16 @@ FAST_LADDER = (200, 500, 1000, 2000, 4000)
 TINY_LADDER = (40, 100, 200, 500)
 LARGE_LADDER = (1000, 2500, 5000)
 HEAD_TYPES = ("cls_linear", "cls_mlp", "attention_mil", "modality_gated_mil")
+CHECKPOINT_METRICS = (
+    "val_accuracy",
+    "val_balanced_accuracy",
+    "val_f1",
+    "val_loss",
+    "train_accuracy",
+    "train_balanced_accuracy",
+    "train_f1",
+    "train_loss",
+)
 
 
 @dataclass(frozen=True)
@@ -61,10 +74,37 @@ class PredictionRow:
 
 
 @dataclass(frozen=True)
+class BinaryMetrics:
+    accuracy: float = 0.0
+    balanced_accuracy: float = 0.0
+    precision: float = 0.0
+    recall: float = 0.0
+    f1: float = 0.0
+    specificity: float = 0.0
+    negative_predictive_value: float = 0.0
+    false_positive_rate: float = 0.0
+    false_negative_rate: float = 0.0
+    matthews_corrcoef: float = 0.0
+    true_positive: int = 0
+    true_negative: int = 0
+    false_positive: int = 0
+    false_negative: int = 0
+
+
+@dataclass(frozen=True)
 class EpochTrainResult:
     loss: float
     accuracy: float
     elapsed_seconds: float
+    metrics: BinaryMetrics = field(default_factory=BinaryMetrics)
+
+
+@dataclass(frozen=True)
+class EpochEvalResult:
+    loss: float
+    accuracy: float
+    elapsed_seconds: float
+    metrics: BinaryMetrics = field(default_factory=BinaryMetrics)
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +134,15 @@ def parse_args() -> argparse.Namespace:
         help="Explicit train video counts. Overrides --round-ladder and does not append full train set.",
     )
     parser.add_argument("--eval-count-per-split", type=int, default=500)
+    parser.add_argument(
+        "--balanced-total",
+        type=int,
+        default=None,
+        help=(
+            "Select this many videos across the whole dataset with equal real/fake counts, "
+            "then derive train/val/test splits from that selected set."
+        ),
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -101,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument(
         "--modality-lr",
         nargs="*",
@@ -111,8 +161,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-type", choices=HEAD_TYPES, default=None)
     parser.add_argument("--head-hidden-dim", type=int, default=None)
     parser.add_argument("--head-dropout", type=float, default=None)
+    parser.add_argument(
+        "--checkpoint-metric",
+        choices=CHECKPOINT_METRICS,
+        default="val_accuracy",
+        help="Metric used for best.pt and early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop after this many epochs without checkpoint-metric improvement. 0 disables.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum checkpoint-metric improvement required to reset early stopping.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite-cache", action="store_true")
+    parser.add_argument(
+        "--prefer-cached-selection",
+        action="store_true",
+        help=(
+            "Prefer examples with existing valid cached features when selecting train/val/test "
+            "examples. Class balance and split boundaries are still preserved."
+        ),
+    )
+    parser.add_argument(
+        "--warm-start-rounds",
+        action="store_true",
+        help="Initialize each train-count round from the previous round checkpoint for the same modality set.",
+    )
     parser.add_argument("--skip-failures", action="store_true")
     parser.add_argument("--sanity-count", type=int, default=300)
     parser.add_argument("--no-sanity-check", action="store_true")
@@ -176,21 +257,69 @@ def class_counts(examples: Sequence[VideoExample]) -> dict[str, int]:
     return counts
 
 
-def _shuffled(items: Sequence[VideoExample], seed: int) -> list[VideoExample]:
+def _random_rank_by_path(items: Sequence[VideoExample], seed: int) -> dict[str, float]:
+    rng = random.Random(seed)
+    return {str(example.path): rng.random() for example in items}
+
+
+def _random_rank_by_value(items: Sequence[str], seed: int) -> dict[str, float]:
+    rng = random.Random(seed)
+    return {item: rng.random() for item in items}
+
+
+def _shuffled(
+    items: Sequence[VideoExample],
+    seed: int,
+    cache_score_by_path: Mapping[str, int] | None = None,
+) -> list[VideoExample]:
     result = list(items)
-    random.Random(seed).shuffle(result)
+    if cache_score_by_path is None:
+        random.Random(seed).shuffle(result)
+        return result
+    ranks = _random_rank_by_path(result, seed)
+    result.sort(
+        key=lambda example: (
+            -cache_score_by_path.get(str(example.path), 0),
+            ranks[str(example.path)],
+        )
+    )
     return result
 
 
-def _balanced_fake_order(fake_examples: Sequence[VideoExample], seed: int) -> list[VideoExample]:
+def _balanced_fake_order(
+    fake_examples: Sequence[VideoExample],
+    seed: int,
+    cache_score_by_path: Mapping[str, int] | None = None,
+) -> list[VideoExample]:
     by_identity: dict[str, list[VideoExample]] = defaultdict(list)
     for example in fake_examples:
         by_identity[example.identity_id or "unknown"].append(example)
-    rng = random.Random(seed)
-    for examples in by_identity.values():
-        rng.shuffle(examples)
+    identity_seed_offsets = {identity: index for index, identity in enumerate(sorted(by_identity))}
+    for identity, examples in by_identity.items():
+        by_identity[identity] = _shuffled(
+            examples,
+            seed + identity_seed_offsets[identity] + 1,
+            cache_score_by_path=cache_score_by_path,
+        )
     identities = sorted(by_identity)
-    rng.shuffle(identities)
+    if cache_score_by_path is None:
+        random.Random(seed).shuffle(identities)
+    else:
+        ranks = _random_rank_by_value(identities, seed)
+        ordered: list[VideoExample] = []
+        active = list(identities)
+        while active:
+            active.sort(
+                key=lambda identity: (
+                    -cache_score_by_path.get(str(by_identity[identity][0].path), 0),
+                    ranks[identity],
+                )
+            )
+            identity = active[0]
+            ordered.append(by_identity[identity].pop(0))
+            if not by_identity[identity]:
+                active.pop(0)
+        return ordered
 
     ordered: list[VideoExample] = []
     while identities:
@@ -198,7 +327,7 @@ def _balanced_fake_order(fake_examples: Sequence[VideoExample], seed: int) -> li
         for identity in identities:
             examples = by_identity[identity]
             if examples:
-                ordered.append(examples.pop())
+                ordered.append(examples.pop(0))
             if examples:
                 next_identities.append(identity)
         identities = next_identities
@@ -208,11 +337,17 @@ def _balanced_fake_order(fake_examples: Sequence[VideoExample], seed: int) -> li
 def build_balanced_train_order(
     examples: Sequence[VideoExample],
     seed: int,
+    cache_score_by_path: Mapping[str, int] | None = None,
 ) -> list[VideoExample]:
-    real = _shuffled([example for example in examples if example.class_name == "real"], seed)
+    real = _shuffled(
+        [example for example in examples if example.class_name == "real"],
+        seed,
+        cache_score_by_path=cache_score_by_path,
+    )
     fake = _balanced_fake_order(
         [example for example in examples if example.class_name == "fake"],
         seed + 1,
+        cache_score_by_path=cache_score_by_path,
     )
     ordered: list[VideoExample] = []
     real_index = 0
@@ -231,11 +366,17 @@ def select_balanced_subset(
     examples: Sequence[VideoExample],
     target_count: int,
     seed: int,
+    cache_score_by_path: Mapping[str, int] | None = None,
 ) -> list[VideoExample]:
-    real = _shuffled([example for example in examples if example.class_name == "real"], seed)
+    real = _shuffled(
+        [example for example in examples if example.class_name == "real"],
+        seed,
+        cache_score_by_path=cache_score_by_path,
+    )
     fake = _balanced_fake_order(
         [example for example in examples if example.class_name == "fake"],
         seed + 1,
+        cache_score_by_path=cache_score_by_path,
     )
     per_class = min(target_count // 2, len(real), len(fake))
     selected: list[VideoExample] = []
@@ -245,21 +386,109 @@ def select_balanced_subset(
     return selected
 
 
+def _with_split(example: VideoExample, split: str) -> VideoExample:
+    return VideoExample(
+        path=example.path,
+        label=example.label,
+        class_name=example.class_name,
+        source_id=example.source_id,
+        split=split,
+        identity_id=example.identity_id,
+        generator_id=example.generator_id,
+        source_id_kind=example.source_id_kind,
+        age_bin=example.age_bin,
+        gender=example.gender,
+        ethnicity=example.ethnicity,
+        emotion=example.emotion,
+    )
+
+
+def _split_class_examples(
+    examples: Sequence[VideoExample],
+    train_count: int,
+    val_count: int,
+) -> tuple[list[VideoExample], list[VideoExample], list[VideoExample]]:
+    train = [_with_split(example, "train") for example in examples[:train_count]]
+    val = [
+        _with_split(example, "val") for example in examples[train_count : train_count + val_count]
+    ]
+    test = [_with_split(example, "test") for example in examples[train_count + val_count :]]
+    return train, val, test
+
+
+def split_balanced_total_examples(
+    examples: Sequence[VideoExample],
+    balanced_total: int,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+    cache_score_by_path: Mapping[str, int] | None = None,
+) -> tuple[list[VideoExample], list[VideoExample], list[VideoExample]]:
+    if balanced_total <= 0:
+        raise ValueError("`--balanced-total` must be positive.")
+    if balanced_total % 2 != 0:
+        raise ValueError("`--balanced-total` must be even for equal real/fake selection.")
+    if train_ratio <= 0.0 or train_ratio >= 1.0:
+        raise ValueError("`--train-ratio` must be in (0.0, 1.0).")
+    if val_ratio <= 0.0 or train_ratio + val_ratio >= 1.0:
+        raise ValueError("`--val-ratio` must be in (0.0, 1.0) and leave room for test.")
+
+    per_class = balanced_total // 2
+    real = _shuffled(
+        [example for example in examples if example.class_name == "real"],
+        seed,
+        cache_score_by_path=cache_score_by_path,
+    )
+    fake = _balanced_fake_order(
+        [example for example in examples if example.class_name == "fake"],
+        seed + 1,
+        cache_score_by_path=cache_score_by_path,
+    )
+    if len(real) < per_class or len(fake) < per_class:
+        max_total = 2 * min(len(real), len(fake))
+        raise ValueError(
+            f"`--balanced-total {balanced_total}` exceeds available balanced total "
+            f"{max_total} (real={len(real)}, fake={len(fake)})."
+        )
+
+    real = real[:per_class]
+    fake = fake[:per_class]
+    train_per_class = int(per_class * train_ratio)
+    val_per_class = int(per_class * val_ratio)
+    if train_per_class <= 0 or val_per_class <= 0:
+        raise ValueError("`--balanced-total` is too small for non-empty train/val splits.")
+
+    real_train, real_val, real_test = _split_class_examples(real, train_per_class, val_per_class)
+    fake_train, fake_val, fake_test = _split_class_examples(fake, train_per_class, val_per_class)
+    return (
+        build_balanced_train_order([*real_train, *fake_train], seed + 11),
+        select_balanced_subset([*real_val, *fake_val], len(real_val) + len(fake_val), seed + 23),
+        select_balanced_subset(
+            [*real_test, *fake_test],
+            len(real_test) + len(fake_test),
+            seed + 29,
+        ),
+    )
+
+
 def split_examples(
     examples: Sequence[VideoExample],
     eval_count_per_split: int,
     seed: int,
+    cache_score_by_path: Mapping[str, int] | None = None,
 ) -> tuple[list[VideoExample], list[VideoExample], list[VideoExample]]:
     train = [example for example in examples if example.split == "train"]
     val = select_balanced_subset(
         [example for example in examples if example.split == "val"],
         eval_count_per_split,
         seed + 11,
+        cache_score_by_path=cache_score_by_path,
     )
     test = select_balanced_subset(
         [example for example in examples if example.split == "test"],
         eval_count_per_split,
         seed + 23,
+        cache_score_by_path=cache_score_by_path,
     )
     return train, val, test
 
@@ -307,6 +536,20 @@ def freeze_encoder_modules(model: BinaryFusionClassifier) -> None:
         parameter.requires_grad_(False)
 
 
+def resolve_warm_start_checkpoint(
+    previous_summary: Mapping[str, Any] | None,
+    enabled: bool,
+) -> Path | None:
+    if not enabled:
+        return None
+    if previous_summary is None:
+        return None
+    checkpoint = previous_summary.get("best_checkpoint")
+    if checkpoint is None:
+        raise ValueError("Previous round summary is missing `best_checkpoint`.")
+    return Path(str(checkpoint))
+
+
 def build_head_config(config: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any] | None:
     raw_config = config.get("head")
     if raw_config is None:
@@ -346,7 +589,10 @@ def build_optimizer(
     model: BinaryFusionClassifier,
     base_lr: float,
     modality_lrs: Mapping[str, float],
+    weight_decay: float,
 ) -> torch.optim.Optimizer:
+    if weight_decay < 0.0:
+        raise ValueError("`--weight-decay` must be non-negative.")
     grouped_parameter_ids: set[int] = set()
     parameter_groups: list[dict[str, Any]] = []
     for modality, lr in sorted(modality_lrs.items()):
@@ -369,12 +615,109 @@ def build_optimizer(
     ]
     if remaining_parameters:
         parameter_groups.insert(0, {"params": remaining_parameters, "lr": base_lr})
-    return torch.optim.AdamW(parameter_groups)
+    return torch.optim.AdamW(parameter_groups, weight_decay=weight_decay)
 
 
 def binary_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     predictions = (torch.sigmoid(logits) >= 0.5).to(dtype=torch.float32)
     return float((predictions == labels).to(dtype=torch.float32).mean().item())
+
+
+def safe_divide(numerator: float, denominator: float) -> float:
+    if denominator == 0.0:
+        return 0.0
+    return numerator / denominator
+
+
+def matthews_corrcoef(tp: int, tn: int, fp: int, fn: int) -> float:
+    denominator = float((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) ** 0.5
+    return safe_divide(float(tp * tn - fp * fn), denominator)
+
+
+def binary_metrics_from_counts(tp: int, tn: int, fp: int, fn: int) -> BinaryMetrics:
+    total = tp + tn + fp + fn
+    precision = safe_divide(float(tp), float(tp + fp))
+    recall = safe_divide(float(tp), float(tp + fn))
+    specificity = safe_divide(float(tn), float(tn + fp))
+    negative_predictive_value = safe_divide(float(tn), float(tn + fn))
+    false_positive_rate = safe_divide(float(fp), float(fp + tn))
+    false_negative_rate = safe_divide(float(fn), float(fn + tp))
+    f1 = safe_divide(2.0 * precision * recall, precision + recall)
+    return BinaryMetrics(
+        accuracy=safe_divide(float(tp + tn), float(total)),
+        balanced_accuracy=(specificity + recall) / 2.0,
+        precision=precision,
+        recall=recall,
+        f1=f1,
+        specificity=specificity,
+        negative_predictive_value=negative_predictive_value,
+        false_positive_rate=false_positive_rate,
+        false_negative_rate=false_negative_rate,
+        matthews_corrcoef=matthews_corrcoef(tp, tn, fp, fn),
+        true_positive=tp,
+        true_negative=tn,
+        false_positive=fp,
+        false_negative=fn,
+    )
+
+
+def binary_confusion_from_predictions(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[int, int, int, int]:
+    labels_int = labels.view(-1).to(dtype=torch.long)
+    predictions_int = predictions.view(-1).to(dtype=torch.long)
+    fake_mask = labels_int == 1
+    real_mask = labels_int == 0
+    true_positive = int(((predictions_int == 1) & fake_mask).sum().item())
+    true_negative = int(((predictions_int == 0) & real_mask).sum().item())
+    false_positive = int(((predictions_int == 1) & real_mask).sum().item())
+    false_negative = int(((predictions_int == 0) & fake_mask).sum().item())
+    return true_positive, true_negative, false_positive, false_negative
+
+
+def binary_confusion_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> tuple[int, int, int, int]:
+    predictions = (torch.sigmoid(logits.detach()) >= 0.5).to(dtype=torch.long)
+    return binary_confusion_from_predictions(predictions, labels)
+
+
+def metrics_row_fields(prefix: str) -> tuple[str, ...]:
+    return (
+        f"{prefix}_balanced_accuracy",
+        f"{prefix}_precision",
+        f"{prefix}_recall",
+        f"{prefix}_f1",
+        f"{prefix}_specificity",
+        f"{prefix}_negative_predictive_value",
+        f"{prefix}_false_positive_rate",
+        f"{prefix}_false_negative_rate",
+        f"{prefix}_matthews_corrcoef",
+        f"{prefix}_true_positive",
+        f"{prefix}_true_negative",
+        f"{prefix}_false_positive",
+        f"{prefix}_false_negative",
+    )
+
+
+def metrics_row_values(prefix: str, metrics: BinaryMetrics) -> dict[str, Any]:
+    return {
+        f"{prefix}_balanced_accuracy": f"{metrics.balanced_accuracy:.8f}",
+        f"{prefix}_precision": f"{metrics.precision:.8f}",
+        f"{prefix}_recall": f"{metrics.recall:.8f}",
+        f"{prefix}_f1": f"{metrics.f1:.8f}",
+        f"{prefix}_specificity": f"{metrics.specificity:.8f}",
+        f"{prefix}_negative_predictive_value": f"{metrics.negative_predictive_value:.8f}",
+        f"{prefix}_false_positive_rate": f"{metrics.false_positive_rate:.8f}",
+        f"{prefix}_false_negative_rate": f"{metrics.false_negative_rate:.8f}",
+        f"{prefix}_matthews_corrcoef": f"{metrics.matthews_corrcoef:.8f}",
+        f"{prefix}_true_positive": metrics.true_positive,
+        f"{prefix}_true_negative": metrics.true_negative,
+        f"{prefix}_false_positive": metrics.false_positive,
+        f"{prefix}_false_negative": metrics.false_negative,
+    }
 
 
 def train_one_epoch(
@@ -386,8 +729,11 @@ def train_one_epoch(
     device = model_device(model)
     model.train()
     total_loss = 0.0
-    total_correct = 0.0
     total_count = 0
+    true_positive = 0
+    true_negative = 0
+    false_positive = 0
+    false_negative = 0
     start = time.perf_counter()
     for batch in loader:
         labels = batch["label"].to(device)
@@ -397,15 +743,103 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
         count = int(labels.numel())
+        tp, tn, fp, fn = binary_confusion_from_logits(output.logits, labels)
         total_loss += float(loss.item()) * count
-        total_correct += binary_accuracy(output.logits.detach(), labels) * count
         total_count += count
+        true_positive += tp
+        true_negative += tn
+        false_positive += fp
+        false_negative += fn
     elapsed = time.perf_counter() - start
+    metrics = binary_metrics_from_counts(
+        true_positive, true_negative, false_positive, false_negative
+    )
     return EpochTrainResult(
         loss=total_loss / total_count,
-        accuracy=total_correct / total_count,
+        accuracy=metrics.accuracy,
         elapsed_seconds=elapsed,
+        metrics=metrics,
     )
+
+
+def evaluate_loss_accuracy(
+    model: BinaryFusionClassifier,
+    loader: DataLoader[dict[str, Any]],
+    loss_fn: torch.nn.Module,
+) -> EpochEvalResult:
+    device = model_device(model)
+    model.eval()
+    total_loss = 0.0
+    total_count = 0
+    true_positive = 0
+    true_negative = 0
+    false_positive = 0
+    false_negative = 0
+    start = time.perf_counter()
+    with torch.no_grad():
+        for batch in loader:
+            labels = batch["label"].to(device)
+            output = model(move_tensor_batch_to_device(batch, device))
+            loss = loss_fn(output.logits, labels)
+            count = int(labels.numel())
+            tp, tn, fp, fn = binary_confusion_from_logits(output.logits, labels)
+            total_loss += float(loss.item()) * count
+            total_count += count
+            true_positive += tp
+            true_negative += tn
+            false_positive += fp
+            false_negative += fn
+    elapsed = time.perf_counter() - start
+    metrics = binary_metrics_from_counts(
+        true_positive, true_negative, false_positive, false_negative
+    )
+    return EpochEvalResult(
+        loss=total_loss / total_count,
+        accuracy=metrics.accuracy,
+        elapsed_seconds=elapsed,
+        metrics=metrics,
+    )
+
+
+def metric_is_loss(metric_name: str) -> bool:
+    return metric_name.endswith("_loss")
+
+
+def checkpoint_metric_value(
+    metric_name: str,
+    train_result: EpochTrainResult,
+    val_result: EpochEvalResult,
+) -> float:
+    if metric_name == "train_accuracy":
+        return train_result.accuracy
+    if metric_name == "train_balanced_accuracy":
+        return train_result.metrics.balanced_accuracy
+    if metric_name == "train_f1":
+        return train_result.metrics.f1
+    if metric_name == "train_loss":
+        return train_result.loss
+    if metric_name == "val_accuracy":
+        return val_result.accuracy
+    if metric_name == "val_balanced_accuracy":
+        return val_result.metrics.balanced_accuracy
+    if metric_name == "val_f1":
+        return val_result.metrics.f1
+    if metric_name == "val_loss":
+        return val_result.loss
+    raise ValueError(f"Unsupported checkpoint metric: {metric_name}")
+
+
+def is_metric_improvement(
+    metric_name: str,
+    value: float,
+    best_value: float | None,
+    min_delta: float,
+) -> bool:
+    if best_value is None:
+        return True
+    if metric_is_loss(metric_name):
+        return value < best_value - min_delta
+    return value > best_value + min_delta
 
 
 def predict_rows(
@@ -437,6 +871,13 @@ def predict_rows(
                     )
                 )
     return correct / total, rows
+
+
+def prediction_rows_metrics(rows: Sequence[PredictionRow]) -> BinaryMetrics:
+    labels = torch.tensor([row.label for row in rows], dtype=torch.long)
+    predictions = torch.tensor([row.prediction for row in rows], dtype=torch.long)
+    tp, tn, fp, fn = binary_confusion_from_predictions(predictions, labels)
+    return binary_metrics_from_counts(tp, tn, fp, fn)
 
 
 def build_cached_loader(
@@ -491,6 +932,62 @@ def append_failure_rows(cache_dir: Path, rows: Sequence[Mapping[str, Any]]) -> N
             writer.writerow(row)
 
 
+def build_scan_progress(
+    examples: Sequence[VideoExample], spec: FeatureCacheSpec, enabled: bool, label: str
+):
+    if not enabled:
+        return None
+    return tqdm(
+        total=len(examples),
+        desc=f"scan {label}/{spec.modality}" if label else f"scan {spec.modality}",
+        unit="video",
+        dynamic_ncols=True,
+        leave=False,
+    )
+
+
+def update_scan_progress(
+    progress,
+    index: int,
+    total: int,
+    missing_count: int,
+    progress_interval: int,
+    label: str,
+    modality: str,
+) -> None:
+    if progress is not None:
+        progress.update(1)
+        return
+    if index == total or index % progress_interval == 0:
+        print(
+            f"scan {label}: modality={modality} checked={index}/{total} missing={missing_count}",
+            flush=True,
+        )
+
+
+def is_missing_cache_example(
+    example: VideoExample,
+    cache_dir: Path,
+    spec: FeatureCacheSpec,
+    dataset_root: Path,
+    overwrite: bool,
+    root_exists: bool,
+    skip_failure_keys: set[tuple[str, str, str]],
+    spec_id: str,
+) -> bool:
+    failure_key = (spec_id, spec.modality, str(example.path))
+    if failure_key in skip_failure_keys:
+        return False
+    if not overwrite and not root_exists:
+        return True
+    return overwrite or not feature_cache_item_exists(
+        cache_dir,
+        example,
+        spec,
+        dataset_root=dataset_root,
+    )
+
+
 def missing_examples_for_modality(
     examples: Sequence[VideoExample],
     cache_dir: Path,
@@ -498,28 +995,42 @@ def missing_examples_for_modality(
     dataset_root: Path,
     overwrite: bool,
     skip_failure_keys: set[tuple[str, str, str]],
+    progress_bar: bool = False,
+    label: str = "",
+    progress_every: int = 100,
 ) -> list[VideoExample]:
     spec_id = feature_cache_spec_id(spec)
-    modality_cache_root = cache_dir / spec_id / spec.modality
-    if not overwrite and not modality_cache_root.exists():
-        return [
-            example
-            for example in examples
-            if (spec_id, spec.modality, str(example.path)) not in skip_failure_keys
-        ]
+    modality_cache_root = feature_cache_spec_dir(cache_dir, spec)
+    root_exists = modality_cache_root.exists()
+    progress = build_scan_progress(examples, spec, progress_bar, label)
+    progress_interval = max(1, progress_every)
     missing: list[VideoExample] = []
-    for example in examples:
-        failure_key = (spec_id, spec.modality, str(example.path))
-        if failure_key in skip_failure_keys:
-            continue
-        if overwrite or not feature_cache_item_exists(
-            cache_dir,
-            example,
-            spec,
-            dataset_root=dataset_root,
-        ):
-            missing.append(example)
-    return missing
+    try:
+        for index, example in enumerate(examples, start=1):
+            if is_missing_cache_example(
+                example=example,
+                cache_dir=cache_dir,
+                spec=spec,
+                dataset_root=dataset_root,
+                overwrite=overwrite,
+                root_exists=root_exists,
+                skip_failure_keys=skip_failure_keys,
+                spec_id=spec_id,
+            ):
+                missing.append(example)
+            update_scan_progress(
+                progress=progress,
+                index=index,
+                total=len(examples),
+                missing_count=len(missing),
+                progress_interval=progress_interval,
+                label=label,
+                modality=spec.modality,
+            )
+        return missing
+    finally:
+        if progress is not None:
+            progress.close()
 
 
 def count_missing_cache(
@@ -532,7 +1043,7 @@ def count_missing_cache(
     missing: dict[str, int] = {}
     for modality in modalities:
         spec = specs[modality]
-        modality_cache_root = cache_dir / feature_cache_spec_id(spec) / spec.modality
+        modality_cache_root = feature_cache_spec_dir(cache_dir, spec)
         if not modality_cache_root.exists():
             missing[modality] = len(examples)
             continue
@@ -559,6 +1070,66 @@ def count_cached_and_skipped(
         elif (spec_id, spec.modality, str(example.path)) in skip_failure_keys:
             skipped_failed += 1
     return cached, skipped_failed
+
+
+def cache_score_for_example(
+    example: VideoExample,
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+    dataset_root: Path,
+) -> int:
+    return sum(
+        int(feature_cache_item_exists(cache_dir, example, specs[modality], dataset_root))
+        for modality in modalities
+    )
+
+
+def build_cache_score_by_path(
+    examples: Sequence[VideoExample],
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+    dataset_root: Path,
+) -> dict[str, int]:
+    return {
+        str(example.path): cache_score_for_example(
+            example=example,
+            cache_dir=cache_dir,
+            specs=specs,
+            modalities=modalities,
+            dataset_root=dataset_root,
+        )
+        for example in examples
+    }
+
+
+def cache_score_summary(
+    examples: Sequence[VideoExample],
+    cache_score_by_path: Mapping[str, int],
+    modality_count: int,
+) -> dict[str, int]:
+    full = 0
+    partial = 0
+    empty = 0
+    total_cached_modalities = 0
+    for example in examples:
+        score = cache_score_by_path.get(str(example.path), 0)
+        total_cached_modalities += score
+        if score >= modality_count:
+            full += 1
+        elif score > 0:
+            partial += 1
+        else:
+            empty += 1
+    return {
+        "examples": len(examples),
+        "full": full,
+        "partial": partial,
+        "empty": empty,
+        "cached_modalities": total_cached_modalities,
+        "possible_modalities": len(examples) * modality_count,
+    }
 
 
 def missing_modalities_for_example(
@@ -623,29 +1194,186 @@ def filter_examples_with_cache(
     return kept
 
 
-def ensure_feature_cache(
+def rebalance_eval_examples(
+    examples: Sequence[VideoExample],
+    target_count: int,
+    seed: int,
+    label: str,
+) -> list[VideoExample]:
+    balanced = select_balanced_subset(examples, target_count=target_count, seed=seed)
+    if len(balanced) != len(examples):
+        print(
+            f"eval rebalance {label}: input={len(examples)} output={len(balanced)} "
+            f"counts={class_counts(balanced)}",
+            flush=True,
+        )
+    return balanced
+
+
+def chunk_examples(
+    examples: Sequence[VideoExample],
+    chunk_size: int,
+) -> list[list[VideoExample]]:
+    size = max(1, chunk_size)
+    return [list(examples[index : index + size]) for index in range(0, len(examples), size)]
+
+
+def group_modalities_by_clip_spec(
+    modalities: Sequence[str],
+    specs: Mapping[str, FeatureCacheSpec],
+) -> dict[tuple[int, int], tuple[str, ...]]:
+    grouped: dict[tuple[int, int], list[str]] = defaultdict(list)
+    for modality in modalities:
+        spec = specs[modality]
+        grouped[(spec.frame_count, spec.image_size)].append(modality)
+    return {key: tuple(value) for key, value in grouped.items()}
+
+
+def extraction_modality_groups(
+    modalities: Sequence[str],
+    specs: Mapping[str, FeatureCacheSpec],
+    group_by_modality: bool = False,
+) -> list[tuple[int, int, tuple[str, ...]]]:
+    if group_by_modality:
+        return [
+            (specs[modality].frame_count, specs[modality].image_size, (modality,))
+            for modality in modalities
+        ]
+    return [
+        (frame_count, image_size, group_modalities)
+        for (frame_count, image_size), group_modalities in group_modalities_by_clip_spec(
+            modalities, specs
+        ).items()
+    ]
+
+
+def examples_missing_any_modality(
+    examples: Sequence[VideoExample],
+    modalities: Sequence[str],
+    missing_by_modality: Mapping[str, Sequence[VideoExample]],
+) -> list[VideoExample]:
+    missing_sets = {modality: set(missing_by_modality.get(modality, ())) for modality in modalities}
+    return [
+        example
+        for example in examples
+        if any(example in missing_sets[modality] for modality in modalities)
+    ]
+
+
+def build_raw_feature_batch(
+    examples: Sequence[VideoExample],
+    modalities: Sequence[str],
+    frame_count: int,
+    image_size: int,
+) -> dict[str, Any]:
+    dataset = LabeledVideoDataset(
+        examples=examples,
+        num_frames=dict.fromkeys(modalities, frame_count),
+        image_size=image_size,
+    )
+    return collate_labeled_video_batch([dataset[index] for index in range(len(dataset))])
+
+
+def append_cache_failure(
+    failure_rows: list[dict[str, Any]],
+    progress: dict[str, Any],
+    spec: FeatureCacheSpec,
+    example: VideoExample,
+    exc: Exception,
+) -> None:
+    failure_rows.append(
+        {
+            "spec_id": feature_cache_spec_id(spec),
+            "modality": spec.modality,
+            "path": str(example.path),
+            "error": str(exc),
+        }
+    )
+    progress[spec.modality]["failed"] += 1
+
+
+def write_cached_feature_items(
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+    examples: Sequence[VideoExample],
+    feature_batch: Mapping[str, Any],
+    raw_batch: Mapping[str, Any],
+    missing_sets: Mapping[str, set[VideoExample]],
+    dataset_root: Path,
+    progress: dict[str, Any],
+) -> None:
+    for example, item in zip(examples, split_feature_batch(feature_batch, raw_batch), strict=True):
+        for modality in modalities:
+            if example not in missing_sets[modality]:
+                continue
+            write_feature_cache_item(
+                cache_dir=cache_dir,
+                example=example,
+                spec=specs[modality],
+                item=item,
+                dataset_root=dataset_root,
+            )
+            progress[modality]["written"] += 1
+
+
+def cache_single_modality_example(
+    example: VideoExample,
+    cache_dir: Path,
+    spec: FeatureCacheSpec,
+    config: Mapping[str, Any],
+    dataset_root: Path,
+    progress: dict[str, Any],
+    failure_rows: list[dict[str, Any]],
+    fallback_pipelines: dict[str, Any],
+) -> None:
+    modality = spec.modality
+    build_result = fallback_pipelines.get(modality)
+    if build_result is None:
+        build_result = build_fusion_pipeline(config=config, modalities=(modality,))
+        build_result.pipeline.eval()
+        fallback_pipelines[modality] = build_result
+    try:
+        raw_batch = build_raw_feature_batch(
+            examples=[example],
+            modalities=(modality,),
+            frame_count=spec.frame_count,
+            image_size=spec.image_size,
+        )
+        feature_batch = build_result.pipeline.prepare_features(raw_batch)
+        item = split_feature_batch(feature_batch, raw_batch)[0]
+        write_feature_cache_item(
+            cache_dir=cache_dir,
+            example=example,
+            spec=spec,
+            item=item,
+            dataset_root=dataset_root,
+        )
+        progress[modality]["written"] += 1
+    except Exception as exc:
+        print(
+            f"cache fallback: modality={modality} path={example.path} error={exc}",
+            flush=True,
+        )
+        append_cache_failure(failure_rows, progress, spec, example, exc)
+
+
+def initialize_feature_cache_progress(
     examples: Sequence[VideoExample],
     cache_dir: Path,
     specs: Mapping[str, FeatureCacheSpec],
     modalities: Sequence[str],
-    config: Mapping[str, Any],
     dataset_root: Path,
-    extract_batch_size: int,
     overwrite: bool,
     skip_failures: bool,
     progress_every: int,
     label: str,
-) -> dict[str, Any]:
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    progress_bar: bool,
+) -> tuple[dict[str, list[VideoExample]], dict[str, Any]]:
     skip_failure_keys = read_failure_keys(cache_dir) if skip_failures else set()
     progress: dict[str, Any] = {}
     progress_interval = max(1, progress_every)
-    if extract_batch_size != 1:
-        print(
-            "warning: extraction runs one video at a time so failed videos can be skipped; "
-            f"--extract-batch-size={extract_batch_size} ignored.",
-            flush=True,
-        )
+    missing_by_modality: dict[str, list[VideoExample]] = {}
     for modality in modalities:
         spec = specs[modality]
         missing = missing_examples_for_modality(
@@ -655,7 +1383,11 @@ def ensure_feature_cache(
             dataset_root=dataset_root,
             overwrite=overwrite,
             skip_failure_keys=skip_failure_keys,
+            progress_bar=progress_bar,
+            label=label,
+            progress_every=progress_interval,
         )
+        missing_by_modality[modality] = missing
         progress[modality] = {
             "requested": len(examples),
             "missing_before": len(missing),
@@ -678,69 +1410,305 @@ def ensure_feature_cache(
             f"cached={cached_before} skipped_failed={skipped_failed} missing={len(missing)}",
             flush=True,
         )
-        if not missing:
-            continue
-        start = time.perf_counter()
-        build_result = build_fusion_pipeline(config=config, modalities=(modality,))
-        failure_rows: list[dict[str, Any]] = []
-        build_result.pipeline.eval()
-        with torch.no_grad():
-            for index, example in enumerate(missing, start=1):
-                try:
-                    dataset = LabeledVideoDataset(
-                        examples=[example],
-                        num_frames={modality: spec.frame_count},
-                        image_size=spec.image_size,
-                    )
-                    raw_batch = collate_labeled_video_batch([dataset[0]])
-                    feature_batch = build_result.pipeline.prepare_features(raw_batch)
-                    for item in split_feature_batch(feature_batch, raw_batch):
-                        write_feature_cache_item(
-                            cache_dir=cache_dir,
-                            example=example,
-                            spec=spec,
-                            item=item,
-                            dataset_root=dataset_root,
-                        )
-                        progress[modality]["written"] += 1
-                except Exception as exc:
-                    print(
-                        f"cache {label}: modality={modality} failed "
-                        f"{index}/{len(missing)} path={example.path} error={exc}",
-                        flush=True,
-                    )
-                    failure_rows.append(
-                        {
-                            "spec_id": feature_cache_spec_id(spec),
-                            "modality": modality,
-                            "path": str(example.path),
-                            "error": str(exc),
-                        }
-                    )
-                    progress[modality]["failed"] += 1
-                if index == len(missing) or index % progress_interval == 0:
-                    elapsed = time.perf_counter() - start
-                    done = progress[modality]["written"] + progress[modality]["failed"]
-                    rate = 0.0 if elapsed <= 0.0 else done / elapsed
-                    print(
-                        f"cache {label}: modality={modality} "
-                        f"done={done}/{len(missing)} "
-                        f"written={progress[modality]['written']} "
-                        f"failed={progress[modality]['failed']} "
-                        f"elapsed={elapsed:.1f}s videos_per_s={rate:.2f}",
-                        flush=True,
-                    )
-        build_result.pipeline.close()
-        append_failure_rows(cache_dir, failure_rows)
-        if build_result.device.type == "cuda":
-            torch.cuda.empty_cache()
-        elapsed = time.perf_counter() - start
+    return missing_by_modality, progress
+
+
+def close_pipeline_result(build_result) -> None:
+    build_result.pipeline.close()
+    if build_result.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def build_cache_progress_display(
+    group_examples: Sequence[VideoExample],
+    group_name: str,
+    label: str,
+    enabled: bool,
+):
+    if not enabled:
+        return None
+    return tqdm(
+        total=len(group_examples),
+        desc=f"cache {label}/{group_name}",
+        unit="video",
+        dynamic_ncols=True,
+        leave=True,
+    )
+
+
+def cache_feature_batch_or_fallback(
+    batch_examples: Sequence[VideoExample],
+    group_modalities: Sequence[str],
+    frame_count: int,
+    image_size: int,
+    build_result,
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    config: Mapping[str, Any],
+    dataset_root: Path,
+    progress: dict[str, Any],
+    missing_sets: Mapping[str, set[VideoExample]],
+    failure_rows: list[dict[str, Any]],
+    fallback_pipelines: dict[str, Any],
+    chunk_index: int,
+    chunk_count: int,
+    group_name: str,
+    label: str,
+) -> None:
+    try:
+        raw_batch = build_raw_feature_batch(
+            examples=batch_examples,
+            modalities=group_modalities,
+            frame_count=frame_count,
+            image_size=image_size,
+        )
+        feature_batch = build_result.pipeline.prepare_features(raw_batch)
+        write_cached_feature_items(
+            cache_dir=cache_dir,
+            specs=specs,
+            modalities=group_modalities,
+            examples=batch_examples,
+            feature_batch=feature_batch,
+            raw_batch=raw_batch,
+            missing_sets=missing_sets,
+            dataset_root=dataset_root,
+            progress=progress,
+        )
+    except Exception as exc:
         print(
-            f"cache {label}: modality={modality} complete "
-            f"written={progress[modality]['written']} "
-            f"failed={progress[modality]['failed']} elapsed={elapsed:.1f}s",
+            f"cache {label}: modalities={group_name} batch failed "
+            f"{chunk_index}/{chunk_count} size={len(batch_examples)} error={exc}",
             flush=True,
         )
+        for example in batch_examples:
+            for modality in group_modalities:
+                if example not in missing_sets[modality]:
+                    continue
+                cache_single_modality_example(
+                    example=example,
+                    cache_dir=cache_dir,
+                    spec=specs[modality],
+                    config=config,
+                    dataset_root=dataset_root,
+                    progress=progress,
+                    failure_rows=failure_rows,
+                    fallback_pipelines=fallback_pipelines,
+                )
+
+
+def update_cache_group_progress(
+    progress_display,
+    batch_examples: Sequence[VideoExample],
+    chunk_index: int,
+    batch_size: int,
+    group_examples_count: int,
+    progress_interval: int,
+    progress: Mapping[str, Any],
+    group_modalities: Sequence[str],
+    start: float,
+    label: str,
+    group_name: str,
+) -> None:
+    if progress_display is not None:
+        progress_display.update(len(batch_examples))
+    done = min(chunk_index * batch_size, group_examples_count)
+    if done != group_examples_count and done % progress_interval != 0:
+        return
+    elapsed = time.perf_counter() - start
+    written = sum(int(progress[modality]["written"]) for modality in group_modalities)
+    failed = sum(int(progress[modality]["failed"]) for modality in group_modalities)
+    rate = 0.0 if elapsed <= 0.0 else done / elapsed
+    if progress_display is None:
+        print(
+            f"cache {label}: modalities={group_name} "
+            f"done={done}/{group_examples_count} "
+            f"written={written} failed={failed} "
+            f"elapsed={elapsed:.1f}s videos_per_s={rate:.2f}",
+            flush=True,
+        )
+
+
+def cache_feature_group(
+    group_examples: Sequence[VideoExample],
+    group_modalities: Sequence[str],
+    frame_count: int,
+    image_size: int,
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    config: Mapping[str, Any],
+    dataset_root: Path,
+    batch_size: int,
+    progress_interval: int,
+    progress: dict[str, Any],
+    missing_by_modality: Mapping[str, list[VideoExample]],
+    failure_rows: list[dict[str, Any]],
+    fallback_pipelines: dict[str, Any],
+    label: str,
+    progress_bar: bool,
+) -> None:
+    start = time.perf_counter()
+    group_name = ",".join(group_modalities)
+    build_result = build_fusion_pipeline(config=config, modalities=group_modalities)
+    build_result.pipeline.eval()
+    missing_sets = {modality: set(missing_by_modality[modality]) for modality in group_modalities}
+    chunks = chunk_examples(group_examples, batch_size)
+    progress_display = build_cache_progress_display(
+        group_examples=group_examples,
+        group_name=group_name,
+        label=label,
+        enabled=progress_bar,
+    )
+    try:
+        with torch.inference_mode():
+            for chunk_index, batch_examples in enumerate(chunks, start=1):
+                cache_feature_batch_or_fallback(
+                    batch_examples=batch_examples,
+                    group_modalities=group_modalities,
+                    frame_count=frame_count,
+                    image_size=image_size,
+                    build_result=build_result,
+                    cache_dir=cache_dir,
+                    specs=specs,
+                    config=config,
+                    dataset_root=dataset_root,
+                    progress=progress,
+                    missing_sets=missing_sets,
+                    failure_rows=failure_rows,
+                    fallback_pipelines=fallback_pipelines,
+                    chunk_index=chunk_index,
+                    chunk_count=len(chunks),
+                    group_name=group_name,
+                    label=label,
+                )
+                update_cache_group_progress(
+                    progress_display=progress_display,
+                    batch_examples=batch_examples,
+                    chunk_index=chunk_index,
+                    batch_size=batch_size,
+                    group_examples_count=len(group_examples),
+                    progress_interval=progress_interval,
+                    progress=progress,
+                    group_modalities=group_modalities,
+                    start=start,
+                    label=label,
+                    group_name=group_name,
+                )
+    finally:
+        if progress_display is not None:
+            progress_display.close()
+        close_pipeline_result(build_result)
+    elapsed = time.perf_counter() - start
+    print(
+        f"cache {label}: modalities={group_name} complete "
+        f"written={sum(int(progress[modality]['written']) for modality in group_modalities)} "
+        f"failed={sum(int(progress[modality]['failed']) for modality in group_modalities)} "
+        f"elapsed={elapsed:.1f}s",
+        flush=True,
+    )
+
+
+def cache_missing_feature_groups(
+    examples: Sequence[VideoExample],
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+    config: Mapping[str, Any],
+    dataset_root: Path,
+    batch_size: int,
+    progress_interval: int,
+    progress: dict[str, Any],
+    missing_by_modality: Mapping[str, list[VideoExample]],
+    label: str,
+    progress_bar: bool,
+    group_by_modality: bool,
+) -> None:
+    failure_rows: list[dict[str, Any]] = []
+    fallback_pipelines: dict[str, Any] = {}
+    try:
+        active_modalities = [
+            modality for modality in modalities if missing_by_modality.get(modality)
+        ]
+        for frame_count, image_size, group_modalities in extraction_modality_groups(
+            active_modalities,
+            specs,
+            group_by_modality=group_by_modality,
+        ):
+            group_examples = examples_missing_any_modality(
+                examples=examples,
+                modalities=group_modalities,
+                missing_by_modality=missing_by_modality,
+            )
+            if not group_examples:
+                continue
+            cache_feature_group(
+                group_examples=group_examples,
+                group_modalities=group_modalities,
+                frame_count=frame_count,
+                image_size=image_size,
+                cache_dir=cache_dir,
+                specs=specs,
+                config=config,
+                dataset_root=dataset_root,
+                batch_size=batch_size,
+                progress_interval=progress_interval,
+                progress=progress,
+                missing_by_modality=missing_by_modality,
+                failure_rows=failure_rows,
+                fallback_pipelines=fallback_pipelines,
+                label=label,
+                progress_bar=progress_bar,
+            )
+    finally:
+        for build_result in fallback_pipelines.values():
+            close_pipeline_result(build_result)
+        append_failure_rows(cache_dir, failure_rows)
+
+
+def ensure_feature_cache(
+    examples: Sequence[VideoExample],
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+    config: Mapping[str, Any],
+    dataset_root: Path,
+    extract_batch_size: int,
+    overwrite: bool,
+    skip_failures: bool,
+    progress_every: int,
+    label: str,
+    progress_bar: bool = False,
+    group_by_modality: bool = False,
+) -> dict[str, Any]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    progress_bar = progress_bar and sys.stderr.isatty()
+    progress_interval = max(1, progress_every)
+    missing_by_modality, progress = initialize_feature_cache_progress(
+        examples=examples,
+        cache_dir=cache_dir,
+        specs=specs,
+        modalities=modalities,
+        dataset_root=dataset_root,
+        overwrite=overwrite,
+        skip_failures=skip_failures,
+        progress_every=progress_interval,
+        label=label,
+        progress_bar=progress_bar,
+    )
+    cache_missing_feature_groups(
+        examples=examples,
+        cache_dir=cache_dir,
+        specs=specs,
+        modalities=modalities,
+        config=config,
+        dataset_root=dataset_root,
+        batch_size=max(1, extract_batch_size),
+        progress_interval=progress_interval,
+        progress=progress,
+        missing_by_modality=missing_by_modality,
+        label=label,
+        progress_bar=progress_bar,
+        group_by_modality=group_by_modality,
+    )
     return progress
 
 
@@ -756,7 +1724,20 @@ def write_metrics(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("epoch", "train_loss", "train_accuracy", "train_elapsed_seconds"),
+            fieldnames=(
+                "epoch",
+                "train_loss",
+                "train_accuracy",
+                *metrics_row_fields("train"),
+                "train_elapsed_seconds",
+                "val_loss",
+                "val_accuracy",
+                *metrics_row_fields("val"),
+                "val_elapsed_seconds",
+                "checkpoint_metric",
+                "checkpoint_metric_value",
+                "best_checkpoint",
+            ),
         )
         writer.writeheader()
         for row in rows:
@@ -795,6 +1776,7 @@ def run_training_round(
     test_examples: Sequence[VideoExample],
     dataset_root: Path,
     output_dir: Path,
+    warm_start_checkpoint: Path | None = None,
 ) -> dict[str, Any]:
     if not train_examples:
         raise ValueError("No cached train examples available for this round.")
@@ -811,8 +1793,21 @@ def run_training_round(
     )
     freeze_encoder_modules(model)
     model = model.to(build_result.device)
+    if warm_start_checkpoint is not None:
+        state = torch.load(
+            warm_start_checkpoint,
+            map_location=build_result.device,
+            weights_only=False,
+        )
+        model.load_state_dict(state)
+        print(f"loaded warm-start checkpoint: {warm_start_checkpoint}", flush=True)
     modality_lrs = parse_modality_lrs(args.modality_lr)
-    optimizer = build_optimizer(model, base_lr=args.lr, modality_lrs=modality_lrs)
+    optimizer = build_optimizer(
+        model,
+        base_lr=args.lr,
+        modality_lrs=modality_lrs,
+        weight_decay=args.weight_decay,
+    )
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
     train_loader = build_cached_loader(
@@ -844,36 +1839,80 @@ def run_training_round(
     )
 
     metrics: list[dict[str, Any]] = []
-    best_accuracy = -1.0
+    best_metric_value: float | None = None
+    epochs_without_improvement = 0
     best_path = output_dir / "best.pt"
     print(
         "training: "
         f"modalities={','.join(modalities)} epochs={args.epochs} "
         f"train={len(train_examples)} val={len(val_examples)} test={len(test_examples)} "
         f"batch_size={args.batch_size} device={build_result.device} "
-        f"lr={args.lr} modality_lrs={modality_lrs}",
+        f"lr={args.lr} modality_lrs={modality_lrs} "
+        f"weight_decay={args.weight_decay} "
+        f"checkpoint_metric={args.checkpoint_metric} "
+        f"early_stopping_patience={args.early_stopping_patience}",
         flush=True,
     )
     for epoch in range(1, args.epochs + 1):
         result = train_one_epoch(model, train_loader, optimizer, loss_fn)
+        val_result = evaluate_loss_accuracy(model, val_loader, loss_fn)
+        metric_value = checkpoint_metric_value(args.checkpoint_metric, result, val_result)
+        improved = is_metric_improvement(
+            metric_name=args.checkpoint_metric,
+            value=metric_value,
+            best_value=best_metric_value,
+            min_delta=args.early_stopping_min_delta,
+        )
         row = {
             "epoch": epoch,
             "train_loss": f"{result.loss:.8f}",
             "train_accuracy": f"{result.accuracy:.8f}",
+            **metrics_row_values("train", result.metrics),
             "train_elapsed_seconds": f"{result.elapsed_seconds:.6f}",
+            "val_loss": f"{val_result.loss:.8f}",
+            "val_accuracy": f"{val_result.accuracy:.8f}",
+            **metrics_row_values("val", val_result.metrics),
+            "val_elapsed_seconds": f"{val_result.elapsed_seconds:.6f}",
+            "checkpoint_metric": args.checkpoint_metric,
+            "checkpoint_metric_value": f"{metric_value:.8f}",
+            "best_checkpoint": "1" if improved else "0",
         }
         metrics.append(row)
-        if result.accuracy > best_accuracy:
-            best_accuracy = result.accuracy
+        if improved:
+            best_metric_value = metric_value
+            epochs_without_improvement = 0
             best_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), best_path)
+        else:
+            epochs_without_improvement += 1
         print(
             f"epoch={epoch}/{args.epochs} "
             f"train_loss={result.loss:.6f} "
             f"train_accuracy={result.accuracy:.4f} "
-            f"elapsed={result.elapsed_seconds:.3f}s",
+            f"train_f1={result.metrics.f1:.4f} "
+            f"val_loss={val_result.loss:.6f} "
+            f"val_accuracy={val_result.accuracy:.4f} "
+            f"val_f1={val_result.metrics.f1:.4f} "
+            f"val_fp={val_result.metrics.false_positive} "
+            f"val_fn={val_result.metrics.false_negative} "
+            f"{args.checkpoint_metric}={metric_value:.6f} "
+            f"best={1 if improved else 0} "
+            f"elapsed={result.elapsed_seconds:.3f}s "
+            f"val_elapsed={val_result.elapsed_seconds:.3f}s",
             flush=True,
         )
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            print(
+                "early stopping: "
+                f"metric={args.checkpoint_metric} "
+                f"best={best_metric_value:.6f} "
+                f"epochs_without_improvement={epochs_without_improvement}",
+                flush=True,
+            )
+            break
 
     best_state = torch.load(best_path, map_location=build_result.device, weights_only=False)
     model.load_state_dict(best_state)
@@ -881,9 +1920,16 @@ def run_training_round(
     train_accuracy, train_rows = predict_rows(model, train_loader)
     val_accuracy, val_rows = predict_rows(model, val_loader)
     test_accuracy, test_rows = predict_rows(model, test_loader)
+    train_metrics = prediction_rows_metrics(train_rows)
+    val_metrics = prediction_rows_metrics(val_rows)
+    test_metrics = prediction_rows_metrics(test_rows)
     print(
         f"eval: train_accuracy={train_accuracy:.4f} "
-        f"val_accuracy={val_accuracy:.4f} test_accuracy={test_accuracy:.4f}",
+        f"train_f1={train_metrics.f1:.4f} "
+        f"val_accuracy={val_accuracy:.4f} val_f1={val_metrics.f1:.4f} "
+        f"val_fp={val_metrics.false_positive} val_fn={val_metrics.false_negative} "
+        f"test_accuracy={test_accuracy:.4f} test_f1={test_metrics.f1:.4f} "
+        f"test_fp={test_metrics.false_positive} test_fn={test_metrics.false_negative}",
         flush=True,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -894,13 +1940,29 @@ def run_training_round(
         "train_count": len(train_examples),
         "val_count": len(val_examples),
         "test_count": len(test_examples),
+        "train_class_counts": class_counts(train_examples),
+        "val_class_counts": class_counts(val_examples),
+        "test_class_counts": class_counts(test_examples),
         "epochs": args.epochs,
+        "epochs_ran": len(metrics),
         "lr": args.lr,
+        "weight_decay": args.weight_decay,
         "modality_lrs": modality_lrs,
         "batch_size": args.batch_size,
+        "checkpoint_metric": args.checkpoint_metric,
+        "best_checkpoint_metric_value": best_metric_value,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
+        "early_stopped": len(metrics) < args.epochs,
+        "warm_start_checkpoint": None
+        if warm_start_checkpoint is None
+        else str(warm_start_checkpoint),
         "train_accuracy": train_accuracy,
         "val_accuracy": val_accuracy,
         "test_accuracy": test_accuracy,
+        "train_metrics": asdict(train_metrics),
+        "val_metrics": asdict(val_metrics),
+        "test_metrics": asdict(test_metrics),
         "best_checkpoint": str(best_path),
     }
     write_json(output_dir / "summary.json", summary)
@@ -1005,6 +2067,8 @@ def write_dry_run(
     print(f"test_fixed={len(test_examples)} counts={class_counts(test_examples)}")
     print(f"round_targets={','.join(str(target) for target in round_targets)}")
     print(f"missing_cache={dict(missing)}")
+    for line in format_split_audit(examples):
+        print(line)
 
 
 def modality_set_name(modalities: Sequence[str]) -> str:
@@ -1030,12 +2094,46 @@ def main() -> None:
         val_ratio=args.val_ratio,
         seed=args.seed,
     )
-    train_pool, val_examples, test_examples = split_examples(
-        examples,
-        eval_count_per_split=args.eval_count_per_split,
-        seed=args.seed,
+    cache_score_by_path = (
+        build_cache_score_by_path(
+            examples=examples,
+            cache_dir=cache_dir,
+            specs=specs,
+            modalities=base_modalities,
+            dataset_root=dataset_root,
+        )
+        if args.prefer_cached_selection
+        else None
     )
-    train_order = build_balanced_train_order(train_pool, args.seed + 101)
+    if cache_score_by_path is not None:
+        print(
+            "cache selection: "
+            f"enabled summary={cache_score_summary(examples, cache_score_by_path, len(base_modalities))}",
+            flush=True,
+        )
+    if args.balanced_total is None:
+        split_mode = "dataset_splits"
+        train_pool, val_examples, test_examples = split_examples(
+            examples,
+            eval_count_per_split=args.eval_count_per_split,
+            seed=args.seed,
+            cache_score_by_path=cache_score_by_path,
+        )
+    else:
+        split_mode = f"balanced_total_{args.balanced_total}"
+        train_pool, val_examples, test_examples = split_balanced_total_examples(
+            examples=examples,
+            balanced_total=args.balanced_total,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+            cache_score_by_path=cache_score_by_path,
+        )
+    train_order = build_balanced_train_order(
+        train_pool,
+        args.seed + 101,
+        cache_score_by_path=cache_score_by_path,
+    )
     round_targets = resolve_round_targets(
         len(train_order),
         args.round_ladder,
@@ -1053,9 +2151,20 @@ def main() -> None:
         f"modality_sets={','.join(modality_set_name(item) for item in modality_sets)}", flush=True
     )
     print(f"dataset_total={len(examples)} summary={summarize_examples(examples)}", flush=True)
+    for line in format_split_audit(examples):
+        print(line, flush=True)
+    print(f"split_mode={split_mode}", flush=True)
     print(f"train_pool={len(train_pool)} counts={class_counts(train_pool)}", flush=True)
     print(f"val_fixed={len(val_examples)} counts={class_counts(val_examples)}", flush=True)
     print(f"test_fixed={len(test_examples)} counts={class_counts(test_examples)}", flush=True)
+    if cache_score_by_path is not None:
+        print(
+            "cache selection: "
+            f"train={cache_score_summary(train_order, cache_score_by_path, len(base_modalities))} "
+            f"val={cache_score_summary(val_examples, cache_score_by_path, len(base_modalities))} "
+            f"test={cache_score_summary(test_examples, cache_score_by_path, len(base_modalities))}",
+            flush=True,
+        )
     print(f"round_targets={','.join(str(target) for target in round_targets)}", flush=True)
 
     if args.dry_run:
@@ -1070,7 +2179,10 @@ def main() -> None:
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_dataset_manifest(examples, output_dir / "manifest.csv")
+    manifest_examples = (
+        examples if args.balanced_total is None else [*train_pool, *val_examples, *test_examples]
+    )
+    write_dataset_manifest(manifest_examples, output_dir / "manifest.csv")
     write_json(
         output_dir / "run_config.json",
         {
@@ -1083,7 +2195,12 @@ def main() -> None:
             if args.round_targets is not None
             else args.round_ladder,
             "eval_count_per_split": args.eval_count_per_split,
+            "balanced_total": args.balanced_total,
+            "split_mode": split_mode,
+            "train_ratio": args.train_ratio,
+            "val_ratio": args.val_ratio,
             "seed": args.seed,
+            "prefer_cached_selection": args.prefer_cached_selection,
             "spec_ids": {modality: feature_cache_spec_id(spec) for modality, spec in specs.items()},
         },
     )
@@ -1157,6 +2274,23 @@ def main() -> None:
                 dataset_root,
                 label=f"test/{name}",
             )
+            cached_val_examples = rebalance_eval_examples(
+                cached_val_examples,
+                target_count=len(val_examples),
+                seed=args.seed + 701,
+                label=f"val/{name}",
+            )
+            cached_test_examples = rebalance_eval_examples(
+                cached_test_examples,
+                target_count=len(test_examples),
+                seed=args.seed + 709,
+                label=f"test/{name}",
+            )
+            previous = previous_by_modality_set.get(name)
+            warm_start_checkpoint = resolve_warm_start_checkpoint(
+                previous,
+                enabled=args.warm_start_rounds,
+            )
             summary = run_training_round(
                 args=args,
                 config=config,
@@ -1168,8 +2302,8 @@ def main() -> None:
                 test_examples=cached_test_examples,
                 dataset_root=dataset_root,
                 output_dir=round_dir / name,
+                warm_start_checkpoint=warm_start_checkpoint,
             )
-            previous = previous_by_modality_set.get(name)
             summary["previous_val_accuracy"] = (
                 None if previous is None else previous["val_accuracy"]
             )

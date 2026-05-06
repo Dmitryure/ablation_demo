@@ -49,7 +49,6 @@ def _build_radial_bin_indices(image_size: int, num_bins: int) -> torch.Tensor:
 
 
 class FFTExtractor(FeatureExtractor):
-
     name = "fft"
 
     def __init__(self, image_size: int = 128, num_bins: int = 32) -> None:
@@ -60,9 +59,11 @@ class FFTExtractor(FeatureExtractor):
         self.image_size = int(image_size)
         self.num_bins = int(num_bins)
         self._bin_indices = _build_radial_bin_indices(self.image_size, self.num_bins)
-        self._bin_counts = torch.bincount(
-            self._bin_indices.flatten(), minlength=self.num_bins
-        ).clamp(min=1).to(torch.float32)
+        self._bin_counts = (
+            torch.bincount(self._bin_indices.flatten(), minlength=self.num_bins)
+            .clamp(min=1)
+            .to(torch.float32)
+        )
 
     def required_keys(self) -> tuple[str, ...]:
         return ("video_rgb_frames",)
@@ -88,8 +89,8 @@ class FFTExtractor(FeatureExtractor):
             for frame in clip:
                 _validate_frame(frame)
                 per_frame.append(self._compute_frame_spectrum(frame))
-            per_clip.append(torch.stack(per_frame, dim=0))  
-        return {"fft_features": torch.stack(per_clip, dim=0)}  
+            per_clip.append(torch.stack(per_frame, dim=0))
+        return {"fft_features": torch.stack(per_clip, dim=0)}
 
     def close(self) -> None:
         return None

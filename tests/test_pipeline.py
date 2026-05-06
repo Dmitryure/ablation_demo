@@ -91,9 +91,11 @@ class ParameterizedDummyDepthEncoder(nn.Module):
 
 
 class DummyDepthProcessor:
-    def __call__(self, images, return_tensors: str):
+    def __call__(self, images, return_tensors: str, keep_aspect_ratio: bool = True):
         if return_tensors != "pt":
             raise ValueError("DummyDepthProcessor only supports return_tensors='pt'.")
+        if keep_aspect_ratio:
+            raise ValueError("DepthExtractor must disable aspect-ratio preserving resize.")
         pixel_values = torch.stack(
             [
                 torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).float() / 255.0

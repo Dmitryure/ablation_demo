@@ -29,8 +29,7 @@ class FFTBranch(ModalityBranch):
         fft_features = batch["fft_features"]
         if fft_features.ndim != 3:
             raise ValueError(
-                "FFT features must have shape [B, N, num_bins], "
-                f"got {tuple(fft_features.shape)}"
+                f"FFT features must have shape [B, N, num_bins], got {tuple(fft_features.shape)}"
             )
 
         projected_tokens = self.proj(fft_features)

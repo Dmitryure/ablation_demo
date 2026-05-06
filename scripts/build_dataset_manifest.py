@@ -8,7 +8,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset import build_real_fake_examples, summarize_examples, write_dataset_manifest
+from dataset import (
+    build_real_fake_examples,
+    format_split_audit,
+    summarize_examples,
+    write_dataset_manifest,
+)
 
 DEFAULT_REAL_DIR = Path("/home/comp/video_loader/cut_vids1/chunks")
 DEFAULT_FAKE_DIR = Path("/home/comp/facefusion/output_f_faceswap")
@@ -44,6 +49,8 @@ def main() -> None:
         print(
             f"{split}: total={split_summary['total']} real={split_summary['real']} fake={split_summary['fake']}"
         )
+    for line in format_split_audit(examples):
+        print(line)
 
 
 if __name__ == "__main__":

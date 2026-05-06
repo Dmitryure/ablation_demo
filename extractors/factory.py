@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,82 +23,138 @@ class ExtractorFactoryResult:
     warnings: tuple[str, ...]
 
 
+def _require_encoder(encoder: Any, message: str) -> Any:
+    if encoder is None:
+        raise RuntimeError(message)
+    return encoder
+
+
+def _config_mapping(config: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = config.get(key, {})
+    if not isinstance(value, Mapping):
+        raise ValueError(f"`{key}` must be a YAML mapping.")
+    return value
+
+
+def _positive_int(value: Any, name: str, minimum: int = 1) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        if minimum == 2:
+            raise ValueError(f"`{name}` must be an integer greater than 1.")
+        raise ValueError(f"`{name}` must be a positive integer.")
+    return value
+
+
+def _optional_positive_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value, name)
+
+
+def _bool_value(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"`{name}` must be a boolean.")
+    return value
+
+
+def _build_rgb_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    return RGBExtractor(
+        _require_encoder(
+            encoder_result.rgb_encoder,
+            "RGB encoder was not built for the selected modalities.",
+        ),
+        image_size=int(config.get("image_size", 224)),
+    )
+
+
+def _build_eye_gaze_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    del encoder_result
+    return build_eye_gaze_extractor(config)
+
+
+def _build_face_mesh_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    del encoder_result
+    return build_face_mesh_extractor(config)
+
+
+def _build_fau_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    del config
+    return FAUExtractor(
+        _require_encoder(
+            encoder_result.fau_encoder,
+            "FAU encoder was not built for the selected modalities.",
+        )
+    )
+
+
+def _build_rppg_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    del config
+    return RPPGExtractor(
+        _require_encoder(
+            encoder_result.rppg_encoder,
+            "rPPG encoder was not built for the selected modalities.",
+        )
+    )
+
+
+def _build_depth_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    depth_config = _config_mapping(config, "depth")
+    model_id_or_path = depth_config.get("model_id_or_path", DEFAULT_DEPTH_MODEL_ID)
+    if not isinstance(model_id_or_path, str) or not model_id_or_path.strip():
+        raise ValueError("`depth.model_id_or_path` must be a non-empty string.")
+    return DepthExtractor(
+        _require_encoder(
+            encoder_result.depth_encoder,
+            "Depth encoder was not built for the selected modalities.",
+        ),
+        model_id_or_path=model_id_or_path.strip(),
+    )
+
+
+def _build_fft_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    del encoder_result
+    fft_config = _config_mapping(config, "fft")
+    return FFTExtractor(
+        image_size=int(config.get("image_size", 224)),
+        num_bins=_positive_int(fft_config.get("num_bins", 32), "fft.num_bins"),
+    )
+
+
+def _build_stft_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    del encoder_result
+    stft_config = _config_mapping(config, "stft")
+    return STFTExtractor(
+        n_fft=_positive_int(stft_config.get("n_fft", 8), "stft.n_fft", minimum=2),
+        hop_length=_optional_positive_int(stft_config.get("hop_length"), "stft.hop_length"),
+        grid_size=_positive_int(stft_config.get("grid_size", 4), "stft.grid_size"),
+        include_chrominance=_bool_value(
+            stft_config.get("include_chrominance", True),
+            "stft.include_chrominance",
+        ),
+    )
+
+
+_EXTRACTOR_BUILDERS: dict[str, Callable[[Mapping[str, Any], Any], FeatureExtractor]] = {
+    "rgb": _build_rgb_extractor,
+    "eye_gaze": _build_eye_gaze_extractor,
+    "face_mesh": _build_face_mesh_extractor,
+    "fau": _build_fau_extractor,
+    "rppg": _build_rppg_extractor,
+    "depth": _build_depth_extractor,
+    "fft": _build_fft_extractor,
+    "stft": _build_stft_extractor,
+}
+
+
 def _build_extractors_from_encoder_result(
     config: Mapping[str, Any],
     enabled: Sequence[str],
     encoder_result,
 ) -> dict[str, FeatureExtractor]:
-    enabled_set = set(enabled)
     extractors: dict[str, FeatureExtractor] = {}
-
-    if "rgb" in enabled_set:
-        if encoder_result.rgb_encoder is None:
-            raise RuntimeError("RGB encoder was not built for the selected modalities.")
-        extractors["rgb"] = RGBExtractor(
-            encoder_result.rgb_encoder,
-            image_size=int(config.get("image_size", 224)),
-        )
-    if "eye_gaze" in enabled_set:
-        extractors["eye_gaze"] = build_eye_gaze_extractor(config)
-    if "face_mesh" in enabled_set:
-        extractors["face_mesh"] = build_face_mesh_extractor(config)
-    if "fau" in enabled_set:
-        if encoder_result.fau_encoder is None:
-            raise RuntimeError("FAU encoder was not built for the selected modalities.")
-        extractors["fau"] = FAUExtractor(encoder_result.fau_encoder)
-    if "rppg" in enabled_set:
-        if encoder_result.rppg_encoder is None:
-            raise RuntimeError("rPPG encoder was not built for the selected modalities.")
-        extractors["rppg"] = RPPGExtractor(encoder_result.rppg_encoder)
-    if "depth" in enabled_set:
-        if encoder_result.depth_encoder is None:
-            raise RuntimeError("Depth encoder was not built for the selected modalities.")
-        depth_config = config.get("depth", {})
-        if not isinstance(depth_config, Mapping):
-            raise ValueError("`depth` must be a YAML mapping.")
-        model_id_or_path = depth_config.get("model_id_or_path", DEFAULT_DEPTH_MODEL_ID)
-        if not isinstance(model_id_or_path, str) or not model_id_or_path.strip():
-            raise ValueError("`depth.model_id_or_path` must be a non-empty string.")
-        extractors["depth"] = DepthExtractor(
-            encoder_result.depth_encoder,
-            model_id_or_path=model_id_or_path.strip(),
-        )
-    if "fft" in enabled_set:
-        fft_config = config.get("fft", {})
-        if not isinstance(fft_config, Mapping):
-            raise ValueError("`fft` must be a YAML mapping.")
-        num_bins = fft_config.get("num_bins", 32)
-        if not isinstance(num_bins, int) or isinstance(num_bins, bool) or num_bins <= 0:
-            raise ValueError("`fft.num_bins` must be a positive integer.")
-        extractors["fft"] = FFTExtractor(
-            image_size=int(config.get("image_size", 224)),
-            num_bins=num_bins,
-        )
-    if "stft" in enabled_set:
-        stft_config = config.get("stft", {})
-        if not isinstance(stft_config, Mapping):
-            raise ValueError("`stft` must be a YAML mapping.")
-        n_fft = stft_config.get("n_fft", 8)
-        if not isinstance(n_fft, int) or isinstance(n_fft, bool) or n_fft <= 1:
-            raise ValueError("`stft.n_fft` must be an integer greater than 1.")
-        hop_length = stft_config.get("hop_length", None)
-        if hop_length is not None and (
-            not isinstance(hop_length, int) or isinstance(hop_length, bool) or hop_length <= 0
-        ):
-            raise ValueError("`stft.hop_length` must be a positive integer if set.")
-        grid_size = stft_config.get("grid_size", 4)
-        if not isinstance(grid_size, int) or isinstance(grid_size, bool) or grid_size <= 0:
-            raise ValueError("`stft.grid_size` must be a positive integer.")
-        include_chrominance = stft_config.get("include_chrominance", True)
-        if not isinstance(include_chrominance, bool):
-            raise ValueError("`stft.include_chrominance` must be a boolean.")
-        extractors["stft"] = STFTExtractor(
-            n_fft=n_fft,
-            hop_length=hop_length,
-            grid_size=grid_size,
-            include_chrominance=include_chrominance,
-        )
-
+    for modality in enabled:
+        builder = _EXTRACTOR_BUILDERS.get(modality)
+        if builder is not None:
+            extractors[modality] = builder(config, encoder_result)
     return extractors
 
 
@@ -106,7 +162,9 @@ def build_extractors(
     config: Mapping[str, Any],
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft", "stft"))
+    enabled = tuple(
+        modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft", "stft")
+    )
     encoder_result = build_local_encoders(config, modalities=enabled)
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
@@ -123,7 +181,9 @@ def build_extractors_from_encoders(
     encoder_result,
     modalities: Sequence[str] | None = None,
 ) -> ExtractorFactoryResult:
-    enabled = tuple(modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft", "stft"))
+    enabled = tuple(
+        modalities or ("rgb", "eye_gaze", "face_mesh", "fau", "rppg", "depth", "fft", "stft")
+    )
     return ExtractorFactoryResult(
         extractors=_build_extractors_from_encoder_result(
             config=config,
