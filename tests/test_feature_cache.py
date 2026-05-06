@@ -27,23 +27,28 @@ from scripts.run_iterative_cached_ablation import (
     EpochEvalResult,
     EpochTrainResult,
     ModalityDropoutConfig,
+    OcclusionRow,
     TrainingRegularizationConfig,
     binary_metrics_from_counts,
     build_balanced_train_order,
+    build_occlusion_rows,
     checkpoint_metric_value,
     gate_entropy_regularization,
     is_metric_improvement,
     metrics_row_values,
+    occlusion_skip_reason,
     rebalance_eval_examples,
     resolve_cached_loader_config,
     resolve_round_targets,
     resolve_training_regularization_config,
     resolve_warm_start_checkpoint,
+    run_occlusion_eval,
     sample_dropped_modalities,
     select_balanced_subset,
     select_fully_cached_examples,
     split_balanced_total_examples,
     summarize_diagnostic_rows,
+    summarize_occlusion_rows,
     video_metadata_summary,
 )
 
@@ -64,6 +69,31 @@ def build_example(
         split=split,
         identity_id=identity_id,
     )
+
+
+class DummyOcclusionOutput:
+    def __init__(self, logits: torch.Tensor) -> None:
+        self.logits = logits
+        self.probabilities = torch.sigmoid(logits)
+
+
+class DummyOcclusionModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_drops: list[tuple[str, ...]] = []
+
+    def forward(self, batch: dict[str, object]) -> DummyOcclusionOutput:
+        dropped = tuple(str(value) for value in batch.get("dropped_modalities", ()))
+        self.seen_drops.append(dropped)
+        labels = batch["label"]
+        if not isinstance(labels, torch.Tensor):
+            raise TypeError("labels must be a tensor")
+        logits = torch.tensor([[2.0], [-2.0]], dtype=torch.float32)
+        if dropped == ("rgb",):
+            logits = torch.tensor([[1.0], [-1.0]], dtype=torch.float32)
+        if dropped == ("depth",):
+            logits = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+        return DummyOcclusionOutput(logits[: labels.numel()])
 
 
 class FeatureCacheTest(unittest.TestCase):
@@ -734,6 +764,114 @@ class FeatureCacheTest(unittest.TestCase):
         self.assertEqual(summary[0]["generator_id"], "dlc")
         self.assertAlmostEqual(summary[0]["mean_mixed_logit_contribution"], -0.6)
         self.assertAlmostEqual(summary[0]["mean_token_attention_sum"], 0.4)
+
+    def test_build_occlusion_rows_reports_margin_loss_and_probability_deltas(self):
+        batch = {
+            "path": ["/tmp/fake/dlc/a.mp4", "/tmp/real/b.mp4"],
+            "class_name": ["fake", "real"],
+            "label": torch.tensor([1, 0]),
+            "split": ["test", "test"],
+        }
+
+        rows = build_occlusion_rows(
+            batch=batch,
+            modality_removed="depth",
+            full_logits=torch.tensor([[2.0], [-2.0]]),
+            occluded_logits=torch.tensor([[1.0], [-3.0]]),
+            split_name="test",
+        )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].generator_id, "dlc")
+        self.assertAlmostEqual(rows[0].delta_margin, 1.0)
+        self.assertGreater(rows[0].delta_loss, 0.0)
+        self.assertGreater(rows[0].delta_probability, 0.0)
+        self.assertGreater(rows[0].delta_correct_probability, 0.0)
+        self.assertAlmostEqual(rows[1].delta_margin, -1.0)
+        self.assertLess(rows[1].delta_loss, 0.0)
+        self.assertGreater(rows[1].delta_probability, 0.0)
+        self.assertLess(rows[1].delta_correct_probability, 0.0)
+        self.assertFalse(rows[1].prediction_flipped)
+
+    def test_summarize_occlusion_rows_groups_by_modality_generator_and_correctness(self):
+        rows = [
+            OcclusionRow(
+                path="/tmp/fake/dlc/a.mp4",
+                class_name="fake",
+                label=1,
+                full_prediction=1,
+                occluded_prediction=0,
+                full_probability=0.8,
+                occluded_probability=0.4,
+                split="test",
+                generator_id="dlc",
+                modality_removed="rgb",
+                full_logit=1.0,
+                occluded_logit=-0.5,
+                delta_margin=1.5,
+                delta_loss=0.7,
+                delta_probability=0.4,
+                delta_correct_probability=0.4,
+                prediction_flipped=True,
+            ),
+            OcclusionRow(
+                path="/tmp/fake/dlc/b.mp4",
+                class_name="fake",
+                label=1,
+                full_prediction=1,
+                occluded_prediction=1,
+                full_probability=0.7,
+                occluded_probability=0.6,
+                split="test",
+                generator_id="dlc",
+                modality_removed="rgb",
+                full_logit=0.8,
+                occluded_logit=0.4,
+                delta_margin=0.4,
+                delta_loss=0.2,
+                delta_probability=0.1,
+                delta_correct_probability=0.1,
+                prediction_flipped=False,
+            ),
+        ]
+
+        summary = summarize_occlusion_rows(rows)
+
+        self.assertEqual(len(summary), 1)
+        self.assertEqual(summary[0]["modality_removed"], "rgb")
+        self.assertEqual(summary[0]["correctness"], "correct")
+        self.assertEqual(summary[0]["generator_id"], "dlc")
+        self.assertEqual(summary[0]["count"], 2)
+        self.assertAlmostEqual(summary[0]["mean_delta_margin"], 0.95)
+        self.assertAlmostEqual(summary[0]["prediction_flip_rate"], 0.5)
+
+    def test_occlusion_skip_reason_requires_multiple_modalities(self):
+        self.assertIsNone(occlusion_skip_reason(("rgb", "depth"), enabled=True))
+        self.assertIsNone(occlusion_skip_reason(("rgb",), enabled=False))
+        self.assertEqual(
+            occlusion_skip_reason(("rgb",), enabled=True),
+            "requires_at_least_two_modalities",
+        )
+
+    def test_run_occlusion_eval_drops_one_modality_at_a_time(self):
+        model = DummyOcclusionModel()
+        batch = {
+            "path": ["/tmp/fake/dlc/a.mp4", "/tmp/real/b.mp4"],
+            "class_name": ["fake", "real"],
+            "label": torch.tensor([1, 0]),
+            "split": ["test", "test"],
+        }
+
+        rows = run_occlusion_eval(
+            model=model,  # type: ignore[arg-type]
+            loader=[batch],  # type: ignore[arg-type]
+            modalities=("rgb", "depth"),
+            split_name="test",
+        )
+
+        self.assertEqual(model.seen_drops, [(), ("rgb",), ("depth",)])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual({row.modality_removed for row in rows}, {"rgb", "depth"})
 
     def test_rebalance_eval_examples_removes_class_skew_after_cache_filtering(self):
         with tempfile.TemporaryDirectory() as tmpdir:

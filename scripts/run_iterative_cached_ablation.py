@@ -91,6 +91,27 @@ class DiagnosticRow:
 
 
 @dataclass(frozen=True)
+class OcclusionRow:
+    path: str
+    class_name: str
+    label: int
+    full_prediction: int
+    occluded_prediction: int
+    full_probability: float
+    occluded_probability: float
+    split: str
+    generator_id: str
+    modality_removed: str
+    full_logit: float
+    occluded_logit: float
+    delta_margin: float
+    delta_loss: float
+    delta_probability: float
+    delta_correct_probability: float
+    prediction_flipped: bool
+
+
+@dataclass(frozen=True)
 class BinaryMetrics:
     accuracy: float = 0.0
     balanced_accuracy: float = 0.0
@@ -233,6 +254,18 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Minimum checkpoint-metric improvement required to reset early stopping.",
+    )
+    parser.add_argument(
+        "--occlusion-diagnostics",
+        action="store_true",
+        help="After final eval, drop one modality at a time and write modality occlusion diagnostics.",
+    )
+    parser.add_argument(
+        "--occlusion-splits",
+        choices=("train", "val", "test"),
+        nargs="+",
+        default=("val", "test"),
+        help="Splits to evaluate for --occlusion-diagnostics.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--overwrite-cache", action="store_true")
@@ -1165,6 +1198,120 @@ def predict_rows(
                     )
                 )
     return correct / total, rows
+
+
+def correct_class_margin(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    label_sign = labels.to(device=logits.device, dtype=logits.dtype).view(-1, 1) * 2.0 - 1.0
+    return logits.view(-1, 1) * label_sign
+
+
+def correct_class_probability(probabilities: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    labels = labels.to(device=probabilities.device, dtype=probabilities.dtype).view(-1, 1)
+    probabilities = probabilities.view(-1, 1)
+    return torch.where(labels >= 0.5, probabilities, 1.0 - probabilities)
+
+
+def per_example_bce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    labels = labels.to(device=logits.device, dtype=logits.dtype).view_as(logits)
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        labels,
+        reduction="none",
+    )
+
+
+def build_occlusion_rows(
+    batch: Mapping[str, Any],
+    modality_removed: str,
+    full_logits: torch.Tensor,
+    occluded_logits: torch.Tensor,
+    split_name: str,
+) -> list[OcclusionRow]:
+    labels = batch["label"].detach().cpu().view(-1).to(dtype=torch.long)
+    full_logits = full_logits.detach().cpu().view(-1, 1)
+    occluded_logits = occluded_logits.detach().cpu().view(-1, 1)
+    full_probabilities = torch.sigmoid(full_logits)
+    occluded_probabilities = torch.sigmoid(occluded_logits)
+    full_predictions = (full_probabilities.view(-1) >= 0.5).to(dtype=torch.long)
+    occluded_predictions = (occluded_probabilities.view(-1) >= 0.5).to(dtype=torch.long)
+    full_margin = correct_class_margin(full_logits, labels)
+    occluded_margin = correct_class_margin(occluded_logits, labels)
+    full_losses = per_example_bce_loss(full_logits, labels)
+    occluded_losses = per_example_bce_loss(occluded_logits, labels)
+    full_correct_probabilities = correct_class_probability(full_probabilities, labels)
+    occluded_correct_probabilities = correct_class_probability(occluded_probabilities, labels)
+
+    rows: list[OcclusionRow] = []
+    for index, label in enumerate(labels.tolist()):
+        path = str(batch["path"][index])
+        class_name = str(batch["class_name"][index])
+        split = str(batch.get("split", [split_name] * len(labels))[index])
+        rows.append(
+            OcclusionRow(
+                path=path,
+                class_name=class_name,
+                label=int(label),
+                full_prediction=int(full_predictions[index].item()),
+                occluded_prediction=int(occluded_predictions[index].item()),
+                full_probability=float(full_probabilities[index].item()),
+                occluded_probability=float(occluded_probabilities[index].item()),
+                split=split,
+                generator_id=infer_prediction_generator(path, class_name),
+                modality_removed=modality_removed,
+                full_logit=float(full_logits[index].item()),
+                occluded_logit=float(occluded_logits[index].item()),
+                delta_margin=float((full_margin[index] - occluded_margin[index]).item()),
+                delta_loss=float((occluded_losses[index] - full_losses[index]).item()),
+                delta_probability=float(
+                    (full_probabilities[index] - occluded_probabilities[index]).item()
+                ),
+                delta_correct_probability=float(
+                    (
+                        full_correct_probabilities[index] - occluded_correct_probabilities[index]
+                    ).item()
+                ),
+                prediction_flipped=bool(
+                    full_predictions[index].item() != occluded_predictions[index].item()
+                ),
+            )
+        )
+    return rows
+
+
+def run_occlusion_eval(
+    model: BinaryFusionClassifier,
+    loader: DataLoader[dict[str, Any]],
+    modalities: Sequence[str],
+    split_name: str,
+) -> list[OcclusionRow]:
+    device = model_device(model)
+    rows: list[OcclusionRow] = []
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            full_output = model(move_tensor_batch_to_device(batch, device))
+            full_logits = full_output.logits.detach().cpu()
+            for modality in modalities:
+                occluded_batch = {**batch, "dropped_modalities": (modality,)}
+                occluded_output = model(move_tensor_batch_to_device(occluded_batch, device))
+                rows.extend(
+                    build_occlusion_rows(
+                        batch=batch,
+                        modality_removed=modality,
+                        full_logits=full_logits,
+                        occluded_logits=occluded_output.logits,
+                        split_name=split_name,
+                    )
+                )
+    return rows
+
+
+def occlusion_skip_reason(modalities: Sequence[str], enabled: bool) -> str | None:
+    if not enabled:
+        return None
+    if len(modalities) <= 1:
+        return "requires_at_least_two_modalities"
+    return None
 
 
 def append_diagnostic_rows(
@@ -2458,6 +2605,159 @@ def write_diagnostic_summary(path: Path, rows: Sequence[Mapping[str, Any]]) -> N
             )
 
 
+def write_occlusion_rows(path: Path, rows: Sequence[OcclusionRow]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "path",
+                "class_name",
+                "label",
+                "full_prediction",
+                "occluded_prediction",
+                "full_probability",
+                "occluded_probability",
+                "split",
+                "generator_id",
+                "modality_removed",
+                "full_logit",
+                "occluded_logit",
+                "delta_margin",
+                "delta_loss",
+                "delta_probability",
+                "delta_correct_probability",
+                "prediction_flipped",
+            ),
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    "path": row.path,
+                    "class_name": row.class_name,
+                    "label": row.label,
+                    "full_prediction": row.full_prediction,
+                    "occluded_prediction": row.occluded_prediction,
+                    "full_probability": f"{row.full_probability:.8f}",
+                    "occluded_probability": f"{row.occluded_probability:.8f}",
+                    "split": row.split,
+                    "generator_id": row.generator_id,
+                    "modality_removed": row.modality_removed,
+                    "full_logit": f"{row.full_logit:.8f}",
+                    "occluded_logit": f"{row.occluded_logit:.8f}",
+                    "delta_margin": f"{row.delta_margin:.8f}",
+                    "delta_loss": f"{row.delta_loss:.8f}",
+                    "delta_probability": f"{row.delta_probability:.8f}",
+                    "delta_correct_probability": f"{row.delta_correct_probability:.8f}",
+                    "prediction_flipped": int(row.prediction_flipped),
+                }
+            )
+
+
+def summarize_occlusion_rows(rows: Sequence[OcclusionRow]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        correctness = "correct" if row.label == row.full_prediction else "incorrect"
+        key = (row.split, row.class_name, correctness, row.generator_id, row.modality_removed)
+        group = groups.setdefault(
+            key,
+            {
+                "split": row.split,
+                "class_name": row.class_name,
+                "correctness": correctness,
+                "generator_id": row.generator_id,
+                "modality_removed": row.modality_removed,
+                "count": 0,
+                "delta_margin_sum": 0.0,
+                "abs_delta_margin_sum": 0.0,
+                "delta_loss_sum": 0.0,
+                "delta_probability_sum": 0.0,
+                "delta_correct_probability_sum": 0.0,
+                "prediction_flip_count": 0,
+            },
+        )
+        group["count"] += 1
+        group["delta_margin_sum"] += row.delta_margin
+        group["abs_delta_margin_sum"] += abs(row.delta_margin)
+        group["delta_loss_sum"] += row.delta_loss
+        group["delta_probability_sum"] += row.delta_probability
+        group["delta_correct_probability_sum"] += row.delta_correct_probability
+        group["prediction_flip_count"] += int(row.prediction_flipped)
+
+    summaries = []
+    for group in groups.values():
+        count = int(group["count"])
+        summaries.append(
+            {
+                "split": group["split"],
+                "class_name": group["class_name"],
+                "correctness": group["correctness"],
+                "generator_id": group["generator_id"],
+                "modality_removed": group["modality_removed"],
+                "count": count,
+                "mean_delta_margin": group["delta_margin_sum"] / count,
+                "mean_abs_delta_margin": group["abs_delta_margin_sum"] / count,
+                "mean_delta_loss": group["delta_loss_sum"] / count,
+                "mean_delta_probability": group["delta_probability_sum"] / count,
+                "mean_delta_correct_probability": (group["delta_correct_probability_sum"] / count),
+                "prediction_flip_rate": group["prediction_flip_count"] / count,
+            }
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (
+            item["split"],
+            item["class_name"],
+            item["correctness"],
+            item["generator_id"],
+            -float(item["mean_abs_delta_margin"]),
+            item["modality_removed"],
+        ),
+    )
+
+
+def write_occlusion_summary(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "split",
+                "class_name",
+                "correctness",
+                "generator_id",
+                "modality_removed",
+                "count",
+                "mean_delta_margin",
+                "mean_abs_delta_margin",
+                "mean_delta_loss",
+                "mean_delta_probability",
+                "mean_delta_correct_probability",
+                "prediction_flip_rate",
+            ),
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    **row,
+                    "mean_delta_margin": f"{float(row['mean_delta_margin']):.8f}",
+                    "mean_abs_delta_margin": f"{float(row['mean_abs_delta_margin']):.8f}",
+                    "mean_delta_loss": f"{float(row['mean_delta_loss']):.8f}",
+                    "mean_delta_probability": f"{float(row['mean_delta_probability']):.8f}",
+                    "mean_delta_correct_probability": (
+                        f"{float(row['mean_delta_correct_probability']):.8f}"
+                    ),
+                    "prediction_flip_rate": f"{float(row['prediction_flip_rate']):.8f}",
+                }
+            )
+
+
 def run_training_round(
     args: argparse.Namespace,
     config: Mapping[str, Any],
@@ -2645,6 +2945,36 @@ def run_training_round(
     diagnostic_summary_rows = summarize_diagnostic_rows(diagnostic_rows)
     write_diagnostics(output_dir / "diagnostics.csv", diagnostic_rows)
     write_diagnostic_summary(output_dir / "diagnostics_summary.csv", diagnostic_summary_rows)
+    occlusion_rows: list[OcclusionRow] = []
+    occlusion_summary_rows: list[dict[str, Any]] = []
+    occlusion_skipped_reason = occlusion_skip_reason(modalities, args.occlusion_diagnostics)
+    if args.occlusion_diagnostics and occlusion_skipped_reason is None:
+        split_loaders = {
+            "train": train_loader,
+            "val": val_loader,
+            "test": test_loader,
+        }
+        for split_name in args.occlusion_splits:
+            occlusion_rows.extend(
+                run_occlusion_eval(
+                    model=model,
+                    loader=split_loaders[str(split_name)],
+                    modalities=modalities,
+                    split_name=str(split_name),
+                )
+            )
+        occlusion_summary_rows = summarize_occlusion_rows(occlusion_rows)
+        write_occlusion_rows(output_dir / "occlusion.csv", occlusion_rows)
+        write_occlusion_summary(
+            output_dir / "occlusion_summary.csv",
+            occlusion_summary_rows,
+        )
+        print(
+            "occlusion: "
+            f"splits={','.join(str(split) for split in args.occlusion_splits)} "
+            f"modalities={modality_set_name(modalities)} rows={len(occlusion_rows)}",
+            flush=True,
+        )
     summary = {
         "modalities": list(modalities),
         "train_count": len(train_examples),
@@ -2680,6 +3010,12 @@ def run_training_round(
         "diagnostics_summary_csv": None
         if not diagnostic_summary_rows
         else str(output_dir / "diagnostics_summary.csv"),
+        "occlusion_csv": None if not occlusion_rows else str(output_dir / "occlusion.csv"),
+        "occlusion_summary_csv": None
+        if not occlusion_summary_rows
+        else str(output_dir / "occlusion_summary.csv"),
+        "occlusion_splits": list(args.occlusion_splits) if args.occlusion_diagnostics else [],
+        "occlusion_skipped_reason": occlusion_skipped_reason,
         "best_checkpoint": str(best_path),
     }
     write_json(output_dir / "summary.json", summary)
