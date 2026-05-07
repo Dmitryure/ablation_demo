@@ -32,4 +32,5 @@ logs
 reports/
 models/
 example.sh
-task.sh
+cache_decode_test/
+task*.sh

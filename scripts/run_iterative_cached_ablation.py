@@ -33,17 +33,16 @@ from dataset import (
 )
 from feature_cache import (
     CachedFeatureDataset,
-    FeatureCacheShardWriter,
     FeatureCacheSpec,
-    append_feature_cache_failure,
     build_feature_cache_specs,
     collate_cached_feature_batch,
     feature_cache_item_exists,
     feature_cache_spec_dir,
     feature_cache_spec_id,
-    load_feature_cache_shard_index,
+    metadata_filename_for_example,
     split_feature_batch,
     write_feature_cache_item,
+    write_feature_cache_manifest,
 )
 from pipeline import build_fusion_pipeline, load_pipeline_yaml
 from task_models import BinaryFusionClassifier, build_binary_fusion_classifier
@@ -207,7 +206,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--extract-batch-size", type=int, default=1)
+    parser.add_argument("--extract-batch-size", type=int, default=4)
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -286,6 +285,23 @@ def parse_args() -> argparse.Namespace:
         help="Initialize each train-count round from the previous round checkpoint for the same modality set.",
     )
     parser.add_argument("--skip-failures", action="store_true")
+    parser.add_argument(
+        "--video-decode-mode",
+        choices=("seek", "scan"),
+        default="scan",
+        help="Use random frame seeks or sequential video scan when sampling frames.",
+    )
+    parser.add_argument(
+        "--clip-cache-dir",
+        type=Path,
+        default=None,
+        help="Decoded clip cache directory. Defaults to <cache-dir>/_clips.",
+    )
+    parser.add_argument(
+        "--no-clip-cache",
+        action="store_true",
+        help="Disable decoded clip cache and decode videos directly.",
+    )
     parser.add_argument("--sanity-count", type=int, default=300)
     parser.add_argument("--no-sanity-check", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1691,89 +1707,7 @@ def cache_score_summary(
 
 
 def cache_key_for_example(example: VideoExample, dataset_root: Path) -> str:
-    path = example.path.resolve()
-    root = dataset_root.resolve()
-    try:
-        return str(path.relative_to(root))
-    except ValueError:
-        return str(path)
-
-
-def metadata_matches_example(
-    metadata: Mapping[str, Any],
-    example: VideoExample,
-    spec: FeatureCacheSpec,
-    dataset_root: Path,
-) -> bool:
-    if metadata.get("spec_id") != feature_cache_spec_id(spec):
-        return False
-    video = metadata.get("video")
-    if not isinstance(video, Mapping):
-        return False
-    if str(video.get("relative_path", "")) != cache_key_for_example(example, dataset_root):
-        return False
-    try:
-        stat = example.path.stat()
-    except OSError:
-        return False
-    return int(video.get("size", -1)) == int(stat.st_size) and int(
-        video.get("mtime_ns", -1)
-    ) == int(stat.st_mtime_ns)
-
-
-def cached_example_keys_for_modality(
-    examples_by_cache_key: Mapping[str, VideoExample],
-    cache_dir: Path,
-    spec: FeatureCacheSpec,
-    dataset_root: Path,
-    progress_every: int | None = None,
-) -> set[str]:
-    spec_dir = feature_cache_spec_dir(cache_dir, spec)
-    if not spec_dir.is_dir():
-        return set()
-    cached_keys: set[str] = set()
-    for key, record in load_feature_cache_shard_index(cache_dir, spec).items():
-        example = examples_by_cache_key.get(key)
-        if example is None:
-            continue
-        metadata = {
-            "spec_id": record.get("spec_id"),
-            "video": {
-                "relative_path": record.get("relative_path"),
-                "size": record.get("size"),
-                "mtime_ns": record.get("mtime_ns"),
-            },
-        }
-        if metadata_matches_example(metadata, example, spec, dataset_root):
-            cached_keys.add(key)
-    checked = 0
-    start = time.perf_counter()
-    for metadata_path in spec_dir.glob("*.json"):
-        checked += 1
-        try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(metadata, Mapping):
-            continue
-        video = metadata.get("video")
-        if not isinstance(video, Mapping):
-            continue
-        key = str(video.get("relative_path", ""))
-        example = examples_by_cache_key.get(key)
-        if example is None:
-            continue
-        if metadata_matches_example(metadata, example, spec, dataset_root):
-            cached_keys.add(key)
-        if progress_every is not None and checked % progress_every == 0:
-            elapsed = time.perf_counter() - start
-            print(
-                f"cache selection: modality={spec.modality} "
-                f"metadata_checked={checked} matched={len(cached_keys)} "
-                f"elapsed={elapsed:.1f}s cache_from={spec_dir} spec_id={feature_cache_spec_id(spec)}",
-                flush=True,
-            )
-    return cached_keys
+    return f"{example.class_name}/{metadata_filename_for_example(example, dataset_root)}"
 
 
 def select_fully_cached_examples(
@@ -1784,9 +1718,6 @@ def select_fully_cached_examples(
     dataset_root: Path,
     progress_every: int | None = None,
 ) -> tuple[list[VideoExample], dict[str, int]]:
-    examples_by_cache_key = {
-        cache_key_for_example(example, dataset_root): example for example in examples
-    }
     cached_key_sets: dict[str, set[str]] = {}
     for modality in modalities:
         spec = specs[modality]
@@ -1797,13 +1728,17 @@ def select_fully_cached_examples(
             f"cache_from={spec_dir} spec_id={spec_id}",
             flush=True,
         )
-        cached_key_sets[modality] = cached_example_keys_for_modality(
-            examples_by_cache_key=examples_by_cache_key,
-            cache_dir=cache_dir,
-            spec=spec,
-            dataset_root=dataset_root,
-            progress_every=progress_every,
-        )
+        cached_keys: set[str] = set()
+        for index, example in enumerate(examples, start=1):
+            if feature_cache_item_exists(cache_dir, example, spec, dataset_root):
+                cached_keys.add(cache_key_for_example(example, dataset_root))
+            if progress_every is not None and index % progress_every == 0:
+                print(
+                    f"cache selection: modality={modality} checked={index} "
+                    f"matched={len(cached_keys)} cache_from={spec_dir} spec_id={spec_id}",
+                    flush=True,
+                )
+        cached_key_sets[modality] = cached_keys
         print(
             f"cache selection: modality={modality} matched={len(cached_key_sets[modality])} "
             f"cache_from={spec_dir} spec_id={spec_id}",
@@ -1963,13 +1898,17 @@ def build_raw_feature_batch(
     modalities: Sequence[str],
     frame_count: int,
     image_size: int,
-    video_decode_mode: str = "seek",
+    video_decode_mode: str = "scan",
+    clip_cache_dir: Path | None = None,
+    dataset_root: Path | None = None,
 ) -> dict[str, Any]:
     dataset = LabeledVideoDataset(
         examples=examples,
         num_frames=dict.fromkeys(modalities, frame_count),
         image_size=image_size,
         decode_mode=video_decode_mode,
+        clip_cache_dir=clip_cache_dir,
+        dataset_root=dataset_root,
     )
     return collate_labeled_video_batch([dataset[index] for index in range(len(dataset))])
 
@@ -1992,14 +1931,6 @@ def append_cache_failure(
         }
     )
     progress[spec.modality]["failed"] += 1
-    if cache_dir is not None:
-        append_feature_cache_failure(
-            cache_dir=cache_dir,
-            example=example,
-            spec=spec,
-            error=str(exc),
-            dataset_root=dataset_root,
-        )
 
 
 def write_cached_feature_items(
@@ -2012,23 +1943,18 @@ def write_cached_feature_items(
     missing_sets: Mapping[str, set[VideoExample]],
     dataset_root: Path,
     progress: dict[str, Any],
-    shard_writers: Mapping[str, FeatureCacheShardWriter] | None = None,
 ) -> None:
     for example, item in zip(examples, split_feature_batch(feature_batch, raw_batch), strict=True):
         for modality in modalities:
             if example not in missing_sets[modality]:
                 continue
-            writer = None if shard_writers is None else shard_writers.get(modality)
-            if writer is None:
-                write_feature_cache_item(
-                    cache_dir=cache_dir,
-                    example=example,
-                    spec=specs[modality],
-                    item=item,
-                    dataset_root=dataset_root,
-                )
-            else:
-                writer.write(example, item)
+            write_feature_cache_item(
+                cache_dir=cache_dir,
+                example=example,
+                spec=specs[modality],
+                item=item,
+                dataset_root=dataset_root,
+            )
             progress[modality]["written"] += 1
 
 
@@ -2073,8 +1999,8 @@ def cache_single_modality_example(
     progress: dict[str, Any],
     failure_rows: list[dict[str, Any]],
     fallback_pipelines: dict[str, Any],
-    shard_writer: FeatureCacheShardWriter | None = None,
-    video_decode_mode: str = "seek",
+    video_decode_mode: str = "scan",
+    clip_cache_dir: Path | None = None,
 ) -> None:
     modality = spec.modality
     build_result = fallback_pipelines.get(modality)
@@ -2089,6 +2015,8 @@ def cache_single_modality_example(
             frame_count=spec.frame_count,
             image_size=spec.image_size,
             video_decode_mode=video_decode_mode,
+            clip_cache_dir=clip_cache_dir,
+            dataset_root=dataset_root,
         )
         feature_batch = build_result.pipeline.prepare_features(raw_batch)
         update_cache_timing_progress(
@@ -2098,16 +2026,13 @@ def cache_single_modality_example(
             modalities=(modality,),
         )
         item = split_feature_batch(feature_batch, raw_batch)[0]
-        if shard_writer is None:
-            write_feature_cache_item(
-                cache_dir=cache_dir,
-                example=example,
-                spec=spec,
-                item=item,
-                dataset_root=dataset_root,
-            )
-        else:
-            shard_writer.write(example, item)
+        write_feature_cache_item(
+            cache_dir=cache_dir,
+            example=example,
+            spec=spec,
+            item=item,
+            dataset_root=dataset_root,
+        )
         progress[modality]["written"] += 1
     except Exception as exc:
         print(
@@ -2241,8 +2166,8 @@ def cache_feature_batch_or_fallback(
     chunk_count: int,
     group_name: str,
     label: str,
-    shard_writers: Mapping[str, FeatureCacheShardWriter] | None = None,
-    video_decode_mode: str = "seek",
+    video_decode_mode: str = "scan",
+    clip_cache_dir: Path | None = None,
 ) -> None:
     try:
         raw_batch = build_raw_feature_batch(
@@ -2251,6 +2176,8 @@ def cache_feature_batch_or_fallback(
             frame_count=frame_count,
             image_size=image_size,
             video_decode_mode=video_decode_mode,
+            clip_cache_dir=clip_cache_dir,
+            dataset_root=dataset_root,
         )
         feature_batch = build_result.pipeline.prepare_features(raw_batch)
         update_cache_timing_progress(
@@ -2269,7 +2196,6 @@ def cache_feature_batch_or_fallback(
             missing_sets=missing_sets,
             dataset_root=dataset_root,
             progress=progress,
-            shard_writers=shard_writers,
         )
     except Exception as exc:
         print(
@@ -2290,8 +2216,8 @@ def cache_feature_batch_or_fallback(
                     progress=progress,
                     failure_rows=failure_rows,
                     fallback_pipelines=fallback_pipelines,
-                    shard_writer=None if shard_writers is None else shard_writers.get(modality),
                     video_decode_mode=video_decode_mode,
+                    clip_cache_dir=clip_cache_dir,
                 )
 
 
@@ -2354,27 +2280,13 @@ def cache_feature_group(
     fallback_pipelines: dict[str, Any],
     label: str,
     progress_bar: bool,
-    cache_format: str = "files",
-    shard_size: int = 256,
-    video_decode_mode: str = "seek",
+    video_decode_mode: str = "scan",
+    clip_cache_dir: Path | None = None,
 ) -> None:
     start = time.perf_counter()
     group_name = ",".join(group_modalities)
     build_result = build_fusion_pipeline(config=config, modalities=group_modalities)
     build_result.pipeline.eval()
-    shard_writers: dict[str, FeatureCacheShardWriter] = {}
-    if cache_format == "shards":
-        shard_writers = {
-            modality: FeatureCacheShardWriter(
-                cache_dir=cache_dir,
-                spec=specs[modality],
-                dataset_root=dataset_root,
-                shard_size=shard_size,
-            )
-            for modality in group_modalities
-        }
-    elif cache_format != "files":
-        raise ValueError(f"Unsupported cache format: {cache_format}")
     missing_sets = {modality: set(missing_by_modality[modality]) for modality in group_modalities}
     chunks = chunk_examples(group_examples, batch_size)
     progress_display = build_cache_progress_display(
@@ -2404,8 +2316,8 @@ def cache_feature_group(
                     chunk_count=len(chunks),
                     group_name=group_name,
                     label=label,
-                    shard_writers=shard_writers,
                     video_decode_mode=video_decode_mode,
+                    clip_cache_dir=clip_cache_dir,
                 )
                 update_cache_group_progress(
                     progress_display=progress_display,
@@ -2423,8 +2335,6 @@ def cache_feature_group(
     finally:
         if progress_display is not None:
             progress_display.close()
-        for writer in shard_writers.values():
-            writer.close()
         close_pipeline_result(build_result)
     elapsed = time.perf_counter() - start
     print(
@@ -2450,10 +2360,9 @@ def cache_missing_feature_groups(
     label: str,
     progress_bar: bool,
     group_by_modality: bool,
-    cache_format: str = "files",
-    shard_size: int = 256,
-    video_decode_mode: str = "seek",
-) -> None:
+    video_decode_mode: str = "scan",
+    clip_cache_dir: Path | None = None,
+) -> list[dict[str, Any]]:
     failure_rows: list[dict[str, Any]] = []
     fallback_pipelines: dict[str, Any] = {}
     try:
@@ -2489,14 +2398,14 @@ def cache_missing_feature_groups(
                 fallback_pipelines=fallback_pipelines,
                 label=label,
                 progress_bar=progress_bar,
-                cache_format=cache_format,
-                shard_size=shard_size,
                 video_decode_mode=video_decode_mode,
+                clip_cache_dir=clip_cache_dir,
             )
     finally:
         for build_result in fallback_pipelines.values():
             close_pipeline_result(build_result)
         append_failure_rows(cache_dir, failure_rows)
+    return failure_rows
 
 
 def ensure_feature_cache(
@@ -2514,9 +2423,8 @@ def ensure_feature_cache(
     progress_bar: bool = False,
     group_by_modality: bool = False,
     assume_missing_cache: bool = False,
-    cache_format: str = "files",
-    shard_size: int = 256,
-    video_decode_mode: str = "seek",
+    video_decode_mode: str = "scan",
+    clip_cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     progress_bar = progress_bar and sys.stderr.isatty()
@@ -2534,7 +2442,7 @@ def ensure_feature_cache(
         progress_bar=progress_bar,
         assume_missing_cache=assume_missing_cache,
     )
-    cache_missing_feature_groups(
+    failure_rows = cache_missing_feature_groups(
         examples=examples,
         cache_dir=cache_dir,
         specs=specs,
@@ -2548,10 +2456,24 @@ def ensure_feature_cache(
         label=label,
         progress_bar=progress_bar,
         group_by_modality=group_by_modality,
-        cache_format=cache_format,
-        shard_size=shard_size,
         video_decode_mode=video_decode_mode,
+        clip_cache_dir=clip_cache_dir,
     )
+    for modality in modalities:
+        spec = specs[modality]
+        errors = {
+            str(row["path"]): str(row.get("error", ""))
+            for row in failure_rows
+            if row.get("modality") == modality
+        }
+        manifest_path = write_feature_cache_manifest(
+            cache_dir=cache_dir,
+            examples=examples,
+            spec=spec,
+            dataset_root=dataset_root,
+            errors_by_path=errors,
+        )
+        print(f"cache {label}: wrote manifest {manifest_path}", flush=True)
     return progress
 
 
@@ -3304,6 +3226,7 @@ def main() -> None:
     dataset_root = args.dataset_root
     video_root = resolve_video_root(dataset_root)
     cache_dir = args.cache_dir or (dataset_root / "feature_cache")
+    clip_cache_dir = None if args.no_clip_cache else (args.clip_cache_dir or cache_dir / "_clips")
     output_dir = args.output_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
     base_modalities = resolve_base_modalities(config, args.modalities)
     modality_sets = build_modality_sets(base_modalities, args.modality_permutations)
@@ -3374,6 +3297,11 @@ def main() -> None:
     print(f"dataset_root={dataset_root}", flush=True)
     print(f"video_root={video_root}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
+    print(
+        f"clip_cache_dir={clip_cache_dir if clip_cache_dir is not None else '<disabled>'}",
+        flush=True,
+    )
+    print(f"video_decode_mode={args.video_decode_mode}", flush=True)
     print(f"modalities={','.join(base_modalities)}", flush=True)
     print(f"cached_loader={asdict(resolve_cached_loader_config(config))}", flush=True)
     print(
@@ -3439,6 +3367,9 @@ def main() -> None:
             "regularization": asdict(resolve_training_regularization_config(config, args)),
             "dataset_metadata": video_metadata_summary(manifest_examples),
             "spec_ids": {modality: feature_cache_spec_id(spec) for modality, spec in specs.items()},
+            "video_decode_mode": args.video_decode_mode,
+            "clip_cache_dir": None if clip_cache_dir is None else str(clip_cache_dir),
+            "clip_cache_enabled": clip_cache_dir is not None,
         },
     )
 
@@ -3454,6 +3385,8 @@ def main() -> None:
         skip_failures=args.skip_failures,
         progress_every=args.progress_every,
         label="eval",
+        video_decode_mode=args.video_decode_mode,
+        clip_cache_dir=clip_cache_dir,
     )
     write_json(output_dir / "eval_cache_progress.json", eval_progress)
     print(f"wrote: {output_dir / 'eval_cache_progress.json'}", flush=True)
@@ -3480,6 +3413,8 @@ def main() -> None:
             skip_failures=args.skip_failures,
             progress_every=args.progress_every,
             label=f"train_{target}",
+            video_decode_mode=args.video_decode_mode,
+            clip_cache_dir=clip_cache_dir,
         )
         write_json(round_dir / "cache_progress.json", cache_progress)
         print(f"wrote: {round_dir / 'cache_progress.json'}", flush=True)
@@ -3577,6 +3512,8 @@ def main() -> None:
             skip_failures=args.skip_failures,
             progress_every=args.progress_every,
             label="sanity",
+            video_decode_mode=args.video_decode_mode,
+            clip_cache_dir=clip_cache_dir,
         )
         write_json(output_dir / "sanity_cache_progress.json", sanity_progress)
         print(f"wrote: {output_dir / 'sanity_cache_progress.json'}", flush=True)

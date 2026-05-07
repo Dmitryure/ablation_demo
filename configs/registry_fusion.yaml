@@ -54,7 +54,7 @@ rppg:
 face_mesh:
   slot_count: 24
 depth:
-  model_id_or_path: depth-anything/Depth-Anything-V2-Small-hf
+  model_id_or_path: models/depth-anything-v2-small-hf
   feature_dim: 384
   slot_count: 4
 fft:

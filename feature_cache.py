@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import re
+import csv
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
-from functools import lru_cache
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import torch
@@ -15,10 +12,7 @@ from torch.utils.data import Dataset
 from dataset import VideoExample
 from frame_config import resolve_modality_frame_count
 
-FEATURE_CACHE_VERSION = 2
-FEATURE_CACHE_SHARD_INDEX = "index.jsonl"
-FEATURE_CACHE_SHARD_FAILURES = "failures.jsonl"
-FEATURE_CACHE_SHARD_DIR = "shards"
+FEATURE_CACHE_VERSION = 3
 SPEC_IGNORED_MODALITY_KEYS = frozenset({"frames", "slot_count"})
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOCAL_PATH_CONFIG_KEYS = frozenset({"checkpoint_path", "model_path"})
@@ -32,6 +26,18 @@ MODALITY_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
     "fft": ("fft_features",),
     "stft": ("stft_features",),
 }
+FEATURE_CACHE_MANIFEST = "manifest.csv"
+FEATURE_CACHE_MANIFEST_COLUMNS = (
+    "class_name",
+    "filename",
+    "generator_id",
+    "source_path",
+    "cache_path",
+    "modality",
+    "frame_count",
+    "status",
+    "error",
+)
 
 
 @dataclass(frozen=True)
@@ -105,54 +111,50 @@ def build_feature_cache_specs(
 
 
 def feature_cache_spec_id(spec: FeatureCacheSpec) -> str:
-    payload = json.dumps(asdict(spec), sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:16]
+    return f"{spec.modality}-frames_{spec.frame_count}"
 
 
-def _safe_stem(path: Path) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._")
-    return safe[:96] or "video"
-
-
-def _cache_key_path(example: VideoExample, dataset_root: str | Path | None) -> str:
-    path = example.path.resolve()
+def normalize_cache_dataset_root(dataset_root: str | Path | None) -> Path | None:
     if dataset_root is None:
-        return str(path)
-    root = Path(dataset_root).resolve()
-    try:
-        return str(path.relative_to(root))
-    except ValueError:
-        return str(path)
+        return None
+    root = Path(dataset_root)
+    videos_root = root / "videos"
+    if videos_root.is_dir():
+        return videos_root
+    return root
 
 
-def video_cache_record(
+def _validate_metadata_filename(filename: str) -> str:
+    path = PurePosixPath(filename)
+    if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+        raise ValueError(f"Invalid metadata filename for cache: {filename!r}")
+    return path.as_posix()
+
+
+def metadata_filename_for_example(
     example: VideoExample,
     dataset_root: str | Path | None = None,
-) -> dict[str, Any]:
-    stat = example.path.stat()
-    return {
-        "relative_path": _cache_key_path(example, dataset_root),
-        "size": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
-    }
+) -> str:
+    if example.metadata_filename:
+        return _validate_metadata_filename(example.metadata_filename)
+    root = normalize_cache_dataset_root(dataset_root)
+    if root is None:
+        return _validate_metadata_filename(example.path.name)
+    class_root = (root / example.class_name).resolve()
+    try:
+        return _validate_metadata_filename(
+            example.path.resolve().relative_to(class_root).as_posix()
+        )
+    except ValueError:
+        return _validate_metadata_filename(example.path.name)
 
 
 def feature_cache_spec_dir(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
-    return (
-        Path(cache_dir) / spec.modality / f"frames_{spec.frame_count}" / feature_cache_spec_id(spec)
-    )
+    return Path(cache_dir) / spec.modality / f"frames_{spec.frame_count}"
 
 
-def feature_cache_shard_dir(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
-    return feature_cache_spec_dir(cache_dir, spec) / FEATURE_CACHE_SHARD_DIR
-
-
-def feature_cache_shard_index_path(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
-    return feature_cache_spec_dir(cache_dir, spec) / FEATURE_CACHE_SHARD_INDEX
-
-
-def feature_cache_shard_failures_path(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
-    return feature_cache_spec_dir(cache_dir, spec) / FEATURE_CACHE_SHARD_FAILURES
+def feature_cache_manifest_path(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
+    return feature_cache_spec_dir(cache_dir, spec) / FEATURE_CACHE_MANIFEST
 
 
 def feature_cache_item_path(
@@ -161,27 +163,8 @@ def feature_cache_item_path(
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None = None,
 ) -> Path:
-    cache_key = _cache_key_path(example, dataset_root)
-    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:20]
-    filename = f"{_safe_stem(example.path)}-{digest}.pt"
-    return feature_cache_spec_dir(cache_dir, spec) / filename
-
-
-def feature_cache_metadata_path(cache_path: str | Path) -> Path:
-    return Path(cache_path).with_suffix(".json")
-
-
-def feature_cache_metadata(
-    example: VideoExample,
-    spec: FeatureCacheSpec,
-    dataset_root: str | Path | None = None,
-) -> dict[str, Any]:
-    return {
-        "version": FEATURE_CACHE_VERSION,
-        "spec_id": feature_cache_spec_id(spec),
-        "spec": asdict(spec),
-        "video": video_cache_record(example, dataset_root=dataset_root),
-    }
+    filename = metadata_filename_for_example(example, dataset_root)
+    return feature_cache_spec_dir(cache_dir, spec) / example.class_name / f"{filename}.pt"
 
 
 def _feature_tensors_for_modality(
@@ -199,6 +182,20 @@ def _feature_tensors_for_modality(
     return features
 
 
+def feature_cache_payload_header(
+    example: VideoExample,
+    spec: FeatureCacheSpec,
+    dataset_root: str | Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": FEATURE_CACHE_VERSION,
+        "class_name": example.class_name,
+        "filename": metadata_filename_for_example(example, dataset_root),
+        "modality": spec.modality,
+        "frame_count": spec.frame_count,
+    }
+
+
 def write_feature_cache_item(
     cache_dir: str | Path,
     example: VideoExample,
@@ -208,142 +205,16 @@ def write_feature_cache_item(
 ) -> Path:
     cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = feature_cache_metadata(example, spec, dataset_root=dataset_root)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
     torch.save(
         {
-            **metadata,
+            **feature_cache_payload_header(example, spec, dataset_root),
             "features": _feature_tensors_for_modality(item, spec.modality),
         },
-        cache_path,
+        tmp_path,
     )
-    feature_cache_metadata_path(cache_path).write_text(
-        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    tmp_path.replace(cache_path)
     return cache_path
-
-
-def _append_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-
-
-def _cache_index_row(
-    metadata: Mapping[str, Any],
-    spec: FeatureCacheSpec,
-    shard: str,
-    item_index: int,
-) -> dict[str, Any]:
-    video = metadata["video"]
-    return {
-        "relative_path": video["relative_path"],
-        "size": int(video["size"]),
-        "mtime_ns": int(video["mtime_ns"]),
-        "spec_id": feature_cache_spec_id(spec),
-        "modality": spec.modality,
-        "shard": shard,
-        "item": item_index,
-    }
-
-
-def append_feature_cache_failure(
-    cache_dir: str | Path,
-    example: VideoExample,
-    spec: FeatureCacheSpec,
-    error: str,
-    dataset_root: str | Path | None = None,
-) -> None:
-    metadata = feature_cache_metadata(example, spec, dataset_root=dataset_root)
-    video = metadata["video"]
-    _append_jsonl(
-        feature_cache_shard_failures_path(cache_dir, spec),
-        [
-            {
-                "relative_path": video["relative_path"],
-                "size": int(video["size"]),
-                "mtime_ns": int(video["mtime_ns"]),
-                "spec_id": feature_cache_spec_id(spec),
-                "modality": spec.modality,
-                "error": error,
-            }
-        ],
-    )
-
-
-class FeatureCacheShardWriter:
-    def __init__(
-        self,
-        cache_dir: str | Path,
-        spec: FeatureCacheSpec,
-        dataset_root: str | Path | None = None,
-        shard_size: int = 256,
-    ) -> None:
-        if shard_size <= 0:
-            raise ValueError("`shard_size` must be positive.")
-        self.cache_dir = Path(cache_dir)
-        self.spec = spec
-        self.dataset_root = Path(dataset_root) if dataset_root is not None else None
-        self.shard_size = int(shard_size)
-        self._items: list[dict[str, Any]] = []
-        self._index_rows: list[dict[str, Any]] = []
-        self._next_shard_id = self._infer_next_shard_id()
-
-    def _infer_next_shard_id(self) -> int:
-        shard_dir = feature_cache_shard_dir(self.cache_dir, self.spec)
-        max_id = -1
-        if shard_dir.is_dir():
-            for path in shard_dir.glob("*.pt"):
-                try:
-                    max_id = max(max_id, int(path.stem))
-                except ValueError:
-                    continue
-        return max_id + 1
-
-    def write(self, example: VideoExample, item: Mapping[str, Any]) -> None:
-        metadata = feature_cache_metadata(example, self.spec, dataset_root=self.dataset_root)
-        features = _feature_tensors_for_modality(item, self.spec.modality)
-        item_index = len(self._items)
-        self._items.append({"video": metadata["video"], "features": features})
-        self._index_rows.append(
-            _cache_index_row(
-                metadata=metadata,
-                spec=self.spec,
-                shard=f"{FEATURE_CACHE_SHARD_DIR}/{self._next_shard_id:06d}.pt",
-                item_index=item_index,
-            )
-        )
-        if len(self._items) >= self.shard_size:
-            self.flush()
-
-    def flush(self) -> None:
-        if not self._items:
-            return
-        shard_dir = feature_cache_shard_dir(self.cache_dir, self.spec)
-        shard_dir.mkdir(parents=True, exist_ok=True)
-        shard_name = f"{self._next_shard_id:06d}.pt"
-        shard_path = shard_dir / shard_name
-        tmp_path = shard_path.with_suffix(".tmp")
-        torch.save(
-            {
-                "version": FEATURE_CACHE_VERSION,
-                "spec_id": feature_cache_spec_id(self.spec),
-                "spec": asdict(self.spec),
-                "items": self._items,
-            },
-            tmp_path,
-        )
-        tmp_path.replace(shard_path)
-        _append_jsonl(feature_cache_shard_index_path(self.cache_dir, self.spec), self._index_rows)
-        self._items = []
-        self._index_rows = []
-        self._next_shard_id += 1
-
-    def close(self) -> None:
-        self.flush()
 
 
 def _payload_matches_example(
@@ -352,129 +223,8 @@ def _payload_matches_example(
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None,
 ) -> bool:
-    if payload.get("version") != FEATURE_CACHE_VERSION:
-        return False
-    if payload.get("spec_id") != feature_cache_spec_id(spec):
-        return False
-    stored = payload.get("video")
-    if not isinstance(stored, Mapping):
-        return False
-    current = video_cache_record(example, dataset_root=dataset_root)
-    return (
-        stored.get("relative_path") == current["relative_path"]
-        and stored.get("size") == current["size"]
-        and stored.get("mtime_ns") == current["mtime_ns"]
-    )
-
-
-def _index_record_matches_example(
-    record: Mapping[str, Any],
-    example: VideoExample,
-    spec: FeatureCacheSpec,
-    dataset_root: str | Path | None,
-) -> bool:
-    if record.get("spec_id") != feature_cache_spec_id(spec):
-        return False
-    current = video_cache_record(example, dataset_root=dataset_root)
-    return (
-        record.get("relative_path") == current["relative_path"]
-        and int(record.get("size", -1)) == current["size"]
-        and int(record.get("mtime_ns", -1)) == current["mtime_ns"]
-    )
-
-
-@lru_cache(maxsize=128)
-def _load_shard_index_cached(
-    index_path: str,
-    mtime_ns: int,
-    size: int,
-) -> dict[str, dict[str, Any]]:
-    del mtime_ns, size
-    records: dict[str, dict[str, Any]] = {}
-    path = Path(index_path)
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, Mapping):
-                    continue
-                key = str(record.get("relative_path", ""))
-                if key:
-                    records[key] = dict(record)
-    except OSError:
-        return {}
-    return records
-
-
-def load_feature_cache_shard_index(
-    cache_dir: str | Path,
-    spec: FeatureCacheSpec,
-) -> dict[str, dict[str, Any]]:
-    index_path = feature_cache_shard_index_path(cache_dir, spec)
-    try:
-        stat = index_path.stat()
-    except OSError:
-        return {}
-    return _load_shard_index_cached(str(index_path), int(stat.st_mtime_ns), int(stat.st_size))
-
-
-def _load_sharded_feature_cache_item(
-    cache_dir: str | Path,
-    example: VideoExample,
-    spec: FeatureCacheSpec,
-    dataset_root: str | Path | None = None,
-) -> dict[str, torch.Tensor] | None:
-    key = _cache_key_path(example, dataset_root)
-    record = load_feature_cache_shard_index(cache_dir, spec).get(key)
-    if record is None or not _index_record_matches_example(record, example, spec, dataset_root):
-        return None
-    shard = record.get("shard")
-    item_index = record.get("item")
-    if not isinstance(shard, str):
-        return None
-    try:
-        item_index = int(item_index)
-    except (TypeError, ValueError):
-        return None
-    shard_path = feature_cache_spec_dir(cache_dir, spec) / shard
-    if not shard_path.exists():
-        return None
-    payload = torch.load(shard_path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, Mapping):
-        return None
-    if payload.get("version") != FEATURE_CACHE_VERSION:
-        return None
-    if payload.get("spec_id") != feature_cache_spec_id(spec):
-        return None
-    items = payload.get("items")
-    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
-        return None
-    if item_index < 0 or item_index >= len(items):
-        return None
-    item = items[item_index]
-    if not isinstance(item, Mapping):
-        return None
-    item_metadata = {
-        "version": FEATURE_CACHE_VERSION,
-        "spec_id": feature_cache_spec_id(spec),
-        "video": item.get("video"),
-    }
-    if not _payload_matches_example(item_metadata, example, spec, dataset_root):
-        return None
-    features = item.get("features")
-    if not isinstance(features, Mapping):
-        return None
-    result = {str(key): value for key, value in features.items() if isinstance(value, torch.Tensor)}
-    required_key = MODALITY_FEATURE_KEYS[spec.modality][0]
-    if required_key not in result:
-        return None
-    return result
+    expected = feature_cache_payload_header(example, spec, dataset_root)
+    return all(payload.get(key) == value for key, value in expected.items())
 
 
 def load_feature_cache_item(
@@ -484,33 +234,19 @@ def load_feature_cache_item(
     dataset_root: str | Path | None = None,
 ) -> dict[str, torch.Tensor] | None:
     cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
-    if cache_path.exists():
-        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-        if isinstance(payload, Mapping) and _payload_matches_example(
-            payload, example, spec, dataset_root
-        ):
-            features = payload.get("features")
-            if isinstance(features, Mapping):
-                result = {
-                    str(key): value
-                    for key, value in features.items()
-                    if isinstance(value, torch.Tensor)
-                }
-                required_key = MODALITY_FEATURE_KEYS[spec.modality][0]
-                if required_key in result:
-                    return result
-    return _load_sharded_feature_cache_item(cache_dir, example, spec, dataset_root=dataset_root)
-
-
-def _load_feature_cache_metadata(cache_path: Path) -> Mapping[str, Any] | None:
-    metadata_path = feature_cache_metadata_path(cache_path)
-    if not metadata_path.exists():
+    if not cache_path.exists():
         return None
-    try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping) or not _payload_matches_example(
+        payload, example, spec, dataset_root
+    ):
         return None
-    return payload if isinstance(payload, Mapping) else None
+    features = payload.get("features")
+    if not isinstance(features, Mapping):
+        return None
+    result = {str(key): value for key, value in features.items() if isinstance(value, torch.Tensor)}
+    required_key = MODALITY_FEATURE_KEYS[spec.modality][0]
+    return result if required_key in result else None
 
 
 def feature_cache_item_exists(
@@ -519,16 +255,78 @@ def feature_cache_item_exists(
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None = None,
 ) -> bool:
+    return feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root).exists()
+
+
+def feature_cache_generator_id(
+    example: VideoExample, dataset_root: str | Path | None = None
+) -> str:
+    if example.class_name == "real":
+        return example.generator_id or "real"
+    if example.generator_id:
+        return example.generator_id
+    filename = metadata_filename_for_example(example, dataset_root)
+    parts = PurePosixPath(filename).parts
+    return parts[0] if len(parts) > 1 else ""
+
+
+def feature_cache_manifest_row(
+    cache_dir: str | Path,
+    example: VideoExample,
+    spec: FeatureCacheSpec,
+    dataset_root: str | Path | None,
+    status: str,
+    error: str = "",
+) -> dict[str, Any]:
     cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
-    if cache_path.exists():
-        metadata = _load_feature_cache_metadata(cache_path)
-        if metadata is not None:
-            return _payload_matches_example(metadata, example, spec, dataset_root)
-        if load_feature_cache_item(cache_dir, example, spec, dataset_root=dataset_root) is not None:
-            return True
-    key = _cache_key_path(example, dataset_root)
-    record = load_feature_cache_shard_index(cache_dir, spec).get(key)
-    return record is not None and _index_record_matches_example(record, example, spec, dataset_root)
+    return {
+        "class_name": example.class_name,
+        "filename": metadata_filename_for_example(example, dataset_root),
+        "generator_id": feature_cache_generator_id(example, dataset_root),
+        "source_path": str(example.path),
+        "cache_path": str(cache_path),
+        "modality": spec.modality,
+        "frame_count": spec.frame_count,
+        "status": status,
+        "error": error,
+    }
+
+
+def write_feature_cache_manifest(
+    cache_dir: str | Path,
+    examples: Sequence[VideoExample],
+    spec: FeatureCacheSpec,
+    dataset_root: str | Path | None,
+    errors_by_path: Mapping[str, str] | None = None,
+) -> Path:
+    errors = errors_by_path or {}
+    rows: list[dict[str, Any]] = []
+    for example in examples:
+        error = errors.get(str(example.path), "")
+        cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
+        if cache_path.exists():
+            status = "cached"
+        elif error:
+            status = "failed"
+        else:
+            status = "missing"
+        rows.append(
+            feature_cache_manifest_row(
+                cache_dir=cache_dir,
+                example=example,
+                spec=spec,
+                dataset_root=dataset_root,
+                status=status,
+                error=error,
+            )
+        )
+    path = feature_cache_manifest_path(cache_dir, spec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FEATURE_CACHE_MANIFEST_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
 
 
 def split_feature_batch(
@@ -546,6 +344,7 @@ def split_feature_batch(
             "split": raw_batch["split"][index],
             "class_name": raw_batch["class_name"][index],
             "identity_id": raw_batch["identity_id"][index],
+            "metadata_filename": raw_batch["metadata_filename"][index],
         }
         for key in ("generator_id", "source_id_kind", "age_bin", "gender", "ethnicity", "emotion"):
             if key in raw_batch:
@@ -572,7 +371,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
         self.spec_by_modality = dict(spec_by_modality)
         self.modalities = tuple(modalities)
         self.strict = strict
-        self.dataset_root = Path(dataset_root) if dataset_root is not None else None
+        self.dataset_root = normalize_cache_dataset_root(dataset_root)
 
     def __len__(self) -> int:
         return len(self.examples)
@@ -585,6 +384,7 @@ class CachedFeatureDataset(Dataset[dict[str, Any]]):
             "source_id": example.source_id,
             "split": example.split,
             "class_name": example.class_name,
+            "metadata_filename": metadata_filename_for_example(example, self.dataset_root),
             "identity_id": example.identity_id,
             "generator_id": example.generator_id,
             "source_id_kind": example.source_id_kind,

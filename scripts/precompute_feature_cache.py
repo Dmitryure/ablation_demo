@@ -62,7 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--extract-batch-size", type=int, default=1)
+    parser.add_argument("--extract-batch-size", type=int, default=4)
     parser.add_argument("--progress-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -115,22 +115,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--cache-format",
-        choices=("files", "shards"),
-        default="files",
-        help="Write one file per video, or write indexed shard files.",
-    )
-    parser.add_argument(
-        "--shard-size",
-        type=int,
-        default=256,
-        help="Videos per shard when --cache-format shards is used.",
-    )
-    parser.add_argument(
         "--video-decode-mode",
         choices=("seek", "scan"),
-        default="seek",
+        default="scan",
         help="Use random frame seeks or sequential video scan when sampling frames.",
+    )
+    parser.add_argument(
+        "--clip-cache-dir",
+        type=Path,
+        default=None,
+        help="Decoded clip cache directory. Defaults to <cache-dir>/_clips.",
+    )
+    parser.add_argument(
+        "--no-clip-cache",
+        action="store_true",
+        help="Disable decoded clip cache and decode videos directly.",
     )
     parser.add_argument(
         "--no-progress-bar",
@@ -397,6 +396,7 @@ def main() -> None:
     dataset_root = args.dataset_root
     video_root = resolve_video_root(dataset_root)
     cache_dir = args.cache_dir or (dataset_root / "feature_cache")
+    clip_cache_dir = None if args.no_clip_cache else (args.clip_cache_dir or cache_dir / "_clips")
     modalities = resolve_base_modalities(config, args.modalities)
     specs = build_feature_cache_specs(config, modalities)
     output_dir = args.output_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -422,6 +422,10 @@ def main() -> None:
     print(f"dataset_root={dataset_root}", flush=True)
     print(f"video_root={video_root}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
+    print(
+        f"clip_cache_dir={clip_cache_dir if clip_cache_dir is not None else '<disabled>'}",
+        flush=True,
+    )
     print(f"device={config['device']}", flush=True)
     print(f"modalities={','.join(modalities)}", flush=True)
     selection_mode = (
@@ -476,9 +480,9 @@ def main() -> None:
             "skip_cache_audits": args.skip_cache_audits,
             "assume_missing_cache": args.assume_missing_cache,
             "modality_grouping": args.modality_grouping,
-            "cache_format": args.cache_format,
-            "shard_size": args.shard_size,
             "video_decode_mode": args.video_decode_mode,
+            "clip_cache_dir": None if clip_cache_dir is None else str(clip_cache_dir),
+            "clip_cache_enabled": clip_cache_dir is not None,
             "progress_bar": not args.no_progress_bar,
             "spec_ids": {modality: feature_cache_spec_id(spec) for modality, spec in specs.items()},
             "dataset_summary": summarize_examples(examples),
@@ -508,9 +512,8 @@ def main() -> None:
         progress_bar=not args.no_progress_bar,
         group_by_modality=args.modality_grouping == "modality",
         assume_missing_cache=args.assume_missing_cache,
-        cache_format=args.cache_format,
-        shard_size=args.shard_size,
         video_decode_mode=args.video_decode_mode,
+        clip_cache_dir=clip_cache_dir,
     )
     if args.skip_cache_audits:
         missing_after = None

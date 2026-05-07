@@ -9,7 +9,7 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import cv2
@@ -22,6 +22,7 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 
 VALID_SPLITS: tuple[str, ...] = ("train", "val", "test")
 VIDEO_EXTENSIONS: tuple[str, ...] = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 VIDEO_DECODE_MODES: tuple[str, ...] = ("seek", "scan")
+VIDEO_CLIP_CACHE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class VideoExample:
     class_name: str
     source_id: str
     split: str
+    metadata_filename: str | None = None
     identity_id: str | None = None
     generator_id: str | None = None
     source_id_kind: str | None = None
@@ -263,6 +265,7 @@ def build_labeled_folder_examples(
                 class_name="real",
                 source_id=path.stem,
                 split=split,
+                metadata_filename=path.name,
             )
         )
     for path in fake_paths:
@@ -273,6 +276,7 @@ def build_labeled_folder_examples(
                 class_name="fake",
                 source_id=path.stem,
                 split=split,
+                metadata_filename=path.name,
             )
         )
     return examples
@@ -326,6 +330,7 @@ def _build_metadata_example(
         class_name=class_name,
         source_id=source_id,
         split="train",
+        metadata_filename=row.filename,
         identity_id=None if class_name == "real" else generator_id,
         generator_id=generator_id,
         source_id_kind=source_id_kind,
@@ -358,6 +363,7 @@ def _replace_example_split(example: VideoExample, split: str) -> VideoExample:
         class_name=example.class_name,
         source_id=example.source_id,
         split=split,
+        metadata_filename=example.metadata_filename,
         identity_id=example.identity_id,
         generator_id=example.generator_id,
         source_id_kind=example.source_id_kind,
@@ -686,6 +692,7 @@ def _build_legacy_real_fake_examples(
                 class_name="real",
                 source_id=source_id,
                 split=real_split_by_source[source_id],
+                metadata_filename=path.name,
                 generator_id="real",
                 source_id_kind="source_video",
             )
@@ -700,6 +707,7 @@ def _build_legacy_real_fake_examples(
                 class_name="fake",
                 source_id=source_id,
                 split=fake_split_by_source[source_id],
+                metadata_filename=f"{generator_id}/{path.name}",
                 identity_id=generator_id,
                 generator_id=generator_id,
                 source_id_kind="source_video",
@@ -833,6 +841,7 @@ def write_dataset_manifest(
             "class_name",
             "source_id",
             "split",
+            "metadata_filename",
             "identity_id",
             *AUDIT_MANIFEST_COLUMNS,
         )
@@ -849,6 +858,7 @@ def write_dataset_manifest(
                     "class_name": example.class_name,
                     "source_id": example.source_id,
                     "split": example.split,
+                    "metadata_filename": example.metadata_filename or "",
                     "identity_id": example.identity_id or "",
                     "generator_id": example.generator_id or "",
                     "source_id_kind": example.source_id_kind or "",
@@ -882,6 +892,7 @@ def load_dataset_manifest(
                     class_name=row["class_name"],
                     source_id=row["source_id"],
                     split=row_split,
+                    metadata_filename=row.get("metadata_filename") or None,
                     identity_id=row["identity_id"] or None,
                     generator_id=row.get("generator_id") or None,
                     source_id_kind=row.get("source_id_kind") or None,
@@ -898,7 +909,7 @@ def load_video_clip(
     path: str | Path,
     num_frames: int,
     image_size: int = 224,
-    decode_mode: str = "seek",
+    decode_mode: str = "scan",
 ) -> dict[str, Any]:
     if decode_mode not in VIDEO_DECODE_MODES:
         raise ValueError(f"`decode_mode` must be one of {VIDEO_DECODE_MODES}, got {decode_mode!r}")
@@ -964,17 +975,152 @@ def load_video_clip(
     }
 
 
+def normalize_video_dataset_root(dataset_root: str | Path | None) -> Path | None:
+    if dataset_root is None:
+        return None
+    root = Path(dataset_root)
+    videos_root = root / "videos"
+    if videos_root.is_dir():
+        return videos_root
+    return root
+
+
+def metadata_filename_for_example(
+    example: VideoExample,
+    dataset_root: str | Path | None = None,
+) -> str:
+    def validate(filename: str) -> str:
+        path = PurePosixPath(filename)
+        if path.is_absolute() or any(part in ("", ".", "..") for part in path.parts):
+            raise ValueError(f"Invalid metadata filename: {filename!r}")
+        return path.as_posix()
+
+    if example.metadata_filename:
+        return validate(example.metadata_filename)
+    root = normalize_video_dataset_root(dataset_root)
+    if root is None:
+        return validate(example.path.name)
+    class_root = (root / example.class_name).resolve()
+    try:
+        return validate(example.path.resolve().relative_to(class_root).as_posix())
+    except ValueError:
+        return validate(example.path.name)
+
+
+def video_clip_cache_item_path(
+    cache_dir: str | Path,
+    example: VideoExample,
+    num_frames: int,
+    image_size: int,
+    dataset_root: str | Path | None = None,
+) -> Path:
+    filename = metadata_filename_for_example(example, dataset_root)
+    return (
+        Path(cache_dir)
+        / f"frames_{int(num_frames)}_size_{int(image_size)}"
+        / example.class_name
+        / f"{filename}.pt"
+    )
+
+
+def _video_clip_cache_header(
+    example: VideoExample,
+    num_frames: int,
+    image_size: int,
+    dataset_root: str | Path | None = None,
+) -> dict[str, Any]:
+    return {
+        "version": VIDEO_CLIP_CACHE_VERSION,
+        "class_name": example.class_name,
+        "filename": metadata_filename_for_example(example, dataset_root),
+        "num_frames": int(num_frames),
+        "image_size": int(image_size),
+    }
+
+
+def _video_clip_cache_matches(
+    payload: Mapping[str, Any],
+    example: VideoExample,
+    num_frames: int,
+    image_size: int,
+    dataset_root: str | Path | None = None,
+) -> bool:
+    expected = _video_clip_cache_header(example, num_frames, image_size, dataset_root)
+    return all(payload.get(key) == value for key, value in expected.items())
+
+
+def load_video_clip_for_example(
+    example: VideoExample,
+    num_frames: int,
+    image_size: int = 224,
+    decode_mode: str = "scan",
+    clip_cache_dir: str | Path | None = None,
+    dataset_root: str | Path | None = None,
+) -> dict[str, Any]:
+    if clip_cache_dir is None:
+        return load_video_clip(
+            path=example.path,
+            num_frames=num_frames,
+            image_size=image_size,
+            decode_mode=decode_mode,
+        )
+
+    cache_path = video_clip_cache_item_path(
+        clip_cache_dir,
+        example,
+        num_frames=num_frames,
+        image_size=image_size,
+        dataset_root=dataset_root,
+    )
+    if cache_path.exists():
+        payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if isinstance(payload, Mapping) and _video_clip_cache_matches(
+            payload,
+            example,
+            num_frames=num_frames,
+            image_size=image_size,
+            dataset_root=dataset_root,
+        ):
+            video = payload.get("video")
+            frames = payload.get("video_rgb_frames")
+            if isinstance(video, torch.Tensor) and isinstance(frames, list):
+                return {"video": video, "video_rgb_frames": frames}
+
+    clip = load_video_clip(
+        path=example.path,
+        num_frames=num_frames,
+        image_size=image_size,
+        decode_mode=decode_mode,
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    torch.save(
+        {
+            **_video_clip_cache_header(example, num_frames, image_size, dataset_root),
+            "video": clip["video"].detach().cpu(),
+            "video_rgb_frames": clip["video_rgb_frames"],
+        },
+        tmp_path,
+    )
+    tmp_path.replace(cache_path)
+    return clip
+
+
 class LabeledVideoDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         examples: Sequence[VideoExample],
         num_frames: int | Mapping[str, int],
         image_size: int = 224,
-        decode_mode: str = "seek",
+        decode_mode: str = "scan",
+        clip_cache_dir: str | Path | None = None,
+        dataset_root: str | Path | None = None,
     ) -> None:
         self.examples = list(examples)
         self.num_frames = num_frames
         self.image_size = image_size
+        self.clip_cache_dir = Path(clip_cache_dir) if clip_cache_dir is not None else None
+        self.dataset_root = normalize_video_dataset_root(dataset_root)
         if decode_mode not in VIDEO_DECODE_MODES:
             raise ValueError(f"`decode_mode` must be one of {VIDEO_DECODE_MODES}.")
         self.decode_mode = decode_mode
@@ -992,11 +1138,13 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
         example = self.examples[index]
         if self.frame_counts_by_modality is None:
             load_start = time.perf_counter()
-            clip = load_video_clip(
-                path=example.path,
+            clip = load_video_clip_for_example(
+                example=example,
                 num_frames=int(self.num_frames),
                 image_size=self.image_size,
                 decode_mode=self.decode_mode,
+                clip_cache_dir=self.clip_cache_dir,
+                dataset_root=self.dataset_root,
             )
             load_seconds = time.perf_counter() - load_start
             video = clip["video"]
@@ -1012,11 +1160,13 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
             for modality_name, frame_count in self.frame_counts_by_modality.items():
                 if frame_count not in clips_by_count:
                     load_start = time.perf_counter()
-                    clips_by_count[frame_count] = load_video_clip(
-                        path=example.path,
+                    clips_by_count[frame_count] = load_video_clip_for_example(
+                        example=example,
                         num_frames=frame_count,
                         image_size=self.image_size,
                         decode_mode=self.decode_mode,
+                        clip_cache_dir=self.clip_cache_dir,
+                        dataset_root=self.dataset_root,
                     )
                     load_seconds_by_count[frame_count] = time.perf_counter() - load_start
                 clip = clips_by_count[frame_count]
@@ -1047,6 +1197,7 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
             "split": example.split,
             "class_name": example.class_name,
             "identity_id": example.identity_id,
+            "metadata_filename": example.metadata_filename,
             "generator_id": example.generator_id,
             "source_id_kind": example.source_id_kind,
             "age_bin": example.age_bin,
@@ -1075,6 +1226,7 @@ def collate_labeled_video_batch(items: Sequence[dict[str, Any]]) -> dict[str, An
         "split": [item["split"] for item in items],
         "class_name": [item["class_name"] for item in items],
         "identity_id": [item["identity_id"] for item in items],
+        "metadata_filename": [item.get("metadata_filename") for item in items],
         "generator_id": [item.get("generator_id") for item in items],
         "source_id_kind": [item.get("source_id_kind") for item in items],
         "age_bin": [item.get("age_bin") for item in items],
