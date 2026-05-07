@@ -12,6 +12,8 @@ from torch.utils.data import Dataset
 from dataset import VideoExample
 from frame_config import resolve_modality_frame_count
 
+RPPG_CACHE_VARIANT = "rppg_v2_contiguous128_facecrop_haar_diffnorm128"
+
 FEATURE_CACHE_VERSION = 3
 SPEC_IGNORED_MODALITY_KEYS = frozenset({"frames", "slot_count"})
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -19,7 +21,7 @@ LOCAL_PATH_CONFIG_KEYS = frozenset({"checkpoint_path", "model_path"})
 MODALITY_FEATURE_KEYS: dict[str, tuple[str, ...]] = {
     "rgb": ("rgb_features",),
     "fau": ("fau_features", "fau_au_logits", "fau_au_edge_logits"),
-    "rppg": ("rppg_features", "rppg_waveform"),
+    "rppg": ("rppg_features", "rppg_waveform", "rppg_signal_features"),
     "eye_gaze": ("eye_gaze",),
     "face_mesh": ("face_mesh",),
     "depth": ("depth_features",),
@@ -98,9 +100,21 @@ def build_feature_cache_spec(
         version=FEATURE_CACHE_VERSION,
         modality=modality,
         frame_count=resolve_modality_frame_count(config, modality),
-        image_size=int(config.get("image_size", 224)),
+        image_size=_resolve_modality_image_size(config, modality),
         extractor_config=_modality_extractor_config(config, modality),
     )
+
+
+def _resolve_modality_image_size(config: Mapping[str, Any], modality: str) -> int:
+    section = config.get(modality, {})
+    value = None
+    if isinstance(section, Mapping):
+        value = section.get("image_size")
+    if value is None:
+        value = config.get("image_size", 224)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"`{modality}.image_size` must be a positive integer.")
+    return value
 
 
 def build_feature_cache_specs(
@@ -179,6 +193,10 @@ def _feature_tensors_for_modality(
     required_key = MODALITY_FEATURE_KEYS[modality][0]
     if required_key not in features:
         raise KeyError(f"Missing required cached feature `{required_key}` for {modality}.")
+    if modality == "rppg":
+        missing = [key for key in MODALITY_FEATURE_KEYS[modality] if key not in features]
+        if missing:
+            raise KeyError(f"Missing required cached rPPG feature(s): {', '.join(missing)}.")
     return features
 
 
@@ -187,13 +205,16 @@ def feature_cache_payload_header(
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    return {
+    header = {
         "version": FEATURE_CACHE_VERSION,
         "class_name": example.class_name,
         "filename": metadata_filename_for_example(example, dataset_root),
         "modality": spec.modality,
         "frame_count": spec.frame_count,
     }
+    if spec.modality == "rppg":
+        header["cache_variant"] = RPPG_CACHE_VARIANT
+    return header
 
 
 def write_feature_cache_item(
@@ -246,7 +267,13 @@ def load_feature_cache_item(
         return None
     result = {str(key): value for key, value in features.items() if isinstance(value, torch.Tensor)}
     required_key = MODALITY_FEATURE_KEYS[spec.modality][0]
-    return result if required_key in result else None
+    if required_key not in result:
+        return None
+    if spec.modality == "rppg" and any(
+        key not in result for key in MODALITY_FEATURE_KEYS[spec.modality]
+    ):
+        return None
+    return result
 
 
 def feature_cache_item_exists(
@@ -255,7 +282,7 @@ def feature_cache_item_exists(
     spec: FeatureCacheSpec,
     dataset_root: str | Path | None = None,
 ) -> bool:
-    return feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root).exists()
+    return load_feature_cache_item(cache_dir, example, spec, dataset_root=dataset_root) is not None
 
 
 def feature_cache_generator_id(
@@ -304,7 +331,7 @@ def write_feature_cache_manifest(
     for example in examples:
         error = errors.get(str(example.path), "")
         cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
-        if cache_path.exists():
+        if feature_cache_item_exists(cache_dir, example, spec, dataset_root):
             status = "cached"
         elif error:
             status = "failed"

@@ -223,6 +223,9 @@ class ClipFusionPipeline(nn.Module):
         frames_by_modality = batch.get("video_rgb_frames_by_modality")
         if isinstance(frames_by_modality, Mapping) and modality_name in frames_by_modality:
             modality_batch["video_rgb_frames"] = frames_by_modality[modality_name]
+        fps_by_modality = batch.get("video_fps_by_modality")
+        if isinstance(fps_by_modality, Mapping) and modality_name in fps_by_modality:
+            modality_batch["video_fps"] = fps_by_modality[modality_name]
         return modality_batch
 
     def _enabled_modalities_for_batch(self, batch: Mapping[str, Any]) -> tuple[str, ...]:

@@ -181,6 +181,7 @@ class PipelineTest(unittest.TestCase):
             "fau_au_edge_logits": torch.randn(1, 16, 12, 3),
             "rppg_features": torch.randn(1, 16, 9),
             "rppg_waveform": torch.randn(1, 16),
+            "rppg_signal_features": torch.randn(1, 6),
         }
 
         features = pipeline.prepare_features(batch)
@@ -190,6 +191,7 @@ class PipelineTest(unittest.TestCase):
         self.assertIs(features["fau_au_edge_logits"], batch["fau_au_edge_logits"])
         self.assertIs(features["rppg_features"], batch["rppg_features"])
         self.assertIs(features["rppg_waveform"], batch["rppg_waveform"])
+        self.assertIs(features["rppg_signal_features"], batch["rppg_signal_features"])
         self.assertEqual(pipeline.last_feature_timings, {"fau": 0.0, "rppg": 0.0})
 
     def test_prepare_features_does_not_call_extractor_for_cached_keys(self):
@@ -227,6 +229,10 @@ class PipelineTest(unittest.TestCase):
                     np.full((16, 16, 3), frame_index, dtype=np.uint8) for frame_index in range(6)
                 ],
             },
+            "video_fps_by_modality": {
+                "rgb": torch.tensor([24.0]),
+                "rppg": torch.tensor([30.0]),
+            },
         }
 
         features = pipeline.prepare_features(batch)
@@ -235,6 +241,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(tuple(rgb_encoder.last_input.shape), (1, 3, 4, 32, 32))
         self.assertEqual(tuple(features["rppg_waveform"].shape), (1, 6))
         self.assertEqual(tuple(features["rppg_features"].shape), (1, 6, 9))
+        self.assertEqual(tuple(features["rppg_signal_features"].shape), (1, 6))
 
     def test_modality_subset_keeps_stable_ids_and_expected_token_count(self):
         pipeline = build_test_pipeline(enabled_modalities=("face_mesh", "rppg"))

@@ -1898,10 +1898,12 @@ def build_raw_feature_batch(
     modalities: Sequence[str],
     frame_count: int,
     image_size: int,
+    config: Mapping[str, Any] | None = None,
     video_decode_mode: str = "scan",
     clip_cache_dir: Path | None = None,
     dataset_root: Path | None = None,
 ) -> dict[str, Any]:
+    rppg_config = config.get("rppg", {}) if isinstance(config, Mapping) else {}
     dataset = LabeledVideoDataset(
         examples=examples,
         num_frames=dict.fromkeys(modalities, frame_count),
@@ -1909,6 +1911,8 @@ def build_raw_feature_batch(
         decode_mode=video_decode_mode,
         clip_cache_dir=clip_cache_dir,
         dataset_root=dataset_root,
+        image_size_by_modality=dict.fromkeys(modalities, image_size),
+        rppg_config=rppg_config if isinstance(rppg_config, Mapping) else {},
     )
     return collate_labeled_video_batch([dataset[index] for index in range(len(dataset))])
 
@@ -1979,6 +1983,7 @@ def update_cache_timing_progress(
     modalities: Sequence[str],
 ) -> None:
     load_seconds = _sum_batch_load_seconds(raw_batch, modalities)
+    status_by_modality = raw_batch.get("rppg_face_crop_status_by_modality")
     for modality in modalities:
         if modality in load_seconds:
             progress[modality]["load_seconds"] = (
@@ -1988,6 +1993,16 @@ def update_cache_timing_progress(
             progress[modality]["extract_seconds"] = float(
                 progress[modality].get("extract_seconds", 0.0)
             ) + float(feature_timings[modality])
+        if isinstance(status_by_modality, Mapping) and modality in status_by_modality:
+            counts = dict(progress[modality].get("face_crop_status_counts", {}))
+            values = status_by_modality[modality]
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
+                for value in values:
+                    if value is None:
+                        continue
+                    key = str(value)
+                    counts[key] = counts.get(key, 0) + 1
+            progress[modality]["face_crop_status_counts"] = counts
 
 
 def cache_single_modality_example(
@@ -2014,6 +2029,7 @@ def cache_single_modality_example(
             modalities=(modality,),
             frame_count=spec.frame_count,
             image_size=spec.image_size,
+            config=config,
             video_decode_mode=video_decode_mode,
             clip_cache_dir=clip_cache_dir,
             dataset_root=dataset_root,
@@ -2102,6 +2118,7 @@ def initialize_feature_cache_progress(
             "assume_missing_cache": assume_missing_cache,
             "load_seconds": 0.0,
             "extract_seconds": 0.0,
+            "face_crop_status_counts": {},
         }
         if assume_missing_cache:
             cached_before = 0
@@ -2175,6 +2192,7 @@ def cache_feature_batch_or_fallback(
             modalities=group_modalities,
             frame_count=frame_count,
             image_size=image_size,
+            config=config,
             video_decode_mode=video_decode_mode,
             clip_cache_dir=clip_cache_dir,
             dataset_root=dataset_root,
@@ -2253,6 +2271,9 @@ def update_cache_group_progress(
                 f"{modality}:load={load_seconds / written_modality:.3f}s "
                 f"extract={extract_seconds / written_modality:.3f}s"
             )
+            crop_counts = progress[modality].get("face_crop_status_counts")
+            if crop_counts:
+                timing_parts[-1] = f"{timing_parts[-1]} crop={dict(crop_counts)}"
         print(
             f"cache {label}: modalities={group_name} "
             f"done={done}/{group_examples_count} "

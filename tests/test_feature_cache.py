@@ -14,6 +14,7 @@ from feature_cache import (
     CachedFeatureDataset,
     build_feature_cache_specs,
     collate_cached_feature_batch,
+    feature_cache_item_exists,
     feature_cache_item_path,
     load_feature_cache_item,
     write_feature_cache_item,
@@ -132,6 +133,82 @@ class MinimalFeatureCacheTest(unittest.TestCase):
 
             self.assertIsNotNone(loaded)
             self.assertTrue(torch.equal(loaded["rgb_features"], torch.ones(2, 3)))
+
+    def test_rppg_cache_variant_invalidates_old_payload_but_not_rgb_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            example = build_example(
+                root / "videos" / "real" / "clip.mp4",
+                "real",
+                "clip.mp4",
+                generator_id="real",
+            )
+            specs = build_feature_cache_specs(
+                {
+                    "frames": {"default": 16},
+                    "image_size": 224,
+                    "rgb": {},
+                    "rppg": {"frames": 128, "image_size": 128},
+                },
+                ("rgb", "rppg"),
+            )
+            write_feature_cache_item(
+                cache_dir,
+                example,
+                specs["rgb"],
+                {"rgb_features": torch.ones(2, 3)},
+                dataset_root=root,
+            )
+            rppg_path = feature_cache_item_path(
+                cache_dir, example, specs["rppg"], dataset_root=root
+            )
+            rppg_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "version": 3,
+                    "class_name": "real",
+                    "filename": "clip.mp4",
+                    "modality": "rppg",
+                    "frame_count": 128,
+                    "features": {
+                        "rppg_features": torch.ones(128, 8),
+                        "rppg_waveform": torch.ones(128),
+                    },
+                },
+                rppg_path,
+            )
+
+            self.assertTrue(feature_cache_item_exists(cache_dir, example, specs["rgb"], root))
+            self.assertFalse(feature_cache_item_exists(cache_dir, example, specs["rppg"], root))
+
+    def test_rppg_cache_roundtrip_requires_signal_features(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            example = build_example(
+                root / "videos" / "real" / "clip.mp4",
+                "real",
+                "clip.mp4",
+                generator_id="real",
+            )
+            spec = build_feature_cache_specs(
+                {"frames": {"default": 16}, "rppg": {"frames": 128, "image_size": 128}},
+                ("rppg",),
+            )["rppg"]
+            item = {
+                "rppg_features": torch.ones(128, 8),
+                "rppg_waveform": torch.zeros(128),
+                "rppg_signal_features": torch.arange(6, dtype=torch.float32),
+            }
+
+            write_feature_cache_item(cache_dir, example, spec, item, dataset_root=root)
+            loaded = load_feature_cache_item(cache_dir, example, spec, dataset_root=root)
+
+            self.assertIsNotNone(loaded)
+            self.assertTrue(
+                torch.equal(loaded["rppg_signal_features"], item["rppg_signal_features"])
+            )
 
     def test_manifest_includes_generator_status_and_cache_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -313,7 +313,11 @@ def _branch_input_summary(name: str, config: Mapping[str, Any]) -> str:
         num_classes = int(config.get("fau", {}).get("num_classes", 12))
         return f"fau_features [B, {frames}, {num_classes}, F_fau]"
     if name == "rppg":
-        return f"rppg_features [B, {frames}, F_rppg] + rppg_waveform [B, {frames}]"
+        return (
+            f"rppg_features [B, {frames}, F_rppg] + "
+            "rppg_signal_features [B, 6] + "
+            f"rppg_waveform [B, {frames}]"
+        )
     if name == "depth":
         feature_dim = int(config.get("depth", {}).get("feature_dim", 384))
         return f"depth_features [B, {frames}, {feature_dim}]"
@@ -331,6 +335,8 @@ def _branch_token_formula(name: str, branch: nn.Module, config: Mapping[str, Any
     if name == "fau":
         num_classes = int(config.get("fau", {}).get("num_classes", 12))
         return f"raw_tokens={frames}*{num_classes}, final_slots={slot_count}"
+    if name == "rppg":
+        return f"signal_slots=1, temporal_slots={slot_count - 1}, final_slots={slot_count}"
     if hasattr(branch, "frame_pool") and hasattr(branch.frame_pool, "output_tokens"):
         return (
             f"frames={frames}, frame_query_tokens={branch.frame_pool.output_tokens}, "
@@ -360,7 +366,10 @@ def _branch_note(name: str) -> str:
             "and edge logits are ignored by this branch."
         )
     if name == "rppg":
-        return "Waveform is a side output; only temporal features enter projection and pooling."
+        return (
+            "Temporal PhysNet features pool to slot_count-1 tokens; spectral waveform features "
+            "project to one signal-quality token."
+        )
     if name == "depth":
         return (
             "DepthAnything hidden maps are spatially mean-pooled per frame before temporal pooling."

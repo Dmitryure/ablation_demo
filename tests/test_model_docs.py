@@ -32,7 +32,11 @@ class ModelDocsTest(unittest.TestCase):
         )
         self.assertEqual(
             [stage.title for stage in components["fau"].stages],
-            ["Input", "Project", "Frame Pool", "Flatten Frame Tokens", "Clip Pool"],
+            ["Input", "Project", "Temporal Position", "Clip Pool"],
+        )
+        self.assertEqual(
+            [stage.title for stage in components["rppg"].stages],
+            ["Input", "Input", "Project", "Temporal Pool", "Signal Proj"],
         )
         self.assertEqual(
             [stage.title for stage in components["depth"].stages],
@@ -67,7 +71,7 @@ class ModelDocsTest(unittest.TestCase):
         self.assertEqual(spec.total_tokens, expected_total_tokens)
         self.assertEqual(spec.enabled_token_count, expected_enabled_tokens)
         self.assertEqual(spec.frames["rgb"], 16)
-        self.assertEqual(spec.frames["rppg"], 32)
+        self.assertEqual(spec.frames["rppg"], 128)
         self.assertFalse(components["rgb"].enabled)
         self.assertFalse(components["fau"].enabled)
         self.assertFalse(components["rppg"].enabled)
@@ -90,15 +94,18 @@ class ModelDocsTest(unittest.TestCase):
         self.assertIn('"title": "Eye Gaze Branch"', json_text)
         self.assertIn('"title": "Depth Branch"', json_text)
         self.assertIn('"title": "Add Time Embedding"', json_text)
-        self.assertIn("Project: MLP(8->128->128)", markdown)
+        self.assertIn("Project: MLP(8->256->256)", markdown)
+        self.assertIn("rppg_signal_features [B, 6]", markdown)
+        self.assertIn("signal_slots=1, temporal_slots=23, final_slots=24", markdown)
         self.assertIn("Point Pool: LatentQueryPooling(output_tokens=1)", markdown)
         self.assertIn(
-            "Transformer Encoder: TransformerEncoderLayer x2 (heads=4, hidden=512)", markdown
+            "Transformer Encoder: TransformerEncoderLayer x4 (heads=8, hidden=1024)", markdown
         )
         self.assertIn("Frames: `rgb=16", markdown)
+        self.assertIn("rppg=128", markdown)
         self.assertIn("model_architecture.json", markdown)
         self.assertIn('href="../branches/eye_gaze.py"', dot_source)
-        self.assertIn("MLP(8-&gt;128-&gt;128)", dot_source)
+        self.assertIn("MLP(8-&gt;256-&gt;256)", dot_source)
         self.assertIn("Add Time Embedding", dot_source)
         self.assertIn("Token Bank", dot_source)
         self.assertIn("Depth Branch", dot_source)

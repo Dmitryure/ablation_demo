@@ -49,8 +49,19 @@ fau:
   checkpoint_path: checkpoints/fau/bp4d/swin_transformer_tiny/MEFARG_swin_tiny_BP4D_fold1.pth
   slot_count: 32
 rppg:
+  frames: 128
+  image_size: 128
   checkpoint_path: checkpoints/PURE_PhysNet_DiffNormalized.pth
   slot_count: 24
+  clip_sampling: contiguous_center
+  input_type: diff_normalized
+  face_crop:
+    enabled: true
+    backend: opencv_haar
+    detection_frequency: 16
+    use_median_box: true
+    large_box_coef: 1.5
+    fallback: full_frame
 face_mesh:
   slot_count: 24
 depth:

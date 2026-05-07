@@ -48,7 +48,7 @@ CURRENT_MODALITIES: tuple[str, ...] = FIXED_SLOT_MODALITIES
 PENDING_MODALITIES: tuple[str, ...] = tuple(
     modality for modality in FULL_MODALITIES if modality not in CURRENT_MODALITIES
 )
-SUPPORTED_FRAME_COUNTS: tuple[int, ...] = (16, 32, 64)
+SUPPORTED_FRAME_COUNTS: tuple[int, ...] = (16, 32, 64, 128)
 
 
 def build_registry(dim: int, config: Mapping[str, Any] | None = None) -> nn.ModuleDict:

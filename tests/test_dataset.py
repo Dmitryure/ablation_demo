@@ -16,10 +16,13 @@ from dataset import (
     build_metadata_real_fake_examples,
     build_real_fake_examples,
     collate_labeled_video_batch,
+    diff_normalized_video_tensor,
     format_split_audit,
     infer_metadata_source_id,
     load_dataset_manifest,
     load_video_metadata,
+    resolve_rppg_face_crop_box,
+    sample_contiguous_center_indices,
     split_metadata_examples,
     summarize_examples,
     summarize_split_audit,
@@ -39,6 +42,17 @@ def fake_face_mesh_detector(_: np.ndarray) -> np.ndarray:
     for index in range(points.shape[0]):
         points[index] = (index / 100.0, index / 200.0, -index / 300.0)
     return points
+
+
+class FakeHaarDetector:
+    def __init__(self, boxes_by_call: list[list[tuple[int, int, int, int]]]):
+        self.boxes_by_call = boxes_by_call
+        self.call_count = 0
+
+    def detectMultiScale(self, *_args, **_kwargs):
+        boxes = self.boxes_by_call[self.call_count]
+        self.call_count += 1
+        return np.asarray(boxes, dtype=np.int32)
 
 
 class DummyRGBEncoder(torch.nn.Module):
@@ -360,7 +374,7 @@ class DatasetTest(unittest.TestCase):
             image_size=8,
         )
 
-        def fake_load_video_clip(path, num_frames, image_size, decode_mode="seek"):
+        def fake_load_video_clip(path, num_frames, image_size, decode_mode="seek", **_kwargs):
             del path, decode_mode
             return {
                 "video": torch.full((3, num_frames, image_size, image_size), float(num_frames)),
@@ -368,9 +382,25 @@ class DatasetTest(unittest.TestCase):
                     np.full((image_size, image_size, 3), num_frames, dtype=np.uint8)
                     for _ in range(num_frames)
                 ],
+                "video_fps": 24.0,
             }
 
-        with patch("dataset.load_video_clip", side_effect=fake_load_video_clip):
+        def fake_load_rppg_clip(example, num_frames, image_size, **_kwargs):
+            del example
+            return {
+                "video": torch.full((3, num_frames, image_size, image_size), float(num_frames)),
+                "video_rgb_frames": [
+                    np.full((image_size, image_size, 3), num_frames, dtype=np.uint8)
+                    for _ in range(num_frames)
+                ],
+                "video_fps": 25.0,
+                "rppg_face_crop_status": "fallback_full_frame",
+            }
+
+        with (
+            patch("dataset.load_video_clip", side_effect=fake_load_video_clip),
+            patch("dataset.load_rppg_video_clip_for_example", side_effect=fake_load_rppg_clip),
+        ):
             sample = dataset[0]
             batch = collate_labeled_video_batch([sample, sample])
 
@@ -380,6 +410,64 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(tuple(batch["video_by_modality"]["rppg"].shape), (2, 3, 6, 8, 8))
         self.assertEqual(len(batch["video_rgb_frames_by_modality"]["rgb"][0]), 4)
         self.assertEqual(len(batch["video_rgb_frames_by_modality"]["rppg"][0]), 6)
+        self.assertTrue(
+            torch.equal(batch["video_fps_by_modality"]["rppg"], torch.tensor([25.0, 25.0]))
+        )
+        self.assertEqual(
+            batch["rppg_face_crop_status_by_modality"]["rppg"],
+            ["fallback_full_frame", "fallback_full_frame"],
+        )
+
+    def test_rppg_contiguous_sampler_center_window_and_rejects_short_video(self):
+        self.assertEqual(
+            sample_contiguous_center_indices(total_frames=10, num_frames=4), [3, 4, 5, 6]
+        )
+        with self.assertRaisesRegex(RuntimeError, "need at least 8"):
+            sample_contiguous_center_indices(total_frames=7, num_frames=8)
+
+    def test_rppg_diff_normalized_preserves_shape_and_matches_formula(self):
+        video = torch.tensor(
+            [
+                [[[1.0]], [[2.0]], [[4.0]]],
+                [[[2.0]], [[4.0]], [[8.0]]],
+                [[[4.0]], [[8.0]], [[16.0]]],
+            ]
+        )
+        raw = torch.zeros_like(video)
+        raw[:, :-1] = (video[:, 1:] - video[:, :-1]) / (video[:, 1:] + video[:, :-1] + 1e-6)
+        expected = raw / raw.std(correction=0)
+
+        actual = diff_normalized_video_tensor(video)
+
+        self.assertEqual(tuple(actual.shape), (3, 3, 1, 1))
+        self.assertTrue(torch.allclose(actual, expected, atol=1e-5))
+
+    def test_rppg_face_crop_uses_largest_median_enlarged_box_and_falls_back(self):
+        frames = [np.zeros((80, 100, 3), dtype=np.uint8) for _ in range(2)]
+        detector = FakeHaarDetector(
+            [
+                [(1, 1, 5, 5), (20, 20, 20, 20)],
+                [(20, 20, 20, 20)],
+            ]
+        )
+
+        box, status = resolve_rppg_face_crop_box(
+            frames,
+            detection_frequency=1,
+            large_box_coef=1.5,
+            detector=detector,
+        )
+        fallback_box, fallback_status = resolve_rppg_face_crop_box(
+            frames,
+            detection_frequency=1,
+            large_box_coef=1.5,
+            detector=FakeHaarDetector([[], []]),
+        )
+
+        self.assertEqual(box, (15, 15, 30, 30))
+        self.assertEqual(status, "detected")
+        self.assertIsNone(fallback_box)
+        self.assertEqual(fallback_status, "fallback_full_frame")
 
 
 if __name__ == "__main__":

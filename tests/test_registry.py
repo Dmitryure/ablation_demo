@@ -82,9 +82,11 @@ class DummyDepthEncoder(nn.Module):
 
 
 class DummyDepthProcessor:
-    def __call__(self, images, return_tensors: str):
+    def __call__(self, images, return_tensors: str, keep_aspect_ratio: bool = True):
         if return_tensors != "pt":
             raise ValueError("DummyDepthProcessor only supports return_tensors='pt'.")
+        if keep_aspect_ratio:
+            raise ValueError("DepthExtractor must disable aspect-ratio preserving resize.")
         pixel_values = torch.stack(
             [
                 torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).float() / 255.0
@@ -162,7 +164,7 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(keys["rgb"], ("rgb_features",))
         self.assertEqual(keys["face_mesh"], ("face_mesh",))
         self.assertEqual(keys["fau"], ("fau_features",))
-        self.assertEqual(keys["rppg"], ("rppg_features",))
+        self.assertEqual(keys["rppg"], ("rppg_features", "rppg_signal_features"))
         self.assertEqual(keys["depth"], ("depth_features",))
 
     def test_local_wrappers_instantiate(self):
@@ -315,26 +317,37 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(tuple(output["rppg_features"].shape), (1, 4, 12))
         self.assertEqual(tuple(output["rppg_waveform"].shape), (1, 4))
+        self.assertEqual(tuple(output["rppg_signal_features"].shape), (1, 6))
 
     def test_local_rppg_branch_output_contract(self):
         registry = build_registry(dim=16)
         temporal_features = torch.randn(1, 4, 12)
+        signal_features = torch.randn(1, 6)
 
-        output = registry["rppg"].encode({"rppg_features": temporal_features})
+        output = registry["rppg"].encode(
+            {"rppg_features": temporal_features, "rppg_signal_features": signal_features}
+        )
 
         self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
         self.assertEqual(tuple(output.time_ids.shape), (4,))
         self.assertTrue(torch.equal(output.time_ids, torch.tensor([0, 1, 2, 3])))
+        self.assertEqual(output.debug["signal_token_shape"], (1, 1, 16))
+        self.assertEqual(output.debug["temporal_token_shape"], (1, 3, 16))
 
     def test_rppg_temporal_pooling_changes_when_frame_order_changes(self):
         registry = build_registry(dim=16)
         temporal_features = torch.arange(1, 1 + 6 * 12, dtype=torch.float32).reshape(1, 6, 12)
         reversed_features = torch.flip(temporal_features, dims=(1,))
+        signal_features = torch.randn(1, 6)
 
-        output = registry["rppg"].encode({"rppg_features": temporal_features})
-        reversed_output = registry["rppg"].encode({"rppg_features": reversed_features})
+        output = registry["rppg"].encode(
+            {"rppg_features": temporal_features, "rppg_signal_features": signal_features}
+        )
+        reversed_output = registry["rppg"].encode(
+            {"rppg_features": reversed_features, "rppg_signal_features": signal_features}
+        )
 
-        self.assertFalse(torch.allclose(output.tokens, reversed_output.tokens))
+        self.assertFalse(torch.allclose(output.tokens[:, 1:], reversed_output.tokens[:, 1:]))
 
     def test_eye_gaze_extractor_tensor_shape_with_fake_detector(self):
         extractor = EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector)
@@ -401,7 +414,12 @@ class RegistryTest(unittest.TestCase):
 
         rgb_output = registry["rgb"].encode({"rgb_features": torch.randn(1, 8, 768)})
         eye_gaze_output = registry["eye_gaze"].encode({"eye_gaze": torch.randn(1, 16, 8)})
-        rppg_output = registry["rppg"].encode({"rppg_features": torch.randn(1, 16, 12)})
+        rppg_output = registry["rppg"].encode(
+            {
+                "rppg_features": torch.randn(1, 16, 12),
+                "rppg_signal_features": torch.randn(1, 6),
+            }
+        )
         face_mesh_output = registry["face_mesh"].encode(
             {"face_mesh": torch.randn(1, 4, len(FACE_MESH_CONTOUR_INDICES), 3)}
         )
@@ -421,6 +439,8 @@ class RegistryTest(unittest.TestCase):
     def test_build_registry_rejects_non_positive_token_budgets(self):
         with self.assertRaisesRegex(ValueError, "rppg.slot_count"):
             build_registry(dim=16, config={"rppg": {"slot_count": 0}})
+        with self.assertRaisesRegex(ValueError, "rppg.slot_count"):
+            build_registry(dim=16, config={"rppg": {"slot_count": 1}})
 
     def test_resolve_modality_frame_counts_supports_section_and_default_values(self):
         config = {
@@ -456,6 +476,7 @@ class RegistryTest(unittest.TestCase):
         batch = {
             "rgb_features": torch.randn(1, 8, 768),
             "rppg_features": torch.randn(1, 16, 12),
+            "rppg_signal_features": torch.randn(1, 6),
         }
 
         fusion_output = fuse_selected_modalities(
@@ -512,6 +533,7 @@ class RegistryTest(unittest.TestCase):
         batch = {
             "eye_gaze": torch.randn(1, 2, 8),
             "rppg_features": torch.randn(1, 2, 12),
+            "rppg_signal_features": torch.randn(1, 6),
         }
 
         fusion_output = fuse_selected_modalities(
