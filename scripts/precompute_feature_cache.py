@@ -93,6 +93,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite-cache", action="store_true")
     parser.add_argument("--skip-failures", action="store_true")
     parser.add_argument(
+        "--skip-cache-audits",
+        action="store_true",
+        help="Skip pre/post missing-cache scans and skipped-files CSV generation.",
+    )
+    parser.add_argument(
+        "--assume-missing-cache",
+        action="store_true",
+        help=(
+            "Do not scan for existing cache items before extraction. Fastest for a fresh cache dir; "
+            "existing cache files for selected examples can be overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--modality-grouping",
+        choices=("modality", "clip-spec"),
+        default="modality",
+        help=(
+            "Use 'modality' for one extraction pipeline per modality, or 'clip-spec' "
+            "to group modalities with the same frame count and image size so videos are decoded once."
+        ),
+    )
+    parser.add_argument(
+        "--cache-format",
+        choices=("files", "shards"),
+        default="files",
+        help="Write one file per video, or write indexed shard files.",
+    )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=256,
+        help="Videos per shard when --cache-format shards is used.",
+    )
+    parser.add_argument(
+        "--video-decode-mode",
+        choices=("seek", "scan"),
+        default="seek",
+        help="Use random frame seeks or sequential video scan when sampling frames.",
+    )
+    parser.add_argument(
         "--no-progress-bar",
         action="store_true",
         help="Use plain periodic logs instead of tqdm progress bars.",
@@ -399,18 +439,21 @@ def main() -> None:
         flush=True,
     )
     print(f"selected_summary={summarize_examples(selected_examples)}", flush=True)
-    print("counting missing cache entries...", flush=True)
-    missing_before = count_missing_cache_with_progress(
-        selected_examples,
-        cache_dir,
-        specs,
-        modalities,
-        dataset_root,
-        progress_bar=not args.no_progress_bar,
-        progress_every=args.progress_every,
-    )
-
-    print(f"missing_before={missing_before}", flush=True)
+    if args.skip_cache_audits:
+        missing_before = None
+        print("skipping missing_before cache audit", flush=True)
+    else:
+        print("counting missing cache entries...", flush=True)
+        missing_before = count_missing_cache_with_progress(
+            selected_examples,
+            cache_dir,
+            specs,
+            modalities,
+            dataset_root,
+            progress_bar=not args.no_progress_bar,
+            progress_every=args.progress_every,
+        )
+        print(f"missing_before={missing_before}", flush=True)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(
@@ -430,6 +473,12 @@ def main() -> None:
             "balanced_limit_per_split": args.balanced_limit_per_split,
             "overwrite_cache": args.overwrite_cache,
             "skip_failures": args.skip_failures,
+            "skip_cache_audits": args.skip_cache_audits,
+            "assume_missing_cache": args.assume_missing_cache,
+            "modality_grouping": args.modality_grouping,
+            "cache_format": args.cache_format,
+            "shard_size": args.shard_size,
+            "video_decode_mode": args.video_decode_mode,
             "progress_bar": not args.no_progress_bar,
             "spec_ids": {modality: feature_cache_spec_id(spec) for modality, spec in specs.items()},
             "dataset_summary": summarize_examples(examples),
@@ -457,25 +506,34 @@ def main() -> None:
         progress_every=args.progress_every,
         label="precompute",
         progress_bar=not args.no_progress_bar,
-        group_by_modality=True,
+        group_by_modality=args.modality_grouping == "modality",
+        assume_missing_cache=args.assume_missing_cache,
+        cache_format=args.cache_format,
+        shard_size=args.shard_size,
+        video_decode_mode=args.video_decode_mode,
     )
-    missing_after = count_missing_cache_with_progress(
-        selected_examples,
-        cache_dir,
-        specs,
-        modalities,
-        dataset_root,
-        progress_bar=not args.no_progress_bar,
-        progress_every=args.progress_every,
-    )
-    skipped_count = write_skipped_files_csv(
-        output_dir / "skipped_files.csv",
-        examples=selected_examples,
-        cache_dir=cache_dir,
-        specs=specs,
-        modalities=modalities,
-        dataset_root=dataset_root,
-    )
+    if args.skip_cache_audits:
+        missing_after = None
+        skipped_count = None
+        print("skipping missing_after cache audit", flush=True)
+    else:
+        missing_after = count_missing_cache_with_progress(
+            selected_examples,
+            cache_dir,
+            specs,
+            modalities,
+            dataset_root,
+            progress_bar=not args.no_progress_bar,
+            progress_every=args.progress_every,
+        )
+        skipped_count = write_skipped_files_csv(
+            output_dir / "skipped_files.csv",
+            examples=selected_examples,
+            cache_dir=cache_dir,
+            specs=specs,
+            modalities=modalities,
+            dataset_root=dataset_root,
+        )
     write_json(output_dir / "cache_progress.json", progress)
     write_json(
         output_dir / "summary.json",
@@ -490,7 +548,8 @@ def main() -> None:
     print(f"missing_after={missing_after}", flush=True)
     print(f"skipped_file_rows={skipped_count}", flush=True)
     print(f"wrote: {output_dir / 'cache_progress.json'}", flush=True)
-    print(f"wrote: {output_dir / 'skipped_files.csv'}", flush=True)
+    if not args.skip_cache_audits:
+        print(f"wrote: {output_dir / 'skipped_files.csv'}", flush=True)
     print(f"wrote: {output_dir / 'summary.json'}", flush=True)
     print(f"wrote: {output_dir}", flush=True)
 

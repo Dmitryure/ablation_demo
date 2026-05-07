@@ -259,6 +259,7 @@ class RegistryTest(unittest.TestCase):
 
         self.assertEqual(tuple(output["fau_features"].shape), (1, 2, 4, 20))
         self.assertEqual(tuple(output["fau_au_logits"].shape), (1, 2, 4))
+        self.assertEqual(tuple(output["fau_au_edge_logits"].shape), (1, 2, 4, 3))
 
     def test_local_fau_branch_output_contract(self):
         registry = build_registry(dim=16)
@@ -269,6 +270,42 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(tuple(output.tokens.shape), (1, 32, 16))
         self.assertEqual(tuple(output.time_ids.shape), (32,))
         self.assertTrue(torch.equal(output.time_ids, torch.arange(32)))
+
+    def test_local_fau_branch_ignores_cached_au_logits_and_edges(self):
+        registry = build_registry(dim=16)
+        fau_features = torch.randn(1, 3, 4, 20)
+        au_logits = torch.randn(1, 3, 4)
+        au_edge_logits = torch.randn(1, 3, 4, 3)
+
+        raw_output = registry["fau"].encode({"fau_features": fau_features})
+        cached_output = registry["fau"].encode(
+            {
+                "fau_features": fau_features,
+                "fau_au_logits": au_logits,
+                "fau_au_edge_logits": au_edge_logits,
+            }
+        )
+
+        self.assertEqual(registry["fau"].required_keys(), ("fau_features",))
+        self.assertEqual(tuple(cached_output.tokens.shape), (1, 32, 16))
+        self.assertTrue(torch.allclose(raw_output.tokens, cached_output.tokens))
+        self.assertEqual(
+            cached_output.debug["ignored_optional_keys"],
+            ("fau_au_logits", "fau_au_edge_logits"),
+        )
+
+    def test_local_fau_branch_temporal_encoding_changes_when_frame_order_changes(self):
+        registry = build_registry(dim=16)
+        fau_features = torch.arange(1, 1 + 4 * 3 * 5, dtype=torch.float32).reshape(1, 4, 3, 5)
+        reversed_features = torch.flip(fau_features, dims=(1,))
+
+        output = registry["fau"].encode({"fau_features": fau_features})
+        reversed_output = registry["fau"].encode({"fau_features": reversed_features})
+
+        self.assertEqual(tuple(output.tokens.shape), (1, 32, 16))
+        self.assertEqual(output.debug["au_track_token_shape"], (3, 4, 16))
+        self.assertEqual(output.debug["clip_token_shape"], (1, 12, 16))
+        self.assertFalse(torch.allclose(output.tokens, reversed_output.tokens))
 
     def test_rppg_extractor_output_contract(self):
         extractor = RPPGExtractor(DummyRPPGEncoder(feature_dim=12))

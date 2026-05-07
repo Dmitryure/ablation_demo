@@ -36,20 +36,20 @@ head:
   hidden_dim: 1024
   dropout: 0.15
 eye_gaze:
-  model_path: /home/comp/ablation_task/models/face_landmarker_v2_with_blendshapes.task
+  model_path: models/face_landmarker_v2_with_blendshapes.task
   slot_count: 8
 rgb:
   frames: 16
-  checkpoint_path: /home/comp/ablation_task/checkpoints/mvit_v2_s-ae3be167.pth
+  checkpoint_path: checkpoints/mvit_v2_s-ae3be167.pth
   slot_count: 8
 fau:
   frames: 64
   backbone: swin_transformer_tiny
   num_classes: 12
-  checkpoint_path: /home/comp/ablation_task/checkpoints/fau/bp4d/swin_transformer_tiny/MEFARG_swin_tiny_BP4D_fold1.pth
+  checkpoint_path: checkpoints/fau/bp4d/swin_transformer_tiny/MEFARG_swin_tiny_BP4D_fold1.pth
   slot_count: 32
 rppg:
-  checkpoint_path: /home/comp/ablation_task/checkpoints/PURE_PhysNet_DiffNormalized.pth
+  checkpoint_path: checkpoints/PURE_PhysNet_DiffNormalized.pth
   slot_count: 24
 face_mesh:
   slot_count: 24

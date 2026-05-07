@@ -11,13 +11,18 @@ import torch
 from dataset import VideoExample
 from feature_cache import (
     CachedFeatureDataset,
+    FeatureCacheShardWriter,
+    append_feature_cache_failure,
     build_feature_cache_spec,
     build_feature_cache_specs,
     collate_cached_feature_batch,
     feature_cache_item_exists,
     feature_cache_item_path,
+    feature_cache_shard_failures_path,
+    feature_cache_shard_index_path,
     feature_cache_spec_id,
     load_feature_cache_item,
+    load_feature_cache_shard_index,
     write_feature_cache_item,
 )
 from scripts.run_iterative_cached_ablation import (
@@ -136,6 +141,34 @@ class FeatureCacheTest(unittest.TestCase):
         self.assertNotEqual(feature_cache_spec_id(rgb_spec), feature_cache_spec_id(checkpoint_spec))
         self.assertNotEqual(feature_cache_spec_id(rgb_spec), feature_cache_spec_id(frame_spec))
         self.assertNotEqual(feature_cache_spec_id(rgb_spec), feature_cache_spec_id(modality_spec))
+
+    def test_spec_treats_project_relative_local_paths_like_absolute_paths(self):
+        config = {
+            "image_size": 224,
+            "frames": {"default": 16},
+            "rgb": {"checkpoint_path": "models/face_landmarker_v2_with_blendshapes.task"},
+            "depth": {"model_id_or_path": "depth-anything/Depth-Anything-V2-Small-hf"},
+        }
+        absolute = {
+            **config,
+            "rgb": {
+                "checkpoint_path": str(
+                    Path(__file__).resolve().parents[1]
+                    / "models"
+                    / "face_landmarker_v2_with_blendshapes.task"
+                )
+            },
+        }
+
+        relative_spec = build_feature_cache_spec(config, "rgb")
+        absolute_spec = build_feature_cache_spec(absolute, "rgb")
+        depth_spec = build_feature_cache_spec(config, "depth")
+
+        self.assertEqual(feature_cache_spec_id(relative_spec), feature_cache_spec_id(absolute_spec))
+        self.assertEqual(
+            depth_spec.extractor_config["model_id_or_path"],
+            "depth-anything/Depth-Anything-V2-Small-hf",
+        )
 
     def test_spectral_modalities_are_cacheable(self):
         config = {
@@ -296,6 +329,68 @@ class FeatureCacheTest(unittest.TestCase):
             self.assertEqual(tuple(batch["rgb_features"].shape), (2, 2, 3))
             self.assertEqual(tuple(batch["label"].shape), (2, 1))
             self.assertEqual(batch["split"], ["train", "train"])
+
+    def test_sharded_cache_writes_index_and_loads_features(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            first = root / "fake" / "a.mp4"
+            second = root / "fake" / "b.mp4"
+            first.parent.mkdir()
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            examples = [build_example(first), build_example(second, source_id="clipB")]
+            spec = build_feature_cache_spec({"frames": {"default": 4}, "rgb": {}}, "rgb")
+
+            writer = FeatureCacheShardWriter(root / "cache", spec, dataset_root=root, shard_size=1)
+            writer.write(examples[0], {"rgb_features": torch.ones(2, 3)})
+            writer.write(examples[1], {"rgb_features": torch.full((2, 3), 2.0)})
+            writer.close()
+
+            index_path = feature_cache_shard_index_path(root / "cache", spec)
+            index_records = index_path.read_text(encoding="utf-8").strip().splitlines()
+            loaded = load_feature_cache_item(root / "cache", examples[1], spec, dataset_root=root)
+            index = load_feature_cache_shard_index(root / "cache", spec)
+
+            self.assertEqual(len(index_records), 2)
+            self.assertIn("fake/a.mp4", index)
+            self.assertIn("fake/b.mp4", index)
+            self.assertIsNotNone(loaded)
+            self.assertTrue(torch.equal(loaded["rgb_features"], torch.full((2, 3), 2.0)))
+            self.assertTrue(feature_cache_item_exists(root / "cache", examples[0], spec, root))
+
+            selected, counts = select_fully_cached_examples(
+                examples,
+                root / "cache",
+                {"rgb": spec},
+                ("rgb",),
+                root,
+            )
+
+            self.assertEqual(selected, examples)
+            self.assertEqual(counts["fully_cached_examples"], 2)
+
+    def test_sharded_cache_records_failures_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "fake" / "bad.mp4"
+            video.parent.mkdir()
+            video.write_bytes(b"bad")
+            example = build_example(video)
+            spec = build_feature_cache_spec({"frames": {"default": 4}, "rgb": {}}, "rgb")
+
+            append_feature_cache_failure(
+                root / "cache",
+                example,
+                spec,
+                "decode failed",
+                dataset_root=root,
+            )
+
+            failures = feature_cache_shard_failures_path(root / "cache", spec).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("fake/bad.mp4", failures)
+            self.assertIn("decode failed", failures)
 
     def test_cached_feature_dataset_strict_errors_on_missing_modality(self):
         with tempfile.TemporaryDirectory() as tmpdir:

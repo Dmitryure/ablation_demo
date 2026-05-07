@@ -15,7 +15,11 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
 
-from branches.compression import LatentQueryPooling, TemporalLatentQueryPooling
+from branches.compression import (
+    LatentQueryPooling,
+    TemporalLatentQueryPooling,
+    TemporalPositionEncoding,
+)
 from extractors import EYE_GAZE_COLUMNS, FACE_MESH_CONTOUR_INDICES
 from frame_config import resolve_modality_frame_count, resolve_modality_frame_counts
 from fusion import TokenBankFusion, prepare_token_bank
@@ -152,6 +156,8 @@ def describe_module(module: nn.Module) -> str:
             "TemporalLatentQueryPooling("
             f"output_tokens={module.pool.output_tokens}, positional_bias=sinusoidal)"
         )
+    if isinstance(module, TemporalPositionEncoding):
+        return f"TemporalPositionEncoding(dim={module.dim}, scale=learned)"
     if isinstance(module, LatentQueryPooling):
         return f"LatentQueryPooling(output_tokens={module.output_tokens})"
     if isinstance(module, nn.Embedding):
@@ -322,6 +328,9 @@ def _branch_output_summary(branch: nn.Module, dim: int) -> str:
 def _branch_token_formula(name: str, branch: nn.Module, config: Mapping[str, Any]) -> str:
     frames = resolve_modality_frame_count(config, name)
     slot_count = int(branch.slot_count)
+    if name == "fau":
+        num_classes = int(config.get("fau", {}).get("num_classes", 12))
+        return f"raw_tokens={frames}*{num_classes}, final_slots={slot_count}"
     if hasattr(branch, "frame_pool") and hasattr(branch.frame_pool, "output_tokens"):
         return (
             f"frames={frames}, frame_query_tokens={branch.frame_pool.output_tokens}, "
@@ -345,7 +354,11 @@ def _branch_note(name: str) -> str:
             "Per-point MLP happens before point pooling, then frame tokens compress to clip slots."
         )
     if name == "fau":
-        return "FAU features use two-stage pooling: within frame first, then across the clip."
+        return (
+            "Raw per-AU MEGraphAU embeddings are projected, kept as AU temporal tracks, "
+            "given sinusoidal time encoding, then pooled to fixed FAU slots. Cached AU logits "
+            "and edge logits are ignored by this branch."
+        )
     if name == "rppg":
         return "Waveform is a side output; only temporal features enter projection and pooling."
     if name == "depth":
@@ -376,6 +389,8 @@ def _normalize_branch_stage(
             return None
         if event.attr == "proj":
             title = "Project"
+        elif event.attr == "temporal_position_encoding":
+            title = "Temporal Position"
         elif event.attr == "frame_pool":
             title = "Frame Pool"
         elif event.attr == "point_pool":

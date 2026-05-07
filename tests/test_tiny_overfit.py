@@ -160,8 +160,8 @@ class TinyOverfitTest(unittest.TestCase):
                 )
             ]
 
-            def fake_load_video_clip(path, num_frames, image_size):
-                del path
+            def fake_load_video_clip(path, num_frames, image_size, decode_mode="seek"):
+                del path, decode_mode
                 return {
                     "video": torch.ones(3, num_frames, image_size, image_size),
                     "video_rgb_frames": [object() for _ in range(num_frames)],

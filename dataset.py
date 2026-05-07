@@ -21,6 +21,7 @@ IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3,
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 VALID_SPLITS: tuple[str, ...] = ("train", "val", "test")
 VIDEO_EXTENSIONS: tuple[str, ...] = (".mp4", ".mov", ".avi", ".mkv", ".webm")
+VIDEO_DECODE_MODES: tuple[str, ...] = ("seek", "scan")
 
 
 @dataclass(frozen=True)
@@ -897,7 +898,10 @@ def load_video_clip(
     path: str | Path,
     num_frames: int,
     image_size: int = 224,
+    decode_mode: str = "seek",
 ) -> dict[str, Any]:
+    if decode_mode not in VIDEO_DECODE_MODES:
+        raise ValueError(f"`decode_mode` must be one of {VIDEO_DECODE_MODES}, got {decode_mode!r}")
     clip_path = Path(path)
     cap = cv2.VideoCapture(str(clip_path))
     if not cap.isOpened():
@@ -914,19 +918,44 @@ def load_video_clip(
     clip_frames: list[torch.Tensor] = []
     rgb_frames: list[np.ndarray] = []
 
-    for frame_index in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ok, frame = cap.read()
-        if not ok:
-            cap.release()
-            raise RuntimeError(f"Failed to read frame {frame_index} from {clip_path}")
+    if decode_mode == "seek":
+        for frame_index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = cap.read()
+            if not ok:
+                cap.release()
+                raise RuntimeError(f"Failed to read frame {frame_index} from {clip_path}")
 
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_frames.append(frame)
-        frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
-        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-        frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
-        clip_frames.append(frame_tensor)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frames.append(frame)
+            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+            frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
+            clip_frames.append(frame_tensor)
+    else:
+        target_by_frame = {int(frame_index): target for target, frame_index in enumerate(indices)}
+        selected_frames: list[np.ndarray | None] = [None] * len(indices)
+        max_frame_index = int(indices[-1])
+        for frame_index in range(max_frame_index + 1):
+            ok, frame = cap.read()
+            if not ok:
+                cap.release()
+                raise RuntimeError(f"Failed to read frame {frame_index} from {clip_path}")
+            target = target_by_frame.get(frame_index)
+            if target is not None:
+                selected_frames[target] = frame
+        for target, frame in enumerate(selected_frames):
+            if frame is None:
+                cap.release()
+                raise RuntimeError(
+                    f"Failed to collect sampled frame {indices[target]} from {clip_path}"
+                )
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frames.append(frame)
+            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
+            frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
+            clip_frames.append(frame_tensor)
 
     cap.release()
     return {
@@ -941,10 +970,14 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
         examples: Sequence[VideoExample],
         num_frames: int | Mapping[str, int],
         image_size: int = 224,
+        decode_mode: str = "seek",
     ) -> None:
         self.examples = list(examples)
         self.num_frames = num_frames
         self.image_size = image_size
+        if decode_mode not in VIDEO_DECODE_MODES:
+            raise ValueError(f"`decode_mode` must be one of {VIDEO_DECODE_MODES}.")
+        self.decode_mode = decode_mode
         if isinstance(num_frames, Mapping):
             if not num_frames:
                 raise ValueError("`num_frames` mapping must not be empty.")
@@ -963,6 +996,7 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                 path=example.path,
                 num_frames=int(self.num_frames),
                 image_size=self.image_size,
+                decode_mode=self.decode_mode,
             )
             load_seconds = time.perf_counter() - load_start
             video = clip["video"]
@@ -982,6 +1016,7 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                         path=example.path,
                         num_frames=frame_count,
                         image_size=self.image_size,
+                        decode_mode=self.decode_mode,
                     )
                     load_seconds_by_count[frame_count] = time.perf_counter() - load_start
                 clip = clips_by_count[frame_count]
