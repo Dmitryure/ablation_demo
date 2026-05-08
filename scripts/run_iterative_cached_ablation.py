@@ -37,6 +37,7 @@ from feature_cache import (
     build_feature_cache_specs,
     collate_cached_feature_batch,
     feature_cache_item_exists,
+    feature_cache_manifest_path,
     feature_cache_spec_dir,
     feature_cache_spec_id,
     metadata_filename_for_example,
@@ -1718,10 +1719,25 @@ def missing_examples_for_modality(
     progress_bar: bool = False,
     label: str = "",
     progress_every: int = 100,
+    manifest_minimum_rows: int | None = None,
 ) -> list[VideoExample]:
     spec_id = feature_cache_spec_id(spec)
     modality_cache_root = feature_cache_spec_dir(cache_dir, spec)
     root_exists = modality_cache_root.exists()
+    if not overwrite:
+        manifest_keys = read_cached_manifest_keys(
+            cache_dir,
+            spec,
+            minimum_rows=manifest_minimum_rows,
+        )
+        if manifest_keys is not None:
+            return [
+                example
+                for example in examples
+                if cache_key_for_example(example, dataset_root) not in manifest_keys
+                and (spec_id, spec.modality, str(example.path)) not in skip_failure_keys
+            ]
+
     progress = build_scan_progress(examples, spec, progress_bar, label)
     progress_interval = max(1, progress_every)
     missing: list[VideoExample] = []
@@ -1761,6 +1777,7 @@ def count_missing_cache(
     specs: Mapping[str, FeatureCacheSpec],
     modalities: Sequence[str],
     dataset_root: Path,
+    manifest_minimum_rows: int | None = None,
 ) -> dict[str, int]:
     missing: dict[str, int] = {}
     for modality in modalities:
@@ -1768,6 +1785,17 @@ def count_missing_cache(
         modality_cache_root = feature_cache_spec_dir(cache_dir, spec)
         if not modality_cache_root.exists():
             missing[modality] = len(examples)
+            continue
+        manifest_keys = read_cached_manifest_keys(
+            cache_dir,
+            spec,
+            minimum_rows=manifest_minimum_rows,
+        )
+        if manifest_keys is not None:
+            missing[modality] = sum(
+                cache_key_for_example(example, dataset_root) not in manifest_keys
+                for example in examples
+            )
             continue
         missing[modality] = sum(
             not feature_cache_item_exists(cache_dir, example, spec, dataset_root)
@@ -1782,8 +1810,24 @@ def count_cached_and_skipped(
     spec: FeatureCacheSpec,
     dataset_root: Path,
     skip_failure_keys: set[tuple[str, str, str]],
+    manifest_minimum_rows: int | None = None,
 ) -> tuple[int, int]:
     spec_id = feature_cache_spec_id(spec)
+    manifest_keys = read_cached_manifest_keys(
+        cache_dir,
+        spec,
+        minimum_rows=manifest_minimum_rows,
+    )
+    if manifest_keys is not None:
+        cached = 0
+        skipped_failed = 0
+        for example in examples:
+            if cache_key_for_example(example, dataset_root) in manifest_keys:
+                cached += 1
+            elif (spec_id, spec.modality, str(example.path)) in skip_failure_keys:
+                skipped_failed += 1
+        return cached, skipped_failed
+
     cached = 0
     skipped_failed = 0
     for example in examples:
@@ -1858,6 +1902,33 @@ def cache_key_for_example(example: VideoExample, dataset_root: Path) -> str:
     return f"{example.class_name}/{metadata_filename_for_example(example, dataset_root)}"
 
 
+def read_cached_manifest_keys(
+    cache_dir: Path,
+    spec: FeatureCacheSpec,
+    minimum_rows: int | None = None,
+) -> set[str] | None:
+    path = feature_cache_manifest_path(cache_dir, spec)
+    if not path.is_file():
+        return None
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required_columns = {"class_name", "filename", "status"}
+        if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
+            return None
+        cached_keys: set[str] = set()
+        row_count = 0
+        for row in reader:
+            row_count += 1
+            class_name = str(row.get("class_name", "")).strip()
+            filename = str(row.get("filename", "")).strip()
+            if str(row.get("status", "")).strip() == "cached" and class_name and filename:
+                cached_keys.add(f"{class_name}/{filename}")
+        if minimum_rows is not None and row_count < minimum_rows:
+            return None
+        return cached_keys
+
+
 def select_fully_cached_examples(
     examples: Sequence[VideoExample],
     cache_dir: Path,
@@ -1867,10 +1938,22 @@ def select_fully_cached_examples(
     progress_every: int | None = None,
 ) -> tuple[list[VideoExample], dict[str, int]]:
     cached_key_sets: dict[str, set[str]] = {}
+    manifest_backed_modalities = 0
     for modality in modalities:
         spec = specs[modality]
         spec_dir = feature_cache_spec_dir(cache_dir, spec)
         spec_id = feature_cache_spec_id(spec)
+        manifest_keys = read_cached_manifest_keys(cache_dir, spec, minimum_rows=len(examples))
+        if manifest_keys is not None:
+            cached_key_sets[modality] = manifest_keys
+            manifest_backed_modalities += 1
+            print(
+                f"cache selection: manifest modality={modality} "
+                f"matched={len(manifest_keys)} cache_from={spec_dir} spec_id={spec_id}",
+                flush=True,
+            )
+            continue
+
         print(
             f"cache selection: scan metadata modality={modality} "
             f"cache_from={spec_dir} spec_id={spec_id}",
@@ -1908,6 +1991,7 @@ def select_fully_cached_examples(
             "dataset_examples": len(examples),
             "fully_cached_examples": len(selected),
             "modalities": len(modalities),
+            "manifest_backed_modalities": manifest_backed_modalities,
         }
     )
     return selected, counts
@@ -2242,6 +2326,7 @@ def initialize_feature_cache_progress(
     label: str,
     progress_bar: bool,
     assume_missing_cache: bool = False,
+    manifest_minimum_rows: int | None = None,
 ) -> tuple[dict[str, list[VideoExample]], dict[str, Any]]:
     skip_failure_keys = read_failure_keys(cache_dir) if skip_failures else set()
     progress: dict[str, Any] = {}
@@ -2268,6 +2353,7 @@ def initialize_feature_cache_progress(
                 progress_bar=progress_bar,
                 label=label,
                 progress_every=progress_interval,
+                manifest_minimum_rows=manifest_minimum_rows,
             )
         missing_by_modality[modality] = missing
         progress[modality] = {
@@ -2294,6 +2380,7 @@ def initialize_feature_cache_progress(
                 spec=spec,
                 dataset_root=dataset_root,
                 skip_failure_keys=skip_failure_keys,
+                manifest_minimum_rows=manifest_minimum_rows,
             )
         progress[modality]["cached_before"] = cached_before
         progress[modality]["skipped_failed"] = skipped_failed
@@ -2610,6 +2697,8 @@ def ensure_feature_cache(
     assume_missing_cache: bool = False,
     video_decode_mode: str = "scan",
     clip_cache_dir: Path | None = None,
+    manifest_minimum_rows: int | None = None,
+    write_manifests: bool = True,
 ) -> dict[str, Any]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     progress_bar = progress_bar and sys.stderr.isatty()
@@ -2626,6 +2715,7 @@ def ensure_feature_cache(
         label=label,
         progress_bar=progress_bar,
         assume_missing_cache=assume_missing_cache,
+        manifest_minimum_rows=manifest_minimum_rows,
     )
     failure_rows = cache_missing_feature_groups(
         examples=examples,
@@ -2645,6 +2735,8 @@ def ensure_feature_cache(
         clip_cache_dir=clip_cache_dir,
     )
     for modality in modalities:
+        if not write_manifests:
+            continue
         spec = specs[modality]
         errors = {
             str(row["path"]): str(row.get("error", ""))
@@ -3620,6 +3712,8 @@ def main() -> None:
         label="eval",
         video_decode_mode=args.video_decode_mode,
         clip_cache_dir=clip_cache_dir,
+        manifest_minimum_rows=len(dataset_examples),
+        write_manifests=False,
     )
     write_json(output_dir / "eval_cache_progress.json", eval_progress)
     print(f"wrote: {output_dir / 'eval_cache_progress.json'}", flush=True)
@@ -3648,6 +3742,8 @@ def main() -> None:
             label=f"train_{target}",
             video_decode_mode=args.video_decode_mode,
             clip_cache_dir=clip_cache_dir,
+            manifest_minimum_rows=len(dataset_examples),
+            write_manifests=False,
         )
         write_json(round_dir / "cache_progress.json", cache_progress)
         print(f"wrote: {round_dir / 'cache_progress.json'}", flush=True)
@@ -3747,6 +3843,8 @@ def main() -> None:
             label="sanity",
             video_decode_mode=args.video_decode_mode,
             clip_cache_dir=clip_cache_dir,
+            manifest_minimum_rows=len(dataset_examples),
+            write_manifests=False,
         )
         write_json(output_dir / "sanity_cache_progress.json", sanity_progress)
         print(f"wrote: {output_dir / 'sanity_cache_progress.json'}", flush=True)
