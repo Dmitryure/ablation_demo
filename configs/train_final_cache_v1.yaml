@@ -11,7 +11,7 @@ frames:
   default: 32
 image_size: 224
 face_crop:
-  enabled: true
+  enabled: false
   backend: opencv_haar
   detection_frequency: 16
   large_box_coef: 1.5
@@ -20,6 +20,56 @@ dim: 256
 seed: 0
 device: cuda
 training:
+  run:
+    dataset_root: /mnt/d/final_dataset
+    cache_dir: /mnt/d/final_cache/v1
+    output_dir: iterative_ablation_runs_v1
+    modalities:
+      - rgb
+      - fau
+      - rppg
+      - eye_gaze
+      - face_mesh
+      - depth
+      - fft
+      - stft
+    modality_permutations: none
+    round_ladder: large
+    round_targets: null
+    eval_count_per_split: 500
+    balanced_total: null
+    train_ratio: 0.8
+    val_ratio: 0.1
+    batch_size: 8
+    extract_batch_size: 4
+    progress_every: 25
+    epochs: 30
+    lr: 0.001
+    weight_decay: 0.01
+    modality_lr: null
+    modality_dropout: null
+    depth_dropout: null
+    gate_entropy_weight: null
+    device: cuda
+    checkpoint_metric: val_balanced_accuracy
+    early_stopping_patience: 6
+    early_stopping_min_delta: 0.0
+    occlusion_diagnostics: true
+    occlusion_splits:
+      - val
+      - test
+    seed: 0
+    overwrite_cache: false
+    prefer_cached_selection: true
+    warm_start_rounds: false
+    skip_failures: true
+    video_decode_mode: scan
+    clip_cache_dir: null
+    enable_clip_cache: false
+    no_clip_cache: true
+    sanity_count: 300
+    no_sanity_check: false
+    dry_run: false
   cached_loader:
     num_workers: 4
     pin_memory: true

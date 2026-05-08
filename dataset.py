@@ -17,6 +17,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from face_crop_config import (
+    FACE_CROP_STATUS_DETECTED,
+    FACE_CROP_STATUS_DISABLED,
+    FACE_CROP_STATUS_FALLBACK,
+    RPPG_CACHE_VARIANT,
+    face_crop_cache_variant,
+    merged_face_crop_config,
+)
+
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
 VALID_SPLITS: tuple[str, ...] = ("train", "val", "test")
@@ -24,11 +33,10 @@ VIDEO_EXTENSIONS: tuple[str, ...] = (".mp4", ".mov", ".avi", ".mkv", ".webm")
 VIDEO_DECODE_MODES: tuple[str, ...] = ("seek", "scan")
 VIDEO_CLIP_CACHE_VERSION = 1
 RPPG_CLIP_CACHE_VERSION = 1
-RPPG_CACHE_VARIANT = "rppg_v2_contiguous128_facecrop_haar_diffnorm128"
 RPPG_DEFAULT_FPS = 30.0
-RPPG_FACE_CROP_STATUS_DETECTED = "detected"
-RPPG_FACE_CROP_STATUS_FALLBACK = "fallback_full_frame"
-RPPG_FACE_CROP_STATUS_DISABLED = "disabled"
+RPPG_FACE_CROP_STATUS_DETECTED = FACE_CROP_STATUS_DETECTED
+RPPG_FACE_CROP_STATUS_FALLBACK = FACE_CROP_STATUS_FALLBACK
+RPPG_FACE_CROP_STATUS_DISABLED = FACE_CROP_STATUS_DISABLED
 RPPG_HAAR_CASCADE = "haarcascade_frontalface_default.xml"
 
 
@@ -917,6 +925,7 @@ def load_video_clip(
     num_frames: int,
     image_size: int = 224,
     decode_mode: str = "scan",
+    face_crop_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if decode_mode not in VIDEO_DECODE_MODES:
         raise ValueError(f"`decode_mode` must be one of {VIDEO_DECODE_MODES}, got {decode_mode!r}")
@@ -936,7 +945,6 @@ def load_video_clip(
     indices = (
         torch.linspace(0, total_frames - 1, steps=num_frames).round().to(dtype=torch.int64).tolist()
     )
-    clip_frames: list[torch.Tensor] = []
     rgb_frames: list[np.ndarray] = []
 
     if decode_mode == "seek":
@@ -949,10 +957,6 @@ def load_video_clip(
 
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb_frames.append(frame)
-            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
-            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-            frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
-            clip_frames.append(frame_tensor)
     else:
         target_by_frame = {int(frame_index): target for target, frame_index in enumerate(indices)}
         selected_frames: list[np.ndarray | None] = [None] * len(indices)
@@ -973,16 +977,22 @@ def load_video_clip(
                 )
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb_frames.append(frame)
-            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
-            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
-            frame_tensor = (frame_tensor - IMAGENET_MEAN) / IMAGENET_STD
-            clip_frames.append(frame_tensor)
 
     cap.release()
+    box = None
+    face_crop_status = FACE_CROP_STATUS_DISABLED
+    if face_crop_config is not None:
+        box, face_crop_status = _resolve_clip_face_crop(
+            rgb_frames,
+            face_crop_config=face_crop_config,
+            field_name="video",
+        )
+    resized_frames = crop_resize_rgb_frames(rgb_frames, box, image_size)
     return {
-        "video": torch.stack(clip_frames, dim=1),
-        "video_rgb_frames": rgb_frames,
+        "video": _imagenet_video_tensor(resized_frames),
+        "video_rgb_frames": resized_frames,
         "video_fps": fps,
+        "face_crop_status": face_crop_status,
     }
 
 
@@ -1033,10 +1043,10 @@ def enlarge_box(
     size_h = max(1.0, float(h) * float(coef))
     center_x = float(x) + float(w) / 2.0
     center_y = float(y) + float(h) / 2.0
-    x1 = max(0, int(round(center_x - size_w / 2.0)))
-    y1 = max(0, int(round(center_y - size_h / 2.0)))
-    x2 = min(frame_w, int(round(center_x + size_w / 2.0)))
-    y2 = min(frame_h, int(round(center_y + size_h / 2.0)))
+    x1 = max(0, round(center_x - size_w / 2.0))
+    y1 = max(0, round(center_y - size_h / 2.0))
+    x2 = min(frame_w, round(center_x + size_w / 2.0))
+    y2 = min(frame_h, round(center_y + size_h / 2.0))
     if x2 <= x1:
         x2 = min(frame_w, x1 + 1)
     if y2 <= y1:
@@ -1061,7 +1071,7 @@ def _detect_largest_face(
     return largest_face_box(boxes)
 
 
-def resolve_rppg_face_crop_box(
+def resolve_face_crop_box(
     frames: Sequence[np.ndarray],
     detection_frequency: int = 16,
     large_box_coef: float = 1.5,
@@ -1078,8 +1088,22 @@ def resolve_rppg_face_crop_box(
             detected.append(box)
     median_box = median_face_box(detected)
     if median_box is None:
-        return None, RPPG_FACE_CROP_STATUS_FALLBACK
-    return enlarge_box(median_box, large_box_coef, frames[0].shape), RPPG_FACE_CROP_STATUS_DETECTED
+        return None, FACE_CROP_STATUS_FALLBACK
+    return enlarge_box(median_box, large_box_coef, frames[0].shape), FACE_CROP_STATUS_DETECTED
+
+
+def resolve_rppg_face_crop_box(
+    frames: Sequence[np.ndarray],
+    detection_frequency: int = 16,
+    large_box_coef: float = 1.5,
+    detector: cv2.CascadeClassifier | None = None,
+) -> tuple[tuple[int, int, int, int] | None, str]:
+    return resolve_face_crop_box(
+        frames=frames,
+        detection_frequency=detection_frequency,
+        large_box_coef=large_box_coef,
+        detector=detector,
+    )
 
 
 def crop_resize_rgb_frames(
@@ -1101,6 +1125,37 @@ def _rppg_config_value(config: Mapping[str, Any] | None, key: str, default: Any)
     if config is None:
         return default
     return config.get(key, default)
+
+
+def _resolve_clip_face_crop(
+    frames: Sequence[np.ndarray],
+    face_crop_config: Mapping[str, Any],
+    field_name: str,
+) -> tuple[tuple[int, int, int, int] | None, str]:
+    if not bool(face_crop_config["enabled"]):
+        return None, FACE_CROP_STATUS_DISABLED
+    backend = str(face_crop_config["backend"])
+    if backend != "opencv_haar":
+        raise ValueError(f"Unsupported {field_name} face crop backend: {backend!r}")
+    box, status = resolve_face_crop_box(
+        frames,
+        detection_frequency=int(face_crop_config["detection_frequency"]),
+        large_box_coef=float(face_crop_config["large_box_coef"]),
+    )
+    fallback = str(face_crop_config["fallback"])
+    if box is None and fallback != "full_frame":
+        raise RuntimeError(f"{field_name} face crop failed and fallback={fallback!r}")
+    return box, status
+
+
+def _imagenet_video_tensor(frames: Sequence[np.ndarray]) -> torch.Tensor:
+    tensors = []
+    for frame in frames:
+        frame_tensor = (
+            torch.from_numpy(np.ascontiguousarray(frame)).permute(2, 0, 1).float() / 255.0
+        )
+        tensors.append((frame_tensor - IMAGENET_MEAN) / IMAGENET_STD)
+    return torch.stack(tensors, dim=1)
 
 
 def load_rppg_video_clip(
@@ -1129,26 +1184,16 @@ def load_rppg_video_clip(
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
 
-    face_crop_config = _rppg_config_value(rppg_config, "face_crop", {})
-    if face_crop_config is None:
-        face_crop_config = {}
-    if not isinstance(face_crop_config, Mapping):
-        raise ValueError("`rppg.face_crop` must be a mapping.")
-    crop_enabled = bool(face_crop_config.get("enabled", True))
-    box = None
-    status = RPPG_FACE_CROP_STATUS_DISABLED
-    if crop_enabled:
-        backend = str(face_crop_config.get("backend", "opencv_haar"))
-        if backend != "opencv_haar":
-            raise ValueError(f"Unsupported rPPG face crop backend: {backend!r}")
-        box, status = resolve_rppg_face_crop_box(
-            frames,
-            detection_frequency=int(face_crop_config.get("detection_frequency", 16)),
-            large_box_coef=float(face_crop_config.get("large_box_coef", 1.5)),
-        )
-        fallback = str(face_crop_config.get("fallback", "full_frame"))
-        if box is None and fallback != "full_frame":
-            raise RuntimeError(f"rPPG face crop failed and fallback={fallback!r}")
+    face_crop_config = merged_face_crop_config(
+        global_config=None,
+        modality_config=rppg_config,
+        default_enabled=True,
+    )
+    box, status = _resolve_clip_face_crop(
+        frames,
+        face_crop_config=face_crop_config,
+        field_name="rPPG",
+    )
 
     cropped_frames = crop_resize_rgb_frames(frames, box, image_size)
     video = torch.stack(
@@ -1208,11 +1253,20 @@ def video_clip_cache_item_path(
     example: VideoExample,
     num_frames: int,
     image_size: int,
+    cache_variant: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> Path:
     filename = metadata_filename_for_example(example, dataset_root)
+    if cache_variant is None:
+        return (
+            Path(cache_dir)
+            / f"frames_{int(num_frames)}_size_{int(image_size)}"
+            / example.class_name
+            / f"{filename}.pt"
+        )
     return (
         Path(cache_dir)
+        / cache_variant
         / f"frames_{int(num_frames)}_size_{int(image_size)}"
         / example.class_name
         / f"{filename}.pt"
@@ -1240,15 +1294,19 @@ def _video_clip_cache_header(
     example: VideoExample,
     num_frames: int,
     image_size: int,
+    cache_variant: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    return {
+    header = {
         "version": VIDEO_CLIP_CACHE_VERSION,
         "class_name": example.class_name,
         "filename": metadata_filename_for_example(example, dataset_root),
         "num_frames": int(num_frames),
         "image_size": int(image_size),
     }
+    if cache_variant is not None:
+        header["cache_variant"] = cache_variant
+    return header
 
 
 def _video_clip_cache_matches(
@@ -1256,9 +1314,16 @@ def _video_clip_cache_matches(
     example: VideoExample,
     num_frames: int,
     image_size: int,
+    cache_variant: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> bool:
-    expected = _video_clip_cache_header(example, num_frames, image_size, dataset_root)
+    expected = _video_clip_cache_header(
+        example,
+        num_frames,
+        image_size,
+        cache_variant,
+        dataset_root,
+    )
     return all(payload.get(key) == value for key, value in expected.items())
 
 
@@ -1294,6 +1359,8 @@ def load_video_clip_for_example(
     num_frames: int,
     image_size: int = 224,
     decode_mode: str = "scan",
+    face_crop_config: Mapping[str, Any] | None = None,
+    cache_variant: str | None = None,
     clip_cache_dir: str | Path | None = None,
     dataset_root: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -1303,6 +1370,7 @@ def load_video_clip_for_example(
             num_frames=num_frames,
             image_size=image_size,
             decode_mode=decode_mode,
+            face_crop_config=face_crop_config,
         )
 
     cache_path = video_clip_cache_item_path(
@@ -1310,6 +1378,7 @@ def load_video_clip_for_example(
         example,
         num_frames=num_frames,
         image_size=image_size,
+        cache_variant=cache_variant,
         dataset_root=dataset_root,
     )
     if cache_path.exists():
@@ -1319,28 +1388,44 @@ def load_video_clip_for_example(
             example,
             num_frames=num_frames,
             image_size=image_size,
+            cache_variant=cache_variant,
             dataset_root=dataset_root,
         ):
             video = payload.get("video")
             frames = payload.get("video_rgb_frames")
             if isinstance(video, torch.Tensor) and isinstance(frames, list):
                 fps = float(payload.get("video_fps", RPPG_DEFAULT_FPS))
-                return {"video": video, "video_rgb_frames": frames, "video_fps": fps}
+                return {
+                    "video": video,
+                    "video_rgb_frames": frames,
+                    "video_fps": fps,
+                    "face_crop_status": str(
+                        payload.get("face_crop_status", FACE_CROP_STATUS_DISABLED)
+                    ),
+                }
 
     clip = load_video_clip(
         path=example.path,
         num_frames=num_frames,
         image_size=image_size,
         decode_mode=decode_mode,
+        face_crop_config=face_crop_config,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
     torch.save(
         {
-            **_video_clip_cache_header(example, num_frames, image_size, dataset_root),
+            **_video_clip_cache_header(
+                example,
+                num_frames,
+                image_size,
+                cache_variant,
+                dataset_root,
+            ),
             "video": clip["video"].detach().cpu(),
             "video_rgb_frames": clip["video_rgb_frames"],
             "video_fps": float(clip.get("video_fps", RPPG_DEFAULT_FPS)),
+            "face_crop_status": clip.get("face_crop_status", FACE_CROP_STATUS_DISABLED),
         },
         tmp_path,
     )
@@ -1427,12 +1512,18 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
         dataset_root: str | Path | None = None,
         image_size_by_modality: Mapping[str, int] | None = None,
         rppg_config: Mapping[str, Any] | None = None,
+        modality_configs: Mapping[str, Mapping[str, Any]] | None = None,
+        global_config: Mapping[str, Any] | None = None,
     ) -> None:
         self.examples = list(examples)
         self.num_frames = num_frames
         self.image_size = image_size
         self.image_size_by_modality = dict(image_size_by_modality or {})
         self.rppg_config = dict(rppg_config or {})
+        self.modality_configs = {
+            str(key): dict(value) for key, value in (modality_configs or {}).items()
+        }
+        self.global_config = dict(global_config or {})
         self.clip_cache_dir = Path(clip_cache_dir) if clip_cache_dir is not None else None
         self.dataset_root = normalize_video_dataset_root(dataset_root)
         if decode_mode not in VIDEO_DECODE_MODES:
@@ -1467,6 +1558,7 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
             video_by_modality = None
             video_rgb_frames_by_modality = None
             video_fps_by_modality = None
+            face_crop_status_by_modality = None
             rppg_face_crop_status_by_modality = None
             load_timings_by_modality = {"default": load_seconds}
         else:
@@ -1475,13 +1567,30 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
             video_by_modality = {}
             video_rgb_frames_by_modality = {}
             video_fps_by_modality = {}
+            face_crop_status_by_modality = {}
             rppg_face_crop_status_by_modality = {}
             for modality_name, frame_count in self.frame_counts_by_modality.items():
                 modality_image_size = int(
                     self.image_size_by_modality.get(modality_name, self.image_size)
                 )
-                loader_kind = "rppg" if modality_name == "rppg" else "default"
-                clip_key = (loader_kind, int(frame_count), modality_image_size)
+                if modality_name == "rppg":
+                    loader_kind = "rppg"
+                    cache_variant = RPPG_CACHE_VARIANT
+                    face_crop_config = None
+                else:
+                    loader_kind = "default"
+                    modality_config = self.modality_configs.get(modality_name, {})
+                    face_crop_config = merged_face_crop_config(
+                        global_config=self.global_config,
+                        modality_config=modality_config,
+                        default_enabled=False,
+                    )
+                    cache_variant = face_crop_cache_variant(
+                        global_config=self.global_config,
+                        modality_config=modality_config,
+                        default_enabled=False,
+                    )
+                clip_key = (loader_kind, int(frame_count), modality_image_size, cache_variant)
                 if clip_key not in clips_by_spec:
                     load_start = time.perf_counter()
                     if modality_name == "rppg":
@@ -1499,6 +1608,10 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                             num_frames=frame_count,
                             image_size=modality_image_size,
                             decode_mode=self.decode_mode,
+                            face_crop_config=face_crop_config
+                            if cache_variant is not None
+                            else None,
+                            cache_variant=cache_variant,
                             clip_cache_dir=self.clip_cache_dir,
                             dataset_root=self.dataset_root,
                         )
@@ -1508,6 +1621,12 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                 video_rgb_frames_by_modality[modality_name] = clip["video_rgb_frames"]
                 video_fps_by_modality[modality_name] = float(
                     clip.get("video_fps", RPPG_DEFAULT_FPS)
+                )
+                face_crop_status_by_modality[modality_name] = str(
+                    clip.get(
+                        "rppg_face_crop_status" if modality_name == "rppg" else "face_crop_status",
+                        FACE_CROP_STATUS_DISABLED,
+                    )
                 )
                 if modality_name == "rppg":
                     rppg_face_crop_status_by_modality[modality_name] = str(
@@ -1522,6 +1641,13 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                         "rppg" if modality_name == "rppg" else "default",
                         int(value),
                         int(self.image_size_by_modality.get(modality_name, self.image_size)),
+                        RPPG_CACHE_VARIANT
+                        if modality_name == "rppg"
+                        else face_crop_cache_variant(
+                            global_config=self.global_config,
+                            modality_config=self.modality_configs.get(modality_name, {}),
+                            default_enabled=False,
+                        ),
                     )
                     == clip_key
                 )
@@ -1533,6 +1659,13 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                         "rppg" if modality_name == "rppg" else "default",
                         int(frame_count),
                         int(self.image_size_by_modality.get(modality_name, self.image_size)),
+                        RPPG_CACHE_VARIANT
+                        if modality_name == "rppg"
+                        else face_crop_cache_variant(
+                            global_config=self.global_config,
+                            modality_config=self.modality_configs.get(modality_name, {}),
+                            default_enabled=False,
+                        ),
                     )
                 ]
                 / count_usage[
@@ -1540,6 +1673,13 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                         "rppg" if modality_name == "rppg" else "default",
                         int(frame_count),
                         int(self.image_size_by_modality.get(modality_name, self.image_size)),
+                        RPPG_CACHE_VARIANT
+                        if modality_name == "rppg"
+                        else face_crop_cache_variant(
+                            global_config=self.global_config,
+                            modality_config=self.modality_configs.get(modality_name, {}),
+                            default_enabled=False,
+                        ),
                     )
                 ]
                 for modality_name, frame_count in self.frame_counts_by_modality.items()
@@ -1573,6 +1713,7 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
             item["video_by_modality"] = video_by_modality
             item["video_rgb_frames_by_modality"] = video_rgb_frames_by_modality
             item["video_fps_by_modality"] = video_fps_by_modality
+            item["face_crop_status_by_modality"] = face_crop_status_by_modality
             item["rppg_face_crop_status_by_modality"] = rppg_face_crop_status_by_modality
         return {
             **item,
@@ -1631,6 +1772,12 @@ def collate_labeled_video_batch(items: Sequence[dict[str, Any]]) -> dict[str, An
                 ],
                 dtype=torch.float32,
             )
+            for modality_name in modality_names
+        }
+        batch["face_crop_status_by_modality"] = {
+            modality_name: [
+                item.get("face_crop_status_by_modality", {}).get(modality_name) for item in items
+            ]
             for modality_name in modality_names
         }
         batch["rppg_face_crop_status_by_modality"] = {

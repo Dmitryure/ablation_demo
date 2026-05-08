@@ -124,12 +124,17 @@ def parse_args() -> argparse.Namespace:
         "--clip-cache-dir",
         type=Path,
         default=None,
-        help="Decoded clip cache directory. Defaults to <cache-dir>/_clips.",
+        help="Enable decoded clip cache at this directory.",
+    )
+    parser.add_argument(
+        "--enable-clip-cache",
+        action="store_true",
+        help="Enable decoded clip cache at <cache-dir>/_clips.",
     )
     parser.add_argument(
         "--no-clip-cache",
         action="store_true",
-        help="Disable decoded clip cache and decode videos directly.",
+        help="Deprecated no-op; decoded clip cache is disabled by default.",
     )
     parser.add_argument(
         "--no-progress-bar",
@@ -396,7 +401,11 @@ def main() -> None:
     dataset_root = args.dataset_root
     video_root = resolve_video_root(dataset_root)
     cache_dir = args.cache_dir or (dataset_root / "feature_cache")
-    clip_cache_dir = None if args.no_clip_cache else (args.clip_cache_dir or cache_dir / "_clips")
+    clip_cache_dir = None
+    if args.clip_cache_dir is not None:
+        clip_cache_dir = args.clip_cache_dir
+    elif args.enable_clip_cache and not args.no_clip_cache:
+        clip_cache_dir = cache_dir / "_clips"
     modalities = resolve_base_modalities(config, args.modalities)
     specs = build_feature_cache_specs(config, modalities)
     output_dir = args.output_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}"

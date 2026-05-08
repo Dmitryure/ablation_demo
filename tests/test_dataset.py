@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 import torch
 
@@ -20,6 +21,7 @@ from dataset import (
     format_split_audit,
     infer_metadata_source_id,
     load_dataset_manifest,
+    load_video_clip,
     load_video_metadata,
     resolve_rppg_face_crop_box,
     sample_contiguous_center_indices,
@@ -53,6 +55,39 @@ class FakeHaarDetector:
         boxes = self.boxes_by_call[self.call_count]
         self.call_count += 1
         return np.asarray(boxes, dtype=np.int32)
+
+
+class FakeVideoCapture:
+    def __init__(self, frames_bgr: list[np.ndarray], fps: float = 24.0):
+        self.frames_bgr = frames_bgr
+        self.fps = fps
+        self.position = 0
+        self.opened = True
+
+    def isOpened(self):
+        return self.opened
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_COUNT:
+            return len(self.frames_bgr)
+        if prop == cv2.CAP_PROP_FPS:
+            return self.fps
+        return 0.0
+
+    def set(self, prop, value):
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            self.position = int(value)
+        return True
+
+    def read(self):
+        if self.position >= len(self.frames_bgr):
+            return False, None
+        frame = self.frames_bgr[self.position]
+        self.position += 1
+        return True, frame.copy()
+
+    def release(self):
+        self.opened = False
 
 
 class DummyRGBEncoder(torch.nn.Module):
@@ -468,6 +503,64 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(status, "detected")
         self.assertIsNone(fallback_box)
         self.assertEqual(fallback_status, "fallback_full_frame")
+
+    def test_generic_video_clip_face_crop_detected_fallback_and_disabled(self):
+        frame_rgb = np.zeros((4, 4, 3), dtype=np.uint8)
+        frame_rgb[1:3, 1:3] = [255, 0, 0]
+        frames_bgr = [cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR) for _ in range(4)]
+
+        with (
+            patch("dataset.cv2.VideoCapture", return_value=FakeVideoCapture(frames_bgr)),
+            patch("dataset.resolve_face_crop_box", return_value=((1, 1, 2, 2), "detected")),
+        ):
+            detected = load_video_clip(
+                "/tmp/fake.mp4",
+                num_frames=2,
+                image_size=2,
+                face_crop_config={
+                    "enabled": True,
+                    "backend": "opencv_haar",
+                    "detection_frequency": 1,
+                    "large_box_coef": 1.0,
+                    "fallback": "full_frame",
+                },
+            )
+
+        with (
+            patch("dataset.cv2.VideoCapture", return_value=FakeVideoCapture(frames_bgr)),
+            patch("dataset.resolve_face_crop_box", return_value=(None, "fallback_full_frame")),
+        ):
+            fallback = load_video_clip(
+                "/tmp/fake.mp4",
+                num_frames=2,
+                image_size=2,
+                face_crop_config={
+                    "enabled": True,
+                    "backend": "opencv_haar",
+                    "detection_frequency": 1,
+                    "large_box_coef": 1.0,
+                    "fallback": "full_frame",
+                },
+            )
+
+        with patch("dataset.cv2.VideoCapture", return_value=FakeVideoCapture(frames_bgr)):
+            disabled = load_video_clip(
+                "/tmp/fake.mp4",
+                num_frames=2,
+                image_size=2,
+                face_crop_config={
+                    "enabled": False,
+                    "backend": "opencv_haar",
+                    "detection_frequency": 1,
+                    "large_box_coef": 1.0,
+                    "fallback": "full_frame",
+                },
+            )
+
+        self.assertEqual(detected["face_crop_status"], "detected")
+        self.assertEqual(fallback["face_crop_status"], "fallback_full_frame")
+        self.assertEqual(disabled["face_crop_status"], "disabled")
+        self.assertTrue(np.all(detected["video_rgb_frames"][0] == np.array([255, 0, 0])))
 
 
 if __name__ == "__main__":

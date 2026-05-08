@@ -126,6 +126,7 @@ class PrecomputeFeatureCacheSelectionTest(unittest.TestCase):
         class Spec:
             frame_count = 32
             image_size = 224
+            cache_variant = None
 
         specs = {modality: Spec() for modality in ("rppg", "depth", "fft")}
 
@@ -138,9 +139,36 @@ class PrecomputeFeatureCacheSelectionTest(unittest.TestCase):
         self.assertEqual(
             grouped,
             [
-                (32, 224, ("rppg",)),
-                (32, 224, ("depth",)),
-                (32, 224, ("fft",)),
+                (32, 224, None, ("rppg",)),
+                (32, 224, None, ("depth",)),
+                (32, 224, None, ("fft",)),
+            ],
+        )
+
+    def test_extraction_groups_separate_cache_variants(self):
+        class Spec:
+            def __init__(self, cache_variant: str | None):
+                self.frame_count = 32
+                self.image_size = 224
+                self.cache_variant = cache_variant
+
+        specs = {
+            "rgb": Spec("facecrop_v2_opencv_haar"),
+            "depth": Spec("facecrop_v2_opencv_haar"),
+            "fft": Spec(None),
+        }
+
+        grouped = extraction_modality_groups(
+            ("rgb", "depth", "fft"),
+            specs,
+            group_by_modality=False,
+        )
+
+        self.assertEqual(
+            grouped,
+            [
+                (32, 224, "facecrop_v2_opencv_haar", ("rgb", "depth")),
+                (32, 224, None, ("fft",)),
             ],
         )
 

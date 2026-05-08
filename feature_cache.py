@@ -10,9 +10,8 @@ import torch
 from torch.utils.data import Dataset
 
 from dataset import VideoExample
+from face_crop_config import modality_cache_variant
 from frame_config import resolve_modality_frame_count
-
-RPPG_CACHE_VARIANT = "rppg_v2_contiguous128_facecrop_haar_diffnorm128"
 
 FEATURE_CACHE_VERSION = 3
 SPEC_IGNORED_MODALITY_KEYS = frozenset({"frames", "slot_count"})
@@ -49,6 +48,7 @@ class FeatureCacheSpec:
     frame_count: int
     image_size: int
     extractor_config: dict[str, Any]
+    cache_variant: str | None = None
 
 
 def _jsonable(value: Any) -> Any:
@@ -102,6 +102,7 @@ def build_feature_cache_spec(
         frame_count=resolve_modality_frame_count(config, modality),
         image_size=_resolve_modality_image_size(config, modality),
         extractor_config=_modality_extractor_config(config, modality),
+        cache_variant=modality_cache_variant(config, modality),
     )
 
 
@@ -125,7 +126,11 @@ def build_feature_cache_specs(
 
 
 def feature_cache_spec_id(spec: FeatureCacheSpec) -> str:
-    return f"{spec.modality}-frames_{spec.frame_count}"
+    parts = [spec.modality, f"frames_{spec.frame_count}"]
+    if spec.cache_variant is not None:
+        parts.append(f"size_{spec.image_size}")
+        parts.append(spec.cache_variant)
+    return "-".join(parts)
 
 
 def normalize_cache_dataset_root(dataset_root: str | Path | None) -> Path | None:
@@ -164,7 +169,14 @@ def metadata_filename_for_example(
 
 
 def feature_cache_spec_dir(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
-    return Path(cache_dir) / spec.modality / f"frames_{spec.frame_count}"
+    if spec.cache_variant is None:
+        return Path(cache_dir) / spec.modality / f"frames_{spec.frame_count}"
+    return (
+        Path(cache_dir)
+        / spec.modality
+        / spec.cache_variant
+        / f"frames_{spec.frame_count}_size_{spec.image_size}"
+    )
 
 
 def feature_cache_manifest_path(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
@@ -212,8 +224,8 @@ def feature_cache_payload_header(
         "modality": spec.modality,
         "frame_count": spec.frame_count,
     }
-    if spec.modality == "rppg":
-        header["cache_variant"] = RPPG_CACHE_VARIANT
+    if spec.cache_variant is not None:
+        header["cache_variant"] = spec.cache_variant
     return header
 
 
@@ -330,7 +342,6 @@ def write_feature_cache_manifest(
     rows: list[dict[str, Any]] = []
     for example in examples:
         error = errors.get(str(example.path), "")
-        cache_path = feature_cache_item_path(cache_dir, example, spec, dataset_root=dataset_root)
         if feature_cache_item_exists(cache_dir, example, spec, dataset_root):
             status = "cached"
         elif error:

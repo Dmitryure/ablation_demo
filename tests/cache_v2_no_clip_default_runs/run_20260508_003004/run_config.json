@@ -1,0 +1,77 @@
+{
+  "assume_missing_cache": false,
+  "balanced_limit_per_split": null,
+  "balanced_total": 2,
+  "cache_dir": "tests/cache_v2_no_clip_default",
+  "clip_cache_dir": null,
+  "clip_cache_enabled": false,
+  "config": "/home/comp/ablation_task/configs/registry_fusion.yaml",
+  "dataset_root": "/mnt/d/final_dataset",
+  "dataset_summary": {
+    "test": {
+      "fake": 521,
+      "real": 515,
+      "total": 1036
+    },
+    "train": {
+      "fake": 8539,
+      "real": 3120,
+      "total": 11659
+    },
+    "val": {
+      "fake": 557,
+      "real": 516,
+      "total": 1073
+    }
+  },
+  "image_size_override": null,
+  "limit_per_split": null,
+  "limit_total": null,
+  "missing_before": null,
+  "modalities": [
+    "fft",
+    "stft"
+  ],
+  "modality_frame_overrides": {
+    "fft": 8,
+    "stft": 8
+  },
+  "modality_grouping": "modality",
+  "overwrite_cache": false,
+  "progress_bar": false,
+  "seed": 0,
+  "selected_count": 2,
+  "selected_counts": {
+    "fake": 1,
+    "real": 1
+  },
+  "selected_summary": {
+    "test": {
+      "fake": 0,
+      "real": 0,
+      "total": 0
+    },
+    "train": {
+      "fake": 1,
+      "real": 1,
+      "total": 2
+    },
+    "val": {
+      "fake": 0,
+      "real": 0,
+      "total": 0
+    }
+  },
+  "skip_cache_audits": true,
+  "skip_failures": false,
+  "spec_ids": {
+    "fft": "fft-frames_8-size_224-facecrop_v2_opencv_haar_df16_box1p5_fallback_full_frame",
+    "stft": "stft-frames_8-size_224-facecrop_v2_opencv_haar_df16_box1p5_fallback_full_frame"
+  },
+  "splits": [
+    "train",
+    "val",
+    "test"
+  ],
+  "video_decode_mode": "scan"
+}

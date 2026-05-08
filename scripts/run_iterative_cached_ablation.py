@@ -7,7 +7,7 @@ import json
 import random
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,6 +64,54 @@ CHECKPOINT_METRICS = (
     "train_f1",
     "train_loss",
 )
+
+RUN_ARG_DEFAULTS: dict[str, Any] = {
+    "dataset_root": DEFAULT_DATASET_ROOT,
+    "cache_dir": None,
+    "output_dir": DEFAULT_OUTPUT_DIR,
+    "modalities": None,
+    "modality_permutations": "none",
+    "round_ladder": "fast",
+    "round_targets": None,
+    "eval_count_per_split": 500,
+    "balanced_total": None,
+    "train_ratio": 0.8,
+    "val_ratio": 0.1,
+    "batch_size": 8,
+    "extract_batch_size": 4,
+    "progress_every": 25,
+    "epochs": 20,
+    "lr": 1e-3,
+    "weight_decay": 1e-2,
+    "modality_lr": None,
+    "modality_dropout": None,
+    "depth_dropout": None,
+    "gate_entropy_weight": None,
+    "device": None,
+    "head_type": None,
+    "head_hidden_dim": None,
+    "head_dropout": None,
+    "checkpoint_metric": "val_accuracy",
+    "early_stopping_patience": 0,
+    "early_stopping_min_delta": 0.0,
+    "occlusion_diagnostics": False,
+    "occlusion_splits": ("val", "test"),
+    "seed": 0,
+    "overwrite_cache": False,
+    "prefer_cached_selection": False,
+    "warm_start_rounds": False,
+    "skip_failures": False,
+    "video_decode_mode": "scan",
+    "clip_cache_dir": None,
+    "enable_clip_cache": False,
+    "no_clip_cache": False,
+    "sanity_count": 300,
+    "no_sanity_check": False,
+    "dry_run": False,
+}
+
+PATH_RUN_ARGS = {"dataset_root", "cache_dir", "output_dir", "clip_cache_dir"}
+SEQUENCE_RUN_ARGS = {"modalities", "round_targets", "occlusion_splits"}
 
 
 @dataclass(frozen=True)
@@ -171,20 +219,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Iteratively grow per-modality feature cache and train cached ablations."
     )
-    parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--modalities", nargs="*", default=None)
     parser.add_argument(
         "--modality-permutations",
         choices=("none", "singletons", "singletons-plus-all", "all"),
-        default="none",
+        default=None,
     )
     parser.add_argument(
         "--round-ladder",
         choices=("fast", "tiny", "large"),
-        default="fast",
+        default=None,
     )
     parser.add_argument(
         "--round-targets",
@@ -193,7 +241,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Explicit train video counts. Overrides --round-ladder and does not append full train set.",
     )
-    parser.add_argument("--eval-count-per-split", type=int, default=500)
+    parser.add_argument("--eval-count-per-split", type=int, default=None)
     parser.add_argument(
         "--balanced-total",
         type=int,
@@ -203,14 +251,14 @@ def parse_args() -> argparse.Namespace:
             "then derive train/val/test splits from that selected set."
         ),
     )
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--extract-batch-size", type=int, default=4)
-    parser.add_argument("--progress-every", type=int, default=25)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--train-ratio", type=float, default=None)
+    parser.add_argument("--val-ratio", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--extract-batch-size", type=int, default=None)
+    parser.add_argument("--progress-every", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument(
         "--modality-lr",
         nargs="*",
@@ -242,38 +290,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint-metric",
         choices=CHECKPOINT_METRICS,
-        default="val_accuracy",
+        default=None,
         help="Metric used for best.pt and early stopping.",
     )
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
-        default=0,
+        default=None,
         help="Stop after this many epochs without checkpoint-metric improvement. 0 disables.",
     )
     parser.add_argument(
         "--early-stopping-min-delta",
         type=float,
-        default=0.0,
+        default=None,
         help="Minimum checkpoint-metric improvement required to reset early stopping.",
     )
     parser.add_argument(
         "--occlusion-diagnostics",
         action="store_true",
+        default=None,
         help="After final eval, drop one modality at a time and write modality occlusion diagnostics.",
     )
     parser.add_argument(
         "--occlusion-splits",
         choices=("train", "val", "test"),
         nargs="+",
-        default=("val", "test"),
+        default=None,
         help="Splits to evaluate for --occlusion-diagnostics.",
     )
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--overwrite-cache", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--overwrite-cache", action="store_true", default=None)
     parser.add_argument(
         "--prefer-cached-selection",
         action="store_true",
+        default=None,
         help=(
             "Prefer examples with existing valid cached features when selecting train/val/test "
             "examples. Class balance and split boundaries are still preserved."
@@ -282,29 +332,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warm-start-rounds",
         action="store_true",
+        default=None,
         help="Initialize each train-count round from the previous round checkpoint for the same modality set.",
     )
-    parser.add_argument("--skip-failures", action="store_true")
+    parser.add_argument("--skip-failures", action="store_true", default=None)
     parser.add_argument(
         "--video-decode-mode",
         choices=("seek", "scan"),
-        default="scan",
+        default=None,
         help="Use random frame seeks or sequential video scan when sampling frames.",
     )
     parser.add_argument(
         "--clip-cache-dir",
         type=Path,
         default=None,
-        help="Decoded clip cache directory. Defaults to <cache-dir>/_clips.",
+        help="Enable decoded clip cache at this directory.",
+    )
+    parser.add_argument(
+        "--enable-clip-cache",
+        action="store_true",
+        default=None,
+        help="Enable decoded clip cache at <cache-dir>/_clips.",
     )
     parser.add_argument(
         "--no-clip-cache",
         action="store_true",
-        help="Disable decoded clip cache and decode videos directly.",
+        default=None,
+        help="Deprecated no-op; decoded clip cache is disabled by default.",
     )
-    parser.add_argument("--sanity-count", type=int, default=300)
-    parser.add_argument("--no-sanity-check", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--sanity-count", type=int, default=None)
+    parser.add_argument("--no-sanity-check", action="store_true", default=None)
+    parser.add_argument("--dry-run", action="store_true", default=None)
     return parser.parse_args()
 
 
@@ -313,6 +371,88 @@ def build_config(config_path: Path, device: str | None) -> dict[str, Any]:
     if device is not None:
         config["device"] = device
     return config
+
+
+def training_run_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    training = config.get("training", {})
+    if training is None:
+        training = {}
+    if not isinstance(training, Mapping):
+        raise ValueError("Config `training` must be a mapping when provided.")
+    run = training.get("run", config.get("run", {}))
+    if run is None:
+        return {}
+    if not isinstance(run, Mapping):
+        raise ValueError("Config `training.run` must be a mapping when provided.")
+    return run
+
+
+def _coerce_run_path(value: Any, field_name: str) -> Path | None:
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str) and value.strip():
+        return Path(value)
+    raise ValueError(f"`training.run.{field_name}` must be a non-empty path or null.")
+
+
+def _coerce_run_sequence(value: Any, field_name: str) -> list[Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"`training.run.{field_name}` must be a YAML list or null.")
+    return list(value)
+
+
+def _coerce_modality_lr(value: Any) -> dict[str, float] | list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        parsed: dict[str, float] = {}
+        for modality, lr in value.items():
+            if isinstance(lr, bool) or not isinstance(lr, (int, float)) or float(lr) <= 0.0:
+                raise ValueError(
+                    f"`training.run.modality_lr.{modality}` must be a positive number."
+                )
+            parsed[str(modality)] = float(lr)
+        return parsed
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(item) for item in value]
+    raise ValueError("`training.run.modality_lr` must be a mapping, list, or null.")
+
+
+def coerce_training_run_value(field_name: str, value: Any) -> Any:
+    if field_name in PATH_RUN_ARGS:
+        return _coerce_run_path(value, field_name)
+    if field_name in SEQUENCE_RUN_ARGS:
+        return _coerce_run_sequence(value, field_name)
+    if field_name == "modality_lr":
+        return _coerce_modality_lr(value)
+    return value
+
+
+def resolve_training_run_args(
+    config: Mapping[str, Any], args: argparse.Namespace
+) -> argparse.Namespace:
+    run_config = training_run_section(config)
+    values = vars(args).copy()
+    for field_name, default in RUN_ARG_DEFAULTS.items():
+        if values.get(field_name) is not None:
+            continue
+        if field_name in run_config:
+            values[field_name] = coerce_training_run_value(field_name, run_config[field_name])
+        else:
+            values[field_name] = default
+    return argparse.Namespace(**values)
+
+
+def training_run_payload(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        field_name: getattr(args, field_name)
+        for field_name in RUN_ARG_DEFAULTS
+        if hasattr(args, field_name)
+    }
 
 
 def _optional_bool(value: Any, field_name: str, default: bool) -> bool:
@@ -832,9 +972,17 @@ def build_head_config(config: Mapping[str, Any], args: argparse.Namespace) -> di
     return head_config or None
 
 
-def parse_modality_lrs(values: Sequence[str] | None) -> dict[str, float]:
+def parse_modality_lrs(values: Mapping[str, Any] | Sequence[str] | None) -> dict[str, float]:
     if not values:
         return {}
+    if isinstance(values, Mapping):
+        parsed: dict[str, float] = {}
+        for modality, raw_lr in values.items():
+            lr = float(raw_lr)
+            if lr <= 0.0:
+                raise ValueError(f"`modality_lr.{modality}` must be positive, got {raw_lr!r}.")
+            parsed[str(modality)] = lr
+        return parsed
     parsed: dict[str, float] = {}
     for value in values:
         if "=" not in value:
@@ -1854,11 +2002,11 @@ def chunk_examples(
 def group_modalities_by_clip_spec(
     modalities: Sequence[str],
     specs: Mapping[str, FeatureCacheSpec],
-) -> dict[tuple[int, int], tuple[str, ...]]:
-    grouped: dict[tuple[int, int], list[str]] = defaultdict(list)
+) -> dict[tuple[int, int, str | None], tuple[str, ...]]:
+    grouped: dict[tuple[int, int, str | None], list[str]] = defaultdict(list)
     for modality in modalities:
         spec = specs[modality]
-        grouped[(spec.frame_count, spec.image_size)].append(modality)
+        grouped[(spec.frame_count, spec.image_size, spec.cache_variant)].append(modality)
     return {key: tuple(value) for key, value in grouped.items()}
 
 
@@ -1866,17 +2014,24 @@ def extraction_modality_groups(
     modalities: Sequence[str],
     specs: Mapping[str, FeatureCacheSpec],
     group_by_modality: bool = False,
-) -> list[tuple[int, int, tuple[str, ...]]]:
+) -> list[tuple[int, int, str | None, tuple[str, ...]]]:
     if group_by_modality:
         return [
-            (specs[modality].frame_count, specs[modality].image_size, (modality,))
+            (
+                specs[modality].frame_count,
+                specs[modality].image_size,
+                specs[modality].cache_variant,
+                (modality,),
+            )
             for modality in modalities
         ]
     return [
-        (frame_count, image_size, group_modalities)
-        for (frame_count, image_size), group_modalities in group_modalities_by_clip_spec(
-            modalities, specs
-        ).items()
+        (frame_count, image_size, cache_variant, group_modalities)
+        for (
+            frame_count,
+            image_size,
+            cache_variant,
+        ), group_modalities in group_modalities_by_clip_spec(modalities, specs).items()
     ]
 
 
@@ -1904,6 +2059,11 @@ def build_raw_feature_batch(
     dataset_root: Path | None = None,
 ) -> dict[str, Any]:
     rppg_config = config.get("rppg", {}) if isinstance(config, Mapping) else {}
+    modality_configs = {
+        modality: config.get(modality, {})
+        for modality in modalities
+        if isinstance(config, Mapping) and isinstance(config.get(modality, {}), Mapping)
+    }
     dataset = LabeledVideoDataset(
         examples=examples,
         num_frames=dict.fromkeys(modalities, frame_count),
@@ -1913,6 +2073,8 @@ def build_raw_feature_batch(
         dataset_root=dataset_root,
         image_size_by_modality=dict.fromkeys(modalities, image_size),
         rppg_config=rppg_config if isinstance(rppg_config, Mapping) else {},
+        modality_configs=modality_configs,
+        global_config=config if isinstance(config, Mapping) else {},
     )
     return collate_labeled_video_batch([dataset[index] for index in range(len(dataset))])
 
@@ -1983,7 +2145,9 @@ def update_cache_timing_progress(
     modalities: Sequence[str],
 ) -> None:
     load_seconds = _sum_batch_load_seconds(raw_batch, modalities)
-    status_by_modality = raw_batch.get("rppg_face_crop_status_by_modality")
+    status_by_modality = raw_batch.get("face_crop_status_by_modality")
+    if not isinstance(status_by_modality, Mapping):
+        status_by_modality = raw_batch.get("rppg_face_crop_status_by_modality")
     for modality in modalities:
         if modality in load_seconds:
             progress[modality]["load_seconds"] = (
@@ -2390,7 +2554,7 @@ def cache_missing_feature_groups(
         active_modalities = [
             modality for modality in modalities if missing_by_modality.get(modality)
         ]
-        for frame_count, image_size, group_modalities in extraction_modality_groups(
+        for frame_count, image_size, _cache_variant, group_modalities in extraction_modality_groups(
             active_modalities,
             specs,
             group_by_modality=group_by_modality,
@@ -2503,6 +2667,37 @@ def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True, default=str)
         handle.write("\n")
+
+
+def feature_cache_manifest_summary(
+    cache_dir: Path,
+    specs: Mapping[str, FeatureCacheSpec],
+    modalities: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for modality in modalities:
+        spec = specs[modality]
+        spec_dir = feature_cache_spec_dir(cache_dir, spec)
+        manifest_path = spec_dir / "manifest.csv"
+        statuses: Counter[str] = Counter()
+        row_count = 0
+        if manifest_path.exists():
+            with manifest_path.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    row_count += 1
+                    statuses[str(row.get("status", ""))] += 1
+        pt_count = sum(1 for _ in spec_dir.rglob("*.pt")) if spec_dir.exists() else 0
+        summary[modality] = {
+            "spec_id": feature_cache_spec_id(spec),
+            "spec_dir": str(spec_dir),
+            "manifest": str(manifest_path),
+            "manifest_exists": manifest_path.exists(),
+            "rows": row_count,
+            "statuses": dict(statuses),
+            "pt_files": pt_count,
+            "pt_matches_cached_rows": pt_count == statuses.get("cached", 0),
+        }
+    return summary
 
 
 def write_metrics(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -3242,16 +3437,24 @@ def modality_set_name(modalities: Sequence[str]) -> str:
 
 def main() -> None:
     args = parse_args()
+    config = load_pipeline_yaml(args.config)
+    args = resolve_training_run_args(config, args)
+    if args.device is not None:
+        config["device"] = args.device
     torch.manual_seed(args.seed)
-    config = build_config(args.config, args.device)
     dataset_root = args.dataset_root
     video_root = resolve_video_root(dataset_root)
     cache_dir = args.cache_dir or (dataset_root / "feature_cache")
-    clip_cache_dir = None if args.no_clip_cache else (args.clip_cache_dir or cache_dir / "_clips")
+    clip_cache_dir = None
+    if args.clip_cache_dir is not None:
+        clip_cache_dir = args.clip_cache_dir
+    elif args.enable_clip_cache and not args.no_clip_cache:
+        clip_cache_dir = cache_dir / "_clips"
     output_dir = args.output_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
     base_modalities = resolve_base_modalities(config, args.modalities)
     modality_sets = build_modality_sets(base_modalities, args.modality_permutations)
     specs = build_feature_cache_specs(config, base_modalities)
+    resolved_training_run = training_run_payload(args)
 
     print("dataset selection: loading examples", flush=True)
     examples = build_real_fake_examples(
@@ -3324,6 +3527,7 @@ def main() -> None:
     )
     print(f"video_decode_mode={args.video_decode_mode}", flush=True)
     print(f"modalities={','.join(base_modalities)}", flush=True)
+    print(f"config_path={args.config}", flush=True)
     print(f"cached_loader={asdict(resolve_cached_loader_config(config))}", flush=True)
     print(
         f"regularization={asdict(resolve_training_regularization_config(config, args))}",
@@ -3370,6 +3574,9 @@ def main() -> None:
         {
             "dataset_root": str(dataset_root),
             "cache_dir": str(cache_dir),
+            "config_path": str(args.config),
+            "resolved_training_run": resolved_training_run,
+            "pipeline_config": config,
             "base_modalities": list(base_modalities),
             "modality_sets": [list(item) for item in modality_sets],
             "round_targets": list(round_targets),
@@ -3387,6 +3594,11 @@ def main() -> None:
             "cached_loader": asdict(resolve_cached_loader_config(config)),
             "regularization": asdict(resolve_training_regularization_config(config, args)),
             "dataset_metadata": video_metadata_summary(manifest_examples),
+            "cache_manifest_summary": feature_cache_manifest_summary(
+                cache_dir,
+                specs,
+                base_modalities,
+            ),
             "spec_ids": {modality: feature_cache_spec_id(spec) for modality, spec in specs.items()},
             "video_decode_mode": args.video_decode_mode,
             "clip_cache_dir": None if clip_cache_dir is None else str(clip_cache_dir),
@@ -3548,7 +3760,23 @@ def main() -> None:
             summaries=summaries,
             output_dir=output_dir,
         )
-    write_json(output_dir / "summary.json", {"rounds": summaries, "sanity": sanity_results})
+    write_json(
+        output_dir / "summary.json",
+        {
+            "config_path": str(args.config),
+            "resolved_training_run": resolved_training_run,
+            "dataset_root": str(dataset_root),
+            "cache_dir": str(cache_dir),
+            "base_modalities": list(base_modalities),
+            "cache_manifest_summary": feature_cache_manifest_summary(
+                cache_dir,
+                specs,
+                base_modalities,
+            ),
+            "rounds": summaries,
+            "sanity": sanity_results,
+        },
+    )
     print(f"wrote: {output_dir / 'summary.json'}", flush=True)
     print(f"wrote: {output_dir}", flush=True)
 

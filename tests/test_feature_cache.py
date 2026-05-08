@@ -182,6 +182,71 @@ class MinimalFeatureCacheTest(unittest.TestCase):
             self.assertTrue(feature_cache_item_exists(cache_dir, example, specs["rgb"], root))
             self.assertFalse(feature_cache_item_exists(cache_dir, example, specs["rppg"], root))
 
+    def test_cropped_rgb_cache_variant_does_not_reuse_full_frame_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cache_dir = root / "cache"
+            example = build_example(
+                root / "videos" / "real" / "clip.mp4",
+                "real",
+                "clip.mp4",
+                generator_id="real",
+            )
+            legacy_spec = build_feature_cache_specs(
+                {"frames": {"default": 16}, "rgb": {}},
+                ("rgb",),
+            )["rgb"]
+            cropped_spec = build_feature_cache_specs(
+                {
+                    "frames": {"default": 16},
+                    "image_size": 224,
+                    "face_crop": {"enabled": True},
+                    "rgb": {},
+                },
+                ("rgb",),
+            )["rgb"]
+
+            write_feature_cache_item(
+                cache_dir,
+                example,
+                legacy_spec,
+                {"rgb_features": torch.ones(2, 3)},
+                dataset_root=root,
+            )
+
+            self.assertIsNone(legacy_spec.cache_variant)
+            self.assertIsNotNone(cropped_spec.cache_variant)
+            self.assertTrue(feature_cache_item_exists(cache_dir, example, legacy_spec, root))
+            self.assertFalse(feature_cache_item_exists(cache_dir, example, cropped_spec, root))
+
+    def test_disabled_face_crop_keeps_legacy_rgb_cache_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            example = build_example(
+                root / "videos" / "real" / "clip.mp4",
+                "real",
+                "clip.mp4",
+                generator_id="real",
+            )
+            legacy_spec = build_feature_cache_specs(
+                {"frames": {"default": 16}, "rgb": {}},
+                ("rgb",),
+            )["rgb"]
+            disabled_spec = build_feature_cache_specs(
+                {
+                    "frames": {"default": 16},
+                    "face_crop": {"enabled": True},
+                    "rgb": {"face_crop": {"enabled": False}},
+                },
+                ("rgb",),
+            )["rgb"]
+
+            self.assertIsNone(disabled_spec.cache_variant)
+            self.assertEqual(
+                feature_cache_item_path(root / "cache", example, legacy_spec, dataset_root=root),
+                feature_cache_item_path(root / "cache", example, disabled_spec, dataset_root=root),
+            )
+
     def test_rppg_cache_roundtrip_requires_signal_features(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
