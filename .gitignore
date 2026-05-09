@@ -36,3 +36,6 @@ cache_decode_test/
 task*.sh
 readonly_smoke_runs
 iterative_ablation_*
+runs
+shards
+README.md

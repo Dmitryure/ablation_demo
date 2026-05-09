@@ -22,7 +22,7 @@ device: cuda
 training:
   run:
     dataset_root: /mnt/d/final_dataset
-    cache_dir: feature_cache_runs/final_cache_v2_with_v1_rppg
+    cache_dir: runs/feature_cache_runs/final_cache_v2_with_v1_rppg
     output_dir: iterative_ablation_smoke_v2_1k_rppg
     modalities:
       - rgb

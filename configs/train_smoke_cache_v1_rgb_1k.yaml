@@ -16,6 +16,7 @@ training:
   run:
     dataset_root: /mnt/d/final_dataset
     cache_dir: /mnt/d/final_cache/v1
+    sharded_cache_dir: shards/v1_no_fau_mixed_v2
     output_dir: iterative_ablation_smoke_v1_rgb_1k
     modalities:
       - rgb

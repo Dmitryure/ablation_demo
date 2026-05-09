@@ -12,7 +12,11 @@ import torch
 from dataset import VideoExample, load_video_clip_for_example
 from feature_cache import (
     CachedFeatureDataset,
+    ShardedCachedFeatureDataset,
+    ShardedFeatureBatchSampler,
+    ShardedFeatureRef,
     build_feature_cache_specs,
+    cache_example_key,
     collate_cached_feature_batch,
     feature_cache_item_exists,
     feature_cache_item_path,
@@ -55,6 +59,121 @@ class MinimalFeatureCacheTest(unittest.TestCase):
             path = feature_cache_item_path(root / "cache", example, spec, dataset_root=root)
 
             self.assertEqual(path, root / "cache" / "rgb" / "frames_16" / "real" / "clip.mp4.pt")
+
+    def test_schema_v2_sharded_dataset_uses_explicit_key_locations(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shard_dir = root / "shards"
+            shard_dir.mkdir()
+            real = build_example(root / "videos" / "real" / "r1.mp4", "real", "r1.mp4")
+            fake = build_example(root / "videos" / "fake" / "gen" / "f1.mp4", "fake", "gen/f1.mp4")
+            payload = {
+                "version": 2,
+                "examples": [
+                    {
+                        "class_name": "fake",
+                        "metadata_filename": "gen/f1.mp4",
+                    },
+                    {
+                        "class_name": "real",
+                        "metadata_filename": "r1.mp4",
+                    },
+                ],
+                "features": {"rgb_features": torch.tensor([[10.0], [20.0]])},
+            }
+            torch.save(payload, shard_dir / "shard_000000.pt")
+            index = {
+                "schema_version": 2,
+                "shard_size": 2,
+                "example_count": 2,
+                "example_locations": {
+                    cache_example_key(fake, root): {
+                        "shard_index": 0,
+                        "row_index": 0,
+                        "class_name": "fake",
+                        "filename": "gen/f1.mp4",
+                        "label": 1,
+                    },
+                    cache_example_key(real, root): {
+                        "shard_index": 0,
+                        "row_index": 1,
+                        "class_name": "real",
+                        "filename": "r1.mp4",
+                        "label": 0,
+                    },
+                },
+                "shards": [{"path": "shards/shard_000000.pt", "example_count": 2}],
+            }
+            (root / "index.json").write_text(__import__("json").dumps(index), encoding="utf-8")
+
+            dataset = ShardedCachedFeatureDataset(
+                root,
+                all_examples=[real, fake],
+                selected_examples=[real, fake],
+                dataset_root=root,
+            )
+
+            self.assertTrue(torch.equal(dataset[0]["rgb_features"], torch.tensor([20.0])))
+            self.assertTrue(torch.equal(dataset[1]["rgb_features"], torch.tensor([10.0])))
+
+    def test_legacy_sharded_dataset_rejected_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            example = build_example(root / "videos" / "real" / "r1.mp4", "real", "r1.mp4")
+            index = {
+                "version": 1,
+                "shard_size": 1,
+                "example_locations": {
+                    cache_example_key(example, root): {"shard_index": 0, "row_index": 0}
+                },
+                "shards": [{"path": "shard_000000.pt", "example_count": 1}],
+            }
+            (root / "index.json").write_text(__import__("json").dumps(index), encoding="utf-8")
+
+            with self.assertRaises(ValueError):
+                ShardedCachedFeatureDataset(
+                    root,
+                    all_examples=[example],
+                    selected_examples=[example],
+                    dataset_root=root,
+                )
+
+    def test_mixed_shard_sampler_rejects_class_blocked_training_groups(self):
+        real = build_example(Path("/data/real/r.mp4"), "real", "r.mp4")
+        fake = build_example(Path("/data/fake/gen/f.mp4"), "fake", "gen/f.mp4")
+        refs = [
+            *[ShardedFeatureRef(fake, shard_index=0, row_index=index) for index in range(8)],
+            *[ShardedFeatureRef(real, shard_index=1, row_index=index) for index in range(8)],
+        ]
+
+        with self.assertRaises(ValueError):
+            ShardedFeatureBatchSampler(
+                refs=refs,
+                batch_size=4,
+                shuffle=True,
+                batch_strategy="mixed_shard_local",
+            )
+
+    def test_mixed_shard_sampler_interleaves_labels_within_shard(self):
+        real = build_example(Path("/data/real/r.mp4"), "real", "r.mp4")
+        fake = build_example(Path("/data/fake/gen/f.mp4"), "fake", "gen/f.mp4")
+        refs = [
+            *[ShardedFeatureRef(real, shard_index=0, row_index=index) for index in range(4)],
+            *[ShardedFeatureRef(fake, shard_index=0, row_index=index + 4) for index in range(4)],
+        ]
+
+        sampler = ShardedFeatureBatchSampler(
+            refs=refs,
+            batch_size=4,
+            shuffle=False,
+            batch_strategy="mixed_shard_local",
+        )
+
+        batches = list(sampler)
+        self.assertTrue(batches)
+        for batch in batches:
+            labels = {refs[index].example.label for index in batch}
+            self.assertEqual(labels, {0, 1})
 
     def test_fake_cache_path_preserves_generator_folder(self):
         with tempfile.TemporaryDirectory() as tmpdir:

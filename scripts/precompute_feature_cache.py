@@ -33,7 +33,7 @@ from scripts.run_iterative_cached_ablation import (
     write_json,
 )
 
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "feature_cache_runs"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "feature_cache_runs"
 VALID_SPLITS = ("train", "val", "test")
 
 

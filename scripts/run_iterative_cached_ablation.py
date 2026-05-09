@@ -34,7 +34,10 @@ from dataset import (
 from feature_cache import (
     CachedFeatureDataset,
     FeatureCacheSpec,
+    ShardedCachedFeatureDataset,
+    ShardedFeatureBatchSampler,
     build_feature_cache_specs,
+    cache_example_key,
     collate_cached_feature_batch,
     feature_cache_item_exists,
     feature_cache_manifest_path,
@@ -50,7 +53,7 @@ from task_models import BinaryFusionClassifier, build_binary_fusion_classifier
 
 DEFAULT_DATASET_ROOT = Path("/mnt/d/final_dataset")
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "iterative_ablation_runs"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "iterative_ablation_runs"
 FAST_LADDER = (200, 500, 1000, 2000, 4000)
 TINY_LADDER = (40, 100, 200, 500)
 LARGE_LADDER = (1000, 2500, 5000)
@@ -69,6 +72,7 @@ CHECKPOINT_METRICS = (
 RUN_ARG_DEFAULTS: dict[str, Any] = {
     "dataset_root": DEFAULT_DATASET_ROOT,
     "cache_dir": None,
+    "sharded_cache_dir": None,
     "output_dir": DEFAULT_OUTPUT_DIR,
     "modalities": None,
     "modality_permutations": "none",
@@ -111,7 +115,7 @@ RUN_ARG_DEFAULTS: dict[str, Any] = {
     "dry_run": False,
 }
 
-PATH_RUN_ARGS = {"dataset_root", "cache_dir", "output_dir", "clip_cache_dir"}
+PATH_RUN_ARGS = {"dataset_root", "cache_dir", "sharded_cache_dir", "output_dir", "clip_cache_dir"}
 SEQUENCE_RUN_ARGS = {"modalities", "round_targets", "occlusion_splits"}
 
 
@@ -205,6 +209,12 @@ class CachedLoaderConfig:
 
 
 @dataclass(frozen=True)
+class ShardedLoaderConfig:
+    batch_strategy: str = "mixed_shard_local"
+    allow_legacy_shards: bool = False
+
+
+@dataclass(frozen=True)
 class ModalityDropoutConfig:
     default_probability: float = 0.0
     modality_probabilities: dict[str, float] = field(default_factory=dict)
@@ -222,6 +232,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
+    parser.add_argument("--sharded-cache-dir", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--modalities", nargs="*", default=None)
@@ -540,6 +551,31 @@ def resolve_cached_loader_config(config: Mapping[str, Any]) -> CachedLoaderConfi
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+    )
+
+
+def resolve_sharded_loader_config(config: Mapping[str, Any]) -> ShardedLoaderConfig:
+    training = config.get("training", {})
+    if training is None:
+        training = {}
+    if not isinstance(training, Mapping):
+        raise ValueError("Config `training` must be a mapping when provided.")
+    sharded = training.get("sharded_loader", {})
+    if sharded is None:
+        sharded = {}
+    if not isinstance(sharded, Mapping):
+        raise ValueError("Config `training.sharded_loader` must be a mapping when provided.")
+    batch_strategy = str(sharded.get("batch_strategy", "mixed_shard_local"))
+    if batch_strategy not in {"mixed_shard_local", "global_shuffle", "shard_local"}:
+        raise ValueError(f"Unsupported training.sharded_loader.batch_strategy: {batch_strategy}")
+    allow_legacy_shards = _optional_bool(
+        sharded.get("allow_legacy_shards"),
+        "training.sharded_loader.allow_legacy_shards",
+        False,
+    )
+    return ShardedLoaderConfig(
+        batch_strategy=batch_strategy,
+        allow_legacy_shards=allow_legacy_shards,
     )
 
 
@@ -1192,12 +1228,81 @@ def gate_entropy_regularization(
     return -float(weight) * normalized_entropy.mean()
 
 
+def should_log_loop_progress(
+    label: str | None,
+    batch_index: int,
+    batch_count: int,
+    progress_every: int,
+) -> bool:
+    return bool(
+        label
+        and progress_every > 0
+        and (batch_index == batch_count or batch_index % progress_every == 0)
+    )
+
+
+def log_loop_progress(
+    label: str | None,
+    batch_index: int,
+    batch_count: int,
+    progress_every: int,
+    total_count: int,
+    total_loss: float,
+    true_positive: int,
+    true_negative: int,
+    false_positive: int,
+    false_negative: int,
+    start: float,
+) -> None:
+    if not should_log_loop_progress(label, batch_index, batch_count, progress_every):
+        return
+    elapsed = time.perf_counter() - start
+    rate = 0.0 if elapsed <= 0.0 else total_count / elapsed
+    metrics = binary_metrics_from_counts(
+        true_positive,
+        true_negative,
+        false_positive,
+        false_negative,
+    )
+    print(
+        f"{label}: batch={batch_index}/{batch_count} "
+        f"samples={total_count} loss={total_loss / max(total_count, 1):.6f} "
+        f"accuracy={metrics.accuracy:.4f} f1={metrics.f1:.4f} "
+        f"elapsed={elapsed:.1f}s samples_per_s={rate:.2f}",
+        flush=True,
+    )
+
+
+def log_prediction_progress(
+    label: str | None,
+    batch_index: int,
+    batch_count: int,
+    progress_every: int,
+    total_count: int,
+    correct: int,
+    start: float,
+) -> None:
+    if not should_log_loop_progress(label, batch_index, batch_count, progress_every):
+        return
+    elapsed = time.perf_counter() - start
+    rate = 0.0 if elapsed <= 0.0 else total_count / elapsed
+    accuracy = correct / max(total_count, 1)
+    print(
+        f"{label}: batch={batch_index}/{batch_count} "
+        f"samples={total_count} accuracy={accuracy:.4f} "
+        f"elapsed={elapsed:.1f}s samples_per_s={rate:.2f}",
+        flush=True,
+    )
+
+
 def train_one_epoch(
     model: BinaryFusionClassifier,
     loader: DataLoader[dict[str, Any]],
     optimizer: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
     regularization_config: TrainingRegularizationConfig | None = None,
+    progress_label: str | None = None,
+    progress_every: int = 0,
 ) -> EpochTrainResult:
     device = model_device(model)
     model.train()
@@ -1209,7 +1314,8 @@ def train_one_epoch(
     false_positive = 0
     false_negative = 0
     start = time.perf_counter()
-    for batch in loader:
+    batch_count = len(loader)
+    for batch_index, batch in enumerate(loader, start=1):
         labels = batch["label"].to(device)
         optimizer.zero_grad(set_to_none=True)
         training_batch = apply_training_modality_dropout(
@@ -1235,6 +1341,19 @@ def train_one_epoch(
         true_negative += tn
         false_positive += fp
         false_negative += fn
+        log_loop_progress(
+            label=progress_label,
+            batch_index=batch_index,
+            batch_count=batch_count,
+            progress_every=progress_every,
+            total_count=total_count,
+            total_loss=total_loss,
+            true_positive=true_positive,
+            true_negative=true_negative,
+            false_positive=false_positive,
+            false_negative=false_negative,
+            start=start,
+        )
     elapsed = time.perf_counter() - start
     metrics = binary_metrics_from_counts(
         true_positive, true_negative, false_positive, false_negative
@@ -1251,6 +1370,8 @@ def evaluate_loss_accuracy(
     model: BinaryFusionClassifier,
     loader: DataLoader[dict[str, Any]],
     loss_fn: torch.nn.Module,
+    progress_label: str | None = None,
+    progress_every: int = 0,
 ) -> EpochEvalResult:
     device = model_device(model)
     model.eval()
@@ -1261,8 +1382,9 @@ def evaluate_loss_accuracy(
     false_positive = 0
     false_negative = 0
     start = time.perf_counter()
+    batch_count = len(loader)
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader, start=1):
             labels = batch["label"].to(device)
             output = model(move_tensor_batch_to_device(batch, device))
             loss = loss_fn(output.logits, labels)
@@ -1274,6 +1396,19 @@ def evaluate_loss_accuracy(
             true_negative += tn
             false_positive += fp
             false_negative += fn
+            log_loop_progress(
+                label=progress_label,
+                batch_index=batch_index,
+                batch_count=batch_count,
+                progress_every=progress_every,
+                total_count=total_count,
+                total_loss=total_loss,
+                true_positive=true_positive,
+                true_negative=true_negative,
+                false_positive=false_positive,
+                false_negative=false_negative,
+                start=start,
+            )
     elapsed = time.perf_counter() - start
     metrics = binary_metrics_from_counts(
         true_positive, true_negative, false_positive, false_negative
@@ -1331,20 +1466,33 @@ def predict_rows(
     model: BinaryFusionClassifier,
     loader: DataLoader[dict[str, Any]],
     diagnostic_rows: list[DiagnosticRow] | None = None,
+    progress_label: str | None = None,
+    progress_every: int = 0,
 ) -> tuple[float, list[PredictionRow]]:
     device = model_device(model)
     correct = 0
     total = 0
     rows: list[PredictionRow] = []
     model.eval()
+    start = time.perf_counter()
+    batch_count = len(loader)
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader, start=1):
             output = model(move_tensor_batch_to_device(batch, device))
             probabilities = output.probabilities.detach().cpu().view(-1)
             labels = batch["label"].view(-1).to(dtype=torch.long)
             predictions = (probabilities >= 0.5).to(dtype=torch.long)
             correct += int((predictions == labels).sum().item())
             total += int(labels.numel())
+            log_prediction_progress(
+                label=progress_label,
+                batch_index=batch_index,
+                batch_count=batch_count,
+                progress_every=progress_every,
+                total_count=total,
+                correct=correct,
+                start=start,
+            )
             if diagnostic_rows is not None:
                 append_diagnostic_rows(
                     diagnostic_rows=diagnostic_rows,
@@ -1609,6 +1757,49 @@ def build_cached_loader(
     loader_kwargs: dict[str, Any] = {
         "batch_size": batch_size,
         "shuffle": shuffle,
+        "collate_fn": collate_cached_feature_batch,
+        "num_workers": resolved_loader_config.num_workers,
+        "pin_memory": resolved_loader_config.pin_memory,
+    }
+    if resolved_loader_config.num_workers > 0:
+        loader_kwargs["persistent_workers"] = resolved_loader_config.persistent_workers
+        if resolved_loader_config.prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = resolved_loader_config.prefetch_factor
+    return DataLoader(
+        dataset,
+        **loader_kwargs,
+    )
+
+
+def build_sharded_cached_loader(
+    examples: Sequence[VideoExample],
+    all_cache_examples: Sequence[VideoExample],
+    sharded_cache_dir: Path,
+    batch_size: int,
+    shuffle: bool,
+    dataset_root: Path,
+    loader_config: CachedLoaderConfig | None = None,
+    sharded_loader_config: ShardedLoaderConfig | None = None,
+    seed: int = 0,
+) -> DataLoader[dict[str, Any]]:
+    resolved_loader_config = loader_config or CachedLoaderConfig()
+    resolved_sharded_config = sharded_loader_config or ShardedLoaderConfig()
+    dataset = ShardedCachedFeatureDataset(
+        sharded_cache_dir=sharded_cache_dir,
+        all_examples=all_cache_examples,
+        selected_examples=examples,
+        dataset_root=dataset_root,
+        allow_legacy_shards=resolved_sharded_config.allow_legacy_shards,
+    )
+    batch_sampler = ShardedFeatureBatchSampler(
+        refs=dataset.refs,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        seed=seed,
+        batch_strategy=resolved_sharded_config.batch_strategy,
+    )
+    loader_kwargs: dict[str, Any] = {
+        "batch_sampler": batch_sampler,
         "collate_fn": collate_cached_feature_batch,
         "num_workers": resolved_loader_config.num_workers,
         "pin_memory": resolved_loader_config.pin_memory,
@@ -2056,6 +2247,41 @@ def filter_examples_with_cache(
             )
     else:
         print(f"cache filter {label}: kept={len(kept)} dropped=0", flush=True)
+    return kept
+
+
+def read_sharded_cache_keys(sharded_cache_dir: Path) -> set[str]:
+    index_path = sharded_cache_dir / "index.json"
+    with index_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    locations = payload.get("example_locations")
+    if not isinstance(locations, Mapping):
+        raise ValueError(f"Missing sharded cache example_locations: {index_path}")
+    return {str(key) for key in locations}
+
+
+def filter_examples_with_shards(
+    examples: Sequence[VideoExample],
+    sharded_cache_keys: set[str],
+    dataset_root: Path,
+    label: str,
+) -> list[VideoExample]:
+    kept: list[VideoExample] = []
+    dropped: list[VideoExample] = []
+    for example in examples:
+        if cache_example_key(example, dataset_root) in sharded_cache_keys:
+            kept.append(example)
+        else:
+            dropped.append(example)
+    if dropped:
+        print(
+            f"shard filter {label}: kept={len(kept)} dropped={len(dropped)}",
+            flush=True,
+        )
+        for example in dropped[:5]:
+            print(f"shard filter {label}: dropped path={example.path}", flush=True)
+        if len(dropped) > 5:
+            print(f"shard filter {label}: dropped_more={len(dropped) - 5}", flush=True)
     return kept
 
 
@@ -3157,6 +3383,8 @@ def run_training_round(
     dataset_root: Path,
     output_dir: Path,
     warm_start_checkpoint: Path | None = None,
+    sharded_cache_dir: Path | None = None,
+    all_cache_examples: Sequence[VideoExample] | None = None,
 ) -> dict[str, Any]:
     if not train_examples:
         raise ValueError("No cached train examples available for this round.")
@@ -3183,6 +3411,7 @@ def run_training_round(
         print(f"loaded warm-start checkpoint: {warm_start_checkpoint}", flush=True)
     modality_lrs = parse_modality_lrs(args.modality_lr)
     loader_config = resolve_cached_loader_config(config)
+    sharded_loader_config = resolve_sharded_loader_config(config)
     regularization_config = resolve_training_regularization_config(config, args)
     optimizer = build_optimizer(
         model,
@@ -3192,36 +3421,73 @@ def run_training_round(
     )
     loss_fn = torch.nn.BCEWithLogitsLoss()
 
-    train_loader = build_cached_loader(
-        train_examples,
-        cache_dir,
-        specs,
-        modalities,
-        args.batch_size,
-        shuffle=True,
-        dataset_root=dataset_root,
-        loader_config=loader_config,
-    )
-    val_loader = build_cached_loader(
-        val_examples,
-        cache_dir,
-        specs,
-        modalities,
-        args.batch_size,
-        shuffle=False,
-        dataset_root=dataset_root,
-        loader_config=loader_config,
-    )
-    test_loader = build_cached_loader(
-        test_examples,
-        cache_dir,
-        specs,
-        modalities,
-        args.batch_size,
-        shuffle=False,
-        dataset_root=dataset_root,
-        loader_config=loader_config,
-    )
+    if sharded_cache_dir is not None:
+        if all_cache_examples is None:
+            raise ValueError("`all_cache_examples` is required with `sharded_cache_dir`.")
+        train_loader = build_sharded_cached_loader(
+            examples=train_examples,
+            all_cache_examples=all_cache_examples,
+            sharded_cache_dir=sharded_cache_dir,
+            batch_size=args.batch_size,
+            shuffle=True,
+            dataset_root=dataset_root,
+            loader_config=loader_config,
+            sharded_loader_config=sharded_loader_config,
+            seed=int(args.seed),
+        )
+        val_loader = build_sharded_cached_loader(
+            examples=val_examples,
+            all_cache_examples=all_cache_examples,
+            sharded_cache_dir=sharded_cache_dir,
+            batch_size=args.batch_size,
+            shuffle=False,
+            dataset_root=dataset_root,
+            loader_config=loader_config,
+            sharded_loader_config=sharded_loader_config,
+            seed=int(args.seed),
+        )
+        test_loader = build_sharded_cached_loader(
+            examples=test_examples,
+            all_cache_examples=all_cache_examples,
+            sharded_cache_dir=sharded_cache_dir,
+            batch_size=args.batch_size,
+            shuffle=False,
+            dataset_root=dataset_root,
+            loader_config=loader_config,
+            sharded_loader_config=sharded_loader_config,
+            seed=int(args.seed),
+        )
+    else:
+        train_loader = build_cached_loader(
+            train_examples,
+            cache_dir,
+            specs,
+            modalities,
+            args.batch_size,
+            shuffle=True,
+            dataset_root=dataset_root,
+            loader_config=loader_config,
+        )
+        val_loader = build_cached_loader(
+            val_examples,
+            cache_dir,
+            specs,
+            modalities,
+            args.batch_size,
+            shuffle=False,
+            dataset_root=dataset_root,
+            loader_config=loader_config,
+        )
+        test_loader = build_cached_loader(
+            test_examples,
+            cache_dir,
+            specs,
+            modalities,
+            args.batch_size,
+            shuffle=False,
+            dataset_root=dataset_root,
+            loader_config=loader_config,
+        )
 
     metrics: list[dict[str, Any]] = []
     best_metric_value: float | None = None
@@ -3247,8 +3513,16 @@ def run_training_round(
             optimizer,
             loss_fn,
             regularization_config=regularization_config,
+            progress_label=f"train epoch={epoch}",
+            progress_every=int(args.progress_every),
         )
-        val_result = evaluate_loss_accuracy(model, val_loader, loss_fn)
+        val_result = evaluate_loss_accuracy(
+            model,
+            val_loader,
+            loss_fn,
+            progress_label=f"val epoch={epoch}",
+            progress_every=int(args.progress_every),
+        )
         metric_value = checkpoint_metric_value(args.checkpoint_metric, result, val_result)
         improved = is_metric_improvement(
             metric_name=args.checkpoint_metric,
@@ -3311,9 +3585,27 @@ def run_training_round(
     model.load_state_dict(best_state)
     print(f"loaded best checkpoint for eval: {best_path}", flush=True)
     diagnostic_rows: list[DiagnosticRow] = []
-    train_accuracy, train_rows = predict_rows(model, train_loader, diagnostic_rows=diagnostic_rows)
-    val_accuracy, val_rows = predict_rows(model, val_loader, diagnostic_rows=diagnostic_rows)
-    test_accuracy, test_rows = predict_rows(model, test_loader, diagnostic_rows=diagnostic_rows)
+    train_accuracy, train_rows = predict_rows(
+        model,
+        train_loader,
+        diagnostic_rows=diagnostic_rows,
+        progress_label="predict train",
+        progress_every=int(args.progress_every),
+    )
+    val_accuracy, val_rows = predict_rows(
+        model,
+        val_loader,
+        diagnostic_rows=diagnostic_rows,
+        progress_label="predict val",
+        progress_every=int(args.progress_every),
+    )
+    test_accuracy, test_rows = predict_rows(
+        model,
+        test_loader,
+        diagnostic_rows=diagnostic_rows,
+        progress_label="predict test",
+        progress_every=int(args.progress_every),
+    )
     train_metrics = prediction_rows_metrics(train_rows)
     val_metrics = prediction_rows_metrics(val_rows)
     test_metrics = prediction_rows_metrics(test_rows)
@@ -3378,6 +3670,7 @@ def run_training_round(
         "modality_lrs": modality_lrs,
         "batch_size": args.batch_size,
         "cached_loader": asdict(loader_config),
+        "sharded_cache_dir": None if sharded_cache_dir is None else str(sharded_cache_dir),
         "regularization": asdict(regularization_config),
         "checkpoint_metric": args.checkpoint_metric,
         "best_checkpoint_metric_value": best_metric_value,
@@ -3523,6 +3816,25 @@ def write_dry_run(
         print(line)
 
 
+def sharded_cache_progress(
+    *,
+    label: str,
+    examples: Sequence[VideoExample],
+    modalities: Sequence[str],
+    sharded_cache_dir: Path,
+) -> dict[str, Any]:
+    return {
+        "label": label,
+        "requested": len(examples),
+        "cached": len(examples),
+        "failed": 0,
+        "modalities": list(modalities),
+        "sharded_cache_dir": str(sharded_cache_dir),
+        "skipped_feature_cache_ensure": True,
+        "skip_reason": "sharded_cache_dir is set; using prebuilt shards for training.",
+    }
+
+
 def modality_set_name(modalities: Sequence[str]) -> str:
     return "plus".join(modalities)
 
@@ -3547,6 +3859,11 @@ def main() -> None:
     modality_sets = build_modality_sets(base_modalities, args.modality_permutations)
     specs = build_feature_cache_specs(config, base_modalities)
     resolved_training_run = training_run_payload(args)
+    sharded_cache_keys = (
+        read_sharded_cache_keys(args.sharded_cache_dir)
+        if args.sharded_cache_dir is not None
+        else None
+    )
 
     print("dataset selection: loading examples", flush=True)
     examples = build_real_fake_examples(
@@ -3558,7 +3875,29 @@ def main() -> None:
     )
     dataset_examples = examples
     cached_selection_summary: dict[str, int] | None = None
-    if args.prefer_cached_selection:
+    if args.prefer_cached_selection and sharded_cache_keys is not None:
+        examples = [
+            example
+            for example in examples
+            if cache_example_key(example, dataset_root) in sharded_cache_keys
+        ]
+        cached_selection_summary = {
+            "dataset_examples": len(dataset_examples),
+            "fully_cached_examples": len(examples),
+            "modalities": len(base_modalities),
+            "sharded_cache_examples": len(sharded_cache_keys),
+        }
+        print(
+            "shard selection: "
+            f"summary={cached_selection_summary} counts={class_counts(examples)}",
+            flush=True,
+        )
+        if not examples:
+            raise ValueError(
+                "No examples are present in the configured sharded cache. "
+                "Rebuild shards or disable --prefer-cached-selection."
+            )
+    elif args.prefer_cached_selection:
         examples, cached_selection_summary = select_fully_cached_examples(
             examples=examples,
             cache_dir=cache_dir,
@@ -3614,6 +3953,10 @@ def main() -> None:
     print(f"video_root={video_root}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(
+        f"sharded_cache_dir={args.sharded_cache_dir if args.sharded_cache_dir is not None else '<disabled>'}",
+        flush=True,
+    )
+    print(
         f"clip_cache_dir={clip_cache_dir if clip_cache_dir is not None else '<disabled>'}",
         flush=True,
     )
@@ -3666,6 +4009,9 @@ def main() -> None:
         {
             "dataset_root": str(dataset_root),
             "cache_dir": str(cache_dir),
+            "sharded_cache_dir": None
+            if args.sharded_cache_dir is None
+            else str(args.sharded_cache_dir),
             "config_path": str(args.config),
             "resolved_training_run": resolved_training_run,
             "pipeline_config": config,
@@ -3698,23 +4044,31 @@ def main() -> None:
         },
     )
 
-    eval_progress = ensure_feature_cache(
-        examples=[*val_examples, *test_examples],
-        cache_dir=cache_dir,
-        specs=specs,
-        modalities=base_modalities,
-        config=config,
-        dataset_root=dataset_root,
-        extract_batch_size=args.extract_batch_size,
-        overwrite=args.overwrite_cache,
-        skip_failures=args.skip_failures,
-        progress_every=args.progress_every,
-        label="eval",
-        video_decode_mode=args.video_decode_mode,
-        clip_cache_dir=clip_cache_dir,
-        manifest_minimum_rows=len(dataset_examples),
-        write_manifests=False,
-    )
+    if args.sharded_cache_dir is None:
+        eval_progress = ensure_feature_cache(
+            examples=[*val_examples, *test_examples],
+            cache_dir=cache_dir,
+            specs=specs,
+            modalities=base_modalities,
+            config=config,
+            dataset_root=dataset_root,
+            extract_batch_size=args.extract_batch_size,
+            overwrite=args.overwrite_cache,
+            skip_failures=args.skip_failures,
+            progress_every=args.progress_every,
+            label="eval",
+            video_decode_mode=args.video_decode_mode,
+            clip_cache_dir=clip_cache_dir,
+            manifest_minimum_rows=len(dataset_examples),
+            write_manifests=False,
+        )
+    else:
+        eval_progress = sharded_cache_progress(
+            label="eval",
+            examples=[*val_examples, *test_examples],
+            modalities=base_modalities,
+            sharded_cache_dir=args.sharded_cache_dir,
+        )
     write_json(output_dir / "eval_cache_progress.json", eval_progress)
     print(f"wrote: {output_dir / 'eval_cache_progress.json'}", flush=True)
 
@@ -3728,53 +4082,81 @@ def main() -> None:
             f"counts={class_counts(train_examples)} output_dir={round_dir}",
             flush=True,
         )
-        cache_progress = ensure_feature_cache(
-            examples=train_examples,
-            cache_dir=cache_dir,
-            specs=specs,
-            modalities=base_modalities,
-            config=config,
-            dataset_root=dataset_root,
-            extract_batch_size=args.extract_batch_size,
-            overwrite=args.overwrite_cache,
-            skip_failures=args.skip_failures,
-            progress_every=args.progress_every,
-            label=f"train_{target}",
-            video_decode_mode=args.video_decode_mode,
-            clip_cache_dir=clip_cache_dir,
-            manifest_minimum_rows=len(dataset_examples),
-            write_manifests=False,
-        )
+        if args.sharded_cache_dir is None:
+            cache_progress = ensure_feature_cache(
+                examples=train_examples,
+                cache_dir=cache_dir,
+                specs=specs,
+                modalities=base_modalities,
+                config=config,
+                dataset_root=dataset_root,
+                extract_batch_size=args.extract_batch_size,
+                overwrite=args.overwrite_cache,
+                skip_failures=args.skip_failures,
+                progress_every=args.progress_every,
+                label=f"train_{target}",
+                video_decode_mode=args.video_decode_mode,
+                clip_cache_dir=clip_cache_dir,
+                manifest_minimum_rows=len(dataset_examples),
+                write_manifests=False,
+            )
+        else:
+            cache_progress = sharded_cache_progress(
+                label=f"train_{target}",
+                examples=train_examples,
+                modalities=base_modalities,
+                sharded_cache_dir=args.sharded_cache_dir,
+            )
         write_json(round_dir / "cache_progress.json", cache_progress)
         print(f"wrote: {round_dir / 'cache_progress.json'}", flush=True)
 
         for modalities in modality_sets:
             name = modality_set_name(modalities)
             print(f"round={target} modalities={name}", flush=True)
-            cached_train_examples = filter_examples_with_cache(
-                train_examples,
-                cache_dir,
-                specs,
-                modalities,
-                dataset_root,
-                label=f"train_{target}/{name}",
-            )
-            cached_val_examples = filter_examples_with_cache(
-                val_examples,
-                cache_dir,
-                specs,
-                modalities,
-                dataset_root,
-                label=f"val/{name}",
-            )
-            cached_test_examples = filter_examples_with_cache(
-                test_examples,
-                cache_dir,
-                specs,
-                modalities,
-                dataset_root,
-                label=f"test/{name}",
-            )
+            if sharded_cache_keys is not None:
+                cached_train_examples = filter_examples_with_shards(
+                    train_examples,
+                    sharded_cache_keys,
+                    dataset_root,
+                    label=f"train_{target}/{name}",
+                )
+                cached_val_examples = filter_examples_with_shards(
+                    val_examples,
+                    sharded_cache_keys,
+                    dataset_root,
+                    label=f"val/{name}",
+                )
+                cached_test_examples = filter_examples_with_shards(
+                    test_examples,
+                    sharded_cache_keys,
+                    dataset_root,
+                    label=f"test/{name}",
+                )
+            else:
+                cached_train_examples = filter_examples_with_cache(
+                    train_examples,
+                    cache_dir,
+                    specs,
+                    modalities,
+                    dataset_root,
+                    label=f"train_{target}/{name}",
+                )
+                cached_val_examples = filter_examples_with_cache(
+                    val_examples,
+                    cache_dir,
+                    specs,
+                    modalities,
+                    dataset_root,
+                    label=f"val/{name}",
+                )
+                cached_test_examples = filter_examples_with_cache(
+                    test_examples,
+                    cache_dir,
+                    specs,
+                    modalities,
+                    dataset_root,
+                    label=f"test/{name}",
+                )
             cached_val_examples = rebalance_eval_examples(
                 cached_val_examples,
                 target_count=len(val_examples),
@@ -3804,6 +4186,8 @@ def main() -> None:
                 dataset_root=dataset_root,
                 output_dir=round_dir / name,
                 warm_start_checkpoint=warm_start_checkpoint,
+                sharded_cache_dir=args.sharded_cache_dir,
+                all_cache_examples=dataset_examples,
             )
             summary["previous_val_accuracy"] = (
                 None if previous is None else previous["val_accuracy"]
@@ -3829,23 +4213,31 @@ def main() -> None:
             f"counts={class_counts(sanity_examples)}",
             flush=True,
         )
-        sanity_progress = ensure_feature_cache(
-            examples=sanity_examples,
-            cache_dir=cache_dir,
-            specs=specs,
-            modalities=base_modalities,
-            config=config,
-            dataset_root=dataset_root,
-            extract_batch_size=args.extract_batch_size,
-            overwrite=args.overwrite_cache,
-            skip_failures=args.skip_failures,
-            progress_every=args.progress_every,
-            label="sanity",
-            video_decode_mode=args.video_decode_mode,
-            clip_cache_dir=clip_cache_dir,
-            manifest_minimum_rows=len(dataset_examples),
-            write_manifests=False,
-        )
+        if args.sharded_cache_dir is None:
+            sanity_progress = ensure_feature_cache(
+                examples=sanity_examples,
+                cache_dir=cache_dir,
+                specs=specs,
+                modalities=base_modalities,
+                config=config,
+                dataset_root=dataset_root,
+                extract_batch_size=args.extract_batch_size,
+                overwrite=args.overwrite_cache,
+                skip_failures=args.skip_failures,
+                progress_every=args.progress_every,
+                label="sanity",
+                video_decode_mode=args.video_decode_mode,
+                clip_cache_dir=clip_cache_dir,
+                manifest_minimum_rows=len(dataset_examples),
+                write_manifests=False,
+            )
+        else:
+            sanity_progress = sharded_cache_progress(
+                label="sanity",
+                examples=sanity_examples,
+                modalities=base_modalities,
+                sharded_cache_dir=args.sharded_cache_dir,
+            )
         write_json(output_dir / "sanity_cache_progress.json", sanity_progress)
         print(f"wrote: {output_dir / 'sanity_cache_progress.json'}", flush=True)
         sanity_results = run_sanity_check(

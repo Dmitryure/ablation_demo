@@ -22,7 +22,7 @@ training:
   run:
     dataset_root: /mnt/d/final_dataset
     cache_dir: /mnt/d/final_cache/v2
-    output_dir: iterative_ablation_runs_v2
+    output_dir: runs/iterative_ablation_runs_v2
     modalities:
       - rgb
       - fau

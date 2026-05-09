@@ -26,7 +26,7 @@ from dataset import (
 
 DEFAULT_DATASET_ROOT = Path("/mnt/d/final_dataset")
 DEFAULT_CONFIG = PROJECT_ROOT / "configs" / "registry_fusion.yaml"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "feature_cache_runs" / "rppg_face_crop_preview"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "feature_cache_runs" / "rppg_face_crop_preview"
 
 
 def parse_args() -> argparse.Namespace:
