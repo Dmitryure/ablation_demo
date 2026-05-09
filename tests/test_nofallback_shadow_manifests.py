@@ -109,13 +109,17 @@ class NoFallbackShadowManifestTest(unittest.TestCase):
             ):
                 fallback = {"real/r1.mp4"} if group.frame_count == 16 else {"fake/gen/f1.mp4"}
                 failures = {"real/r2.mp4"} if group.frame_count == 16 else set()
-                return fallback, failures, {
-                    "checked": len(rows_by_key),
-                    "fallback": len(fallback),
-                    "decode_failures": len(failures),
-                    "detected": len(rows_by_key) - len(fallback) - len(failures),
-                    "elapsed_seconds": 0.0,
-                }
+                return (
+                    fallback,
+                    failures,
+                    {
+                        "checked": len(rows_by_key),
+                        "fallback": len(fallback),
+                        "decode_failures": len(failures),
+                        "detected": len(rows_by_key) - len(fallback) - len(failures),
+                        "elapsed_seconds": 0.0,
+                    },
+                )
 
             with patch(
                 "scripts.build_nofallback_shadow_manifests.detect_fallback_keys",
@@ -140,7 +144,9 @@ class NoFallbackShadowManifestTest(unittest.TestCase):
 
             self.assertEqual(rgb_statuses["real/r1.mp4"], ("failed", "face_crop_not_detected"))
             self.assertEqual(rgb_statuses["fake/gen/f1.mp4"], ("cached", ""))
-            self.assertEqual(depth_statuses["fake/gen/f1.mp4"], ("failed", "face_crop_not_detected"))
+            self.assertEqual(
+                depth_statuses["fake/gen/f1.mp4"], ("failed", "face_crop_not_detected")
+            )
             self.assertEqual(eye_statuses["fake/gen/f1.mp4"], ("failed", "face_crop_not_detected"))
             self.assertEqual(summary["manifests"]["depth"]["marked_failed"], 1)
             self.assertEqual(summary["manifests"]["eye_gaze"]["marked_failed"], 1)
@@ -185,13 +191,17 @@ class NoFallbackShadowManifestTest(unittest.TestCase):
                 skip_failures,
             ):
                 fallback = {"fake/gen/f1.mp4"}
-                return fallback, set(), {
-                    "checked": len(rows_by_key),
-                    "fallback": len(fallback),
-                    "decode_failures": 0,
-                    "detected": len(rows_by_key) - len(fallback),
-                    "elapsed_seconds": 0.0,
-                }
+                return (
+                    fallback,
+                    set(),
+                    {
+                        "checked": len(rows_by_key),
+                        "fallback": len(fallback),
+                        "decode_failures": 0,
+                        "detected": len(rows_by_key) - len(fallback),
+                        "elapsed_seconds": 0.0,
+                    },
+                )
 
             with patch(
                 "scripts.build_nofallback_shadow_manifests.detect_fallback_keys",
@@ -213,7 +223,9 @@ class NoFallbackShadowManifestTest(unittest.TestCase):
             rgb_statuses = read_statuses(feature_cache_manifest_path(output_dir, specs["rgb"]))
             depth_statuses = read_statuses(feature_cache_manifest_path(output_dir, specs["depth"]))
             self.assertEqual(rgb_statuses["fake/gen/f1.mp4"], ("failed", "face_crop_not_detected"))
-            self.assertEqual(depth_statuses["fake/gen/f1.mp4"], ("failed", "face_crop_not_detected"))
+            self.assertEqual(
+                depth_statuses["fake/gen/f1.mp4"], ("failed", "face_crop_not_detected")
+            )
 
 
 if __name__ == "__main__":

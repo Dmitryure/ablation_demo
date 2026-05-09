@@ -82,7 +82,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ORDER_STRATEGY,
     )
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--expected-manifest-rows", type=int, default=DEFAULT_EXPECTED_MANIFEST_ROWS)
+    parser.add_argument(
+        "--expected-manifest-rows", type=int, default=DEFAULT_EXPECTED_MANIFEST_ROWS
+    )
     parser.add_argument("--progress-every", type=int, default=DEFAULT_PROGRESS_EVERY)
     return parser.parse_args()
 
@@ -148,10 +150,7 @@ def resolve_cache_dirs_by_modality(
         **config_modality_cache_dirs(config),
         **parse_modality_cache_dir_overrides(cli_overrides),
     }
-    return {
-        modality: overrides.get(modality, base_cache_dir)
-        for modality in modalities
-    }
+    return {modality: overrides.get(modality, base_cache_dir) for modality in modalities}
 
 
 def resolve_manifest_dirs_by_modality(
@@ -166,10 +165,7 @@ def resolve_manifest_dirs_by_modality(
         **config_modality_manifest_dirs(config),
         **parse_modality_manifest_dir_overrides(cli_overrides),
     }
-    return {
-        modality: overrides.get(modality, base_dir)
-        for modality in modalities
-    }
+    return {modality: overrides.get(modality, base_dir) for modality in modalities}
 
 
 def resolve_dataset_root(config: dict[str, Any]) -> Path:
@@ -189,7 +185,9 @@ def resolve_modalities(config: dict[str, Any], cli_modalities: list[str] | None)
 
 def reject_existing_output(output_dir: Path) -> None:
     if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Shard output directory already exists and is not empty: {output_dir}")
+        raise FileExistsError(
+            f"Shard output directory already exists and is not empty: {output_dir}"
+        )
 
 
 def source_manifest_stats(
@@ -228,19 +226,14 @@ def load_manifest_backed_examples_from_cache_dirs(
     if not common_keys:
         raise ValueError("No examples are cached for all requested modalities.")
     first_modality = modalities[0]
-    examples = [
-        entries_by_modality[first_modality][key].example
-        for key in sorted(common_keys)
-    ]
+    examples = [entries_by_modality[first_modality][key].example for key in sorted(common_keys)]
     summary = {
         "manifest_rows_expected": expected_rows,
         "modalities": list(modalities),
         "cached_by_modality": {
             modality: len(entries) for modality, entries in sorted(entries_by_modality.items())
         },
-        "cache_dirs_by_modality": {
-            modality: str(cache_dirs[modality]) for modality in modalities
-        },
+        "cache_dirs_by_modality": {modality: str(cache_dirs[modality]) for modality in modalities},
         "manifest_dirs_by_modality": {
             modality: str(manifest_dirs[modality]) for modality in modalities
         },
@@ -302,21 +295,13 @@ def stratified_shard_allocation(
 ) -> dict[str, int]:
     if capacity <= 0:
         return {}
-    active = {
-        class_name: count
-        for class_name, count in remaining_by_class.items()
-        if count > 0
-    }
+    active = {class_name: count for class_name, count in remaining_by_class.items() if count > 0}
     total = sum(active.values())
     if total <= 0:
         return {}
-    raw = {
-        class_name: (count * capacity) / total
-        for class_name, count in active.items()
-    }
+    raw = {class_name: (count * capacity) / total for class_name, count in active.items()}
     allocation = {
-        class_name: min(active[class_name], int(raw[class_name]))
-        for class_name in active
+        class_name: min(active[class_name], int(raw[class_name])) for class_name in active
     }
     remainder = capacity - sum(allocation.values())
     by_fraction = sorted(
@@ -643,9 +628,7 @@ def main() -> None:
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "config_path": str(args.config),
         "cache_dir": str(cache_dir),
-        "cache_dirs_by_modality": {
-            modality: str(cache_dirs[modality]) for modality in modalities
-        },
+        "cache_dirs_by_modality": {modality: str(cache_dirs[modality]) for modality in modalities},
         "manifest_dirs_by_modality": {
             modality: str(manifest_dirs[modality]) for modality in modalities
         },

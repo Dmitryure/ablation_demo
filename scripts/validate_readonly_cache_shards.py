@@ -121,7 +121,11 @@ def validate_readonly_cache_shards(
             for class_name, count in (shard.get("class_counts") or {}).items()
             if int(count) > 0
         }
-        if len(global_classes) > 1 and len(class_counts) == 1 and int(shard.get("example_count", 0)) > 1:
+        if (
+            len(global_classes) > 1
+            and len(class_counts) == 1
+            and int(shard.get("example_count", 0)) > 1
+        ):
             result["single_label_shards"] += 1
 
     if check_payloads and not result["missing_shard_files"]:

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-import json
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
 
-from feature_cache import FEATURE_CACHE_MANIFEST_COLUMNS, FeatureCacheSpec, feature_cache_manifest_path
 from dataset import VideoExample
+from feature_cache import (
+    FEATURE_CACHE_MANIFEST_COLUMNS,
+    FeatureCacheSpec,
+    feature_cache_manifest_path,
+)
 from scripts.build_readonly_cache_shards import (
     default_shard_size,
     load_manifest_backed_examples_from_cache_dirs,

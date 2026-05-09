@@ -3,10 +3,10 @@ from __future__ import annotations
 import csv
 import json
 import random
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator
+from typing import Any
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -504,10 +504,7 @@ class ShardedCachedFeatureDataset(Dataset[dict[str, Any]]):
         self.shards = list(self.index["shards"])
         self.allow_legacy_shards = allow_legacy_shards
         locations = self._example_locations(all_examples or ())
-        self.refs = [
-            self._ref_for_example(example, locations)
-            for example in selected_examples
-        ]
+        self.refs = [self._ref_for_example(example, locations) for example in selected_examples]
         self._loaded_shard_index: int | None = None
         self._loaded_shard: Mapping[str, Any] | None = None
 
@@ -745,7 +742,7 @@ class ShardedFeatureBatchSampler(Sampler[list[int]]):
                 yield ordered[start : start + self.batch_size]
             return
 
-        positions = {label: 0 for label in labels}
+        positions = dict.fromkeys(labels, 0)
         remaining = sum(len(label_indices) for label_indices in by_label.values())
         label_cursor = 0
         while remaining > 0:
@@ -776,7 +773,9 @@ class ShardedFeatureBatchSampler(Sampler[list[int]]):
         for shard_index, indices in self._groups_by_shard().items():
             labels = {int(self.refs[index].example.label) for index in indices}
             if len(labels) == 1 and len(indices) >= self.batch_size * 2:
-                blocked.append(f"shard={shard_index} label={next(iter(labels))} count={len(indices)}")
+                blocked.append(
+                    f"shard={shard_index} label={next(iter(labels))} count={len(indices)}"
+                )
         if blocked:
             sample = "; ".join(blocked[:5])
             raise ValueError(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import sys
 import time
 from collections import defaultdict
@@ -40,8 +39,11 @@ from scripts.run_readonly_cached_smoke import (
     reject_output_inside_inputs,
 )
 
-DEFAULT_CONFIG = PROJECT_ROOT / "runs" / "configs" / (
-    "train_readonly_cache_v2_balanced_fullreal_no_fau_with_v1_rppg_lr1e4.yaml"
+DEFAULT_CONFIG = (
+    PROJECT_ROOT
+    / "runs"
+    / "configs"
+    / ("train_readonly_cache_v2_balanced_fullreal_no_fau_with_v1_rppg_lr1e4.yaml")
 )
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "runs" / "cache_filters" / "v2_nofallback_manifests"
 DEFAULT_PROGRESS_EVERY = 500
@@ -80,7 +82,9 @@ def parse_args() -> argparse.Namespace:
             "--modalities. Useful for RGB-only filtering across an all-modality run."
         ),
     )
-    parser.add_argument("--expected-manifest-rows", type=int, default=DEFAULT_EXPECTED_MANIFEST_ROWS)
+    parser.add_argument(
+        "--expected-manifest-rows", type=int, default=DEFAULT_EXPECTED_MANIFEST_ROWS
+    )
     parser.add_argument("--video-decode-mode", choices=("seek", "scan"), default="scan")
     parser.add_argument("--progress-every", type=int, default=DEFAULT_PROGRESS_EVERY)
     parser.add_argument(
@@ -103,7 +107,9 @@ def resolve_cache_dir(config: Mapping[str, Any], cli_cache_dir: Path | None) -> 
 
 def reject_existing_output(output_dir: Path) -> None:
     if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Shadow manifest output already exists and is not empty: {output_dir}")
+        raise FileExistsError(
+            f"Shadow manifest output already exists and is not empty: {output_dir}"
+        )
 
 
 def read_manifest_rows(path: Path, expected_rows: int) -> tuple[list[dict[str, str]], list[str]]:
@@ -123,7 +129,9 @@ def read_manifest_rows(path: Path, expected_rows: int) -> tuple[list[dict[str, s
     return rows, fieldnames
 
 
-def write_manifest_rows(path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, str]]) -> None:
+def write_manifest_rows(
+    path: Path, fieldnames: Sequence[str], rows: Sequence[Mapping[str, str]]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=False)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -247,13 +255,17 @@ def detect_fallback_keys(
                 f"detect {group.group_id}: checked={index}/{total} "
                 f"fallback={len(fallback_keys)} failures={len(failure_keys)} elapsed={elapsed:.1f}s"
             )
-    return fallback_keys, failure_keys, {
-        "checked": total,
-        "fallback": len(fallback_keys),
-        "decode_failures": len(failure_keys),
-        "detected": total - len(fallback_keys) - len(failure_keys),
-        "elapsed_seconds": time.monotonic() - started,
-    }
+    return (
+        fallback_keys,
+        failure_keys,
+        {
+            "checked": total,
+            "fallback": len(fallback_keys),
+            "decode_failures": len(failure_keys),
+            "detected": total - len(fallback_keys) - len(failure_keys),
+            "elapsed_seconds": time.monotonic() - started,
+        },
+    )
 
 
 def mark_fallback_rows_failed(
@@ -422,7 +434,9 @@ def main() -> None:
         output_dir=output_dir,
         dataset_root=args.dataset_root,
         modalities=tuple(args.modalities),
-        apply_to_modalities=None if args.apply_to_modalities is None else tuple(args.apply_to_modalities),
+        apply_to_modalities=None
+        if args.apply_to_modalities is None
+        else tuple(args.apply_to_modalities),
         expected_rows=args.expected_manifest_rows,
         decode_mode=args.video_decode_mode,
         progress_every=args.progress_every,

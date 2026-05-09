@@ -282,10 +282,19 @@ class ReadOnlyCachedSmokeTest(unittest.TestCase):
                         "val_f1": "0.7",
                     }
                 )
-            with (training_dir / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
+            with (training_dir / "predictions.csv").open(
+                "w", encoding="utf-8", newline=""
+            ) as handle:
                 writer = csv.DictWriter(
                     handle,
-                    fieldnames=["path", "class_name", "label", "prediction", "probability", "split"],
+                    fieldnames=[
+                        "path",
+                        "class_name",
+                        "label",
+                        "prediction",
+                        "probability",
+                        "split",
+                    ],
                 )
                 writer.writeheader()
                 for split in ("train", "val", "test"):

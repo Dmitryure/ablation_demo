@@ -3888,8 +3888,7 @@ def main() -> None:
             "sharded_cache_examples": len(sharded_cache_keys),
         }
         print(
-            "shard selection: "
-            f"summary={cached_selection_summary} counts={class_counts(examples)}",
+            f"shard selection: summary={cached_selection_summary} counts={class_counts(examples)}",
             flush=True,
         )
         if not examples:

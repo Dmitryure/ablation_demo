@@ -99,7 +99,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--expected-manifest-rows", type=int, default=DEFAULT_EXPECTED_MANIFEST_ROWS)
+    parser.add_argument(
+        "--expected-manifest-rows", type=int, default=DEFAULT_EXPECTED_MANIFEST_ROWS
+    )
     parser.add_argument("--progress-every", type=int, default=DEFAULT_PROGRESS_EVERY)
     parser.add_argument(
         "--readonly-audit",
@@ -227,10 +229,7 @@ def resolve_cache_dirs_by_modality(
         **config_modality_cache_dirs(config),
         **parse_modality_cache_dir_overrides(cli_overrides),
     }
-    return {
-        modality: overrides.get(modality, base_cache_dir)
-        for modality in modalities
-    }
+    return {modality: overrides.get(modality, base_cache_dir) for modality in modalities}
 
 
 def resolve_manifest_dirs_by_modality(
@@ -245,10 +244,7 @@ def resolve_manifest_dirs_by_modality(
         **config_modality_manifest_dirs(config),
         **parse_modality_manifest_dir_overrides(cli_overrides),
     }
-    return {
-        modality: overrides.get(modality, base_dir)
-        for modality in modalities
-    }
+    return {modality: overrides.get(modality, base_dir) for modality in modalities}
 
 
 def _resolve_for_guard(path: Path) -> Path:
@@ -344,9 +340,7 @@ def read_cached_manifest_entries(
             entries[key] = ManifestEntry(key=key, example=example)
 
     if row_count != expected_rows:
-        raise ValueError(
-            f"Cache manifest must have {expected_rows} rows, got {row_count}: {path}"
-        )
+        raise ValueError(f"Cache manifest must have {expected_rows} rows, got {row_count}: {path}")
     if label is not None:
         elapsed = time.monotonic() - started
         log(
@@ -375,10 +369,7 @@ def load_manifest_backed_examples(
         raise ValueError("No examples are cached for all requested modalities.")
 
     first_modality = modalities[0]
-    examples = [
-        entries_by_modality[first_modality][key].example
-        for key in sorted(common_keys)
-    ]
+    examples = [entries_by_modality[first_modality][key].example for key in sorted(common_keys)]
     summary = {
         "manifest_rows_expected": expected_rows,
         "modalities": list(modalities),
@@ -412,19 +403,14 @@ def load_manifest_backed_examples_from_cache_dirs(
         raise ValueError("No examples are cached for all requested modalities.")
 
     first_modality = modalities[0]
-    examples = [
-        entries_by_modality[first_modality][key].example
-        for key in sorted(common_keys)
-    ]
+    examples = [entries_by_modality[first_modality][key].example for key in sorted(common_keys)]
     summary = {
         "manifest_rows_expected": expected_rows,
         "modalities": list(modalities),
         "cached_by_modality": {
             modality: len(entries) for modality, entries in sorted(entries_by_modality.items())
         },
-        "cache_dirs_by_modality": {
-            modality: str(cache_dirs[modality]) for modality in modalities
-        },
+        "cache_dirs_by_modality": {modality: str(cache_dirs[modality]) for modality in modalities},
         "manifest_dirs_by_modality": {
             modality: str(resolved_manifest_dirs[modality]) for modality in modalities
         },
@@ -536,7 +522,9 @@ def selected_cache_paths_by_modality(
     paths: list[Path] = []
     for example in examples:
         for modality in modalities:
-            paths.append(feature_cache_item_path(cache_dirs[modality], example, specs[modality], None))
+            paths.append(
+                feature_cache_item_path(cache_dirs[modality], example, specs[modality], None)
+            )
     return paths
 
 
@@ -614,11 +602,7 @@ def assert_cache_stats_unchanged(
     before: Mapping[str, CacheFileStat],
     after: Mapping[str, CacheFileStat],
 ) -> None:
-    changed = [
-        path
-        for path, before_stat in before.items()
-        if before_stat != after.get(path)
-    ]
+    changed = [path for path, before_stat in before.items() if before_stat != after.get(path)]
     if changed:
         sample = "\n".join(changed[:10])
         raise RuntimeError(f"Read-only cache audit failed; changed files:\n{sample}")
@@ -1024,7 +1008,10 @@ def write_core_plots(training_output_dir: Path, run_output_dir: Path) -> dict[st
     roc_pr_path = plots_dir / "roc_pr_curves.png"
     histograms_path = plots_dir / "probability_histograms.png"
     if prediction_rows:
-        write_json(plots_dir / "prediction_metrics_summary.json", prediction_metric_summary(prediction_rows))
+        write_json(
+            plots_dir / "prediction_metrics_summary.json",
+            prediction_metric_summary(prediction_rows),
+        )
 
     try:
         reason = (
@@ -1139,10 +1126,7 @@ def main() -> None:
         expected_rows=cli_args.expected_manifest_rows,
     )
     reject_unexpected_intersection(examples, cache_dir, modalities)
-    log(
-        f"selection intersection: cached={len(examples)} "
-        f"class_counts={class_counts(examples)}"
-    )
+    log(f"selection intersection: cached={len(examples)} class_counts={class_counts(examples)}")
     train_examples, val_examples, test_examples = select_readonly_splits(
         examples=examples,
         balanced_total=args.balanced_total,
@@ -1185,7 +1169,9 @@ def main() -> None:
             )
         else:
             log("sharded cache validation skipped: validate_before_train=false")
-    selected_paths = selected_cache_paths_by_modality(selected_examples, cache_dirs, specs, modalities)
+    selected_paths = selected_cache_paths_by_modality(
+        selected_examples, cache_dirs, specs, modalities
+    )
     if cli_args.check_cache_files:
         reject_missing_selected_cache_with_progress(selected_paths, cli_args.progress_every)
     else:
