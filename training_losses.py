@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+
+import torch
+import torch.nn.functional as F
+
+from training_targets import GeneratorTargetSpec
+
+
+def effective_number_weights(
+    counts: Mapping[str, int],
+    label_names: Sequence[str],
+    beta: float,
+    device: torch.device,
+) -> torch.Tensor:
+    if beta < 0.0 or beta >= 1.0:
+        raise ValueError("`beta` must be in [0.0, 1.0).")
+    weights: list[float] = []
+    for label in label_names:
+        count = max(1, int(counts.get(label, 0)))
+        weight = (1.0 - beta) / (1.0 - beta**count) if beta > 0.0 else 1.0
+        weights.append(weight)
+    tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+    return tensor / tensor.mean().clamp_min(torch.finfo(tensor.dtype).tiny)
+
+
+class ClassBalancedFocalLoss(torch.nn.Module):
+    def __init__(
+        self,
+        counts: Mapping[str, int],
+        target: GeneratorTargetSpec,
+        beta: float = 0.999,
+        gamma: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if gamma < 0.0:
+            raise ValueError("`gamma` must be non-negative.")
+        self.counts = dict(counts)
+        self.target = target
+        self.beta = beta
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if labels.numel() == 0:
+            return logits.sum() * 0.0
+        weights = effective_number_weights(
+            self.counts,
+            self.target.generator_names,
+            self.beta,
+            logits.device,
+        )
+        ce = F.cross_entropy(logits, labels, weight=weights, reduction="none")
+        probabilities = torch.softmax(logits, dim=-1)
+        true_probabilities = probabilities.gather(1, labels.view(-1, 1)).squeeze(1)
+        focal = (1.0 - true_probabilities).clamp_min(0.0).pow(self.gamma)
+        return (focal * ce).mean()
+
+
+def generator_loss_fn(
+    loss_type: str,
+    counts: Mapping[str, int],
+    target: GeneratorTargetSpec,
+    beta: float,
+    gamma: float,
+) -> torch.nn.Module:
+    if loss_type == "cross_entropy":
+        return torch.nn.CrossEntropyLoss()
+    if loss_type == "class_balanced_cross_entropy":
+
+        class WeightedCrossEntropy(torch.nn.Module):
+            def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+                weights = effective_number_weights(
+                    counts,
+                    target.generator_names,
+                    beta,
+                    logits.device,
+                )
+                return F.cross_entropy(logits, labels, weight=weights)
+
+        return WeightedCrossEntropy()
+    if loss_type == "class_balanced_focal":
+        return ClassBalancedFocalLoss(counts=counts, target=target, beta=beta, gamma=gamma)
+    raise ValueError(f"Unsupported generator loss type: {loss_type}")
+
+
+def multitask_loss(
+    binary_logits: torch.Tensor,
+    binary_labels: torch.Tensor,
+    generator_logits: torch.Tensor,
+    generator_labels: torch.Tensor,
+    binary_weight: float,
+    generator_weight: float,
+    generator_loss: torch.nn.Module,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    binary = F.binary_cross_entropy_with_logits(binary_logits, binary_labels)
+    generator = generator_loss(generator_logits, generator_labels)
+    total = binary_weight * binary + generator_weight * generator
+    return total, {
+        "binary_loss": float(binary.detach().item()),
+        "generator_loss": float(generator.detach().item()),
+        "loss": float(total.detach().item()),
+    }

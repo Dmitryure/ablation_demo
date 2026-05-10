@@ -1,0 +1,85 @@
+modalities:
+  - rgb
+  - eye_gaze
+  - face_mesh
+  - depth
+frames:
+  default: 32
+image_size: 224
+face_crop:
+  enabled: true
+  backend: opencv_haar
+  detection_frequency: 16
+  large_box_coef: 1.5
+  fallback: full_frame
+dim: 256
+seed: 0
+device: cuda
+training:
+  run:
+    dataset_root: /mnt/d/final_dataset
+    cache_dir: null
+    sharded_cache_dir: shards/v2_no_fau_with_v1_rppg_mixed_v2
+    output_dir: runs/generator_multitask_v2_grouped_unknown_holdout
+    modalities:
+      - rgb
+      - eye_gaze
+      - face_mesh
+      - depth
+    excluded_generators:
+      - dreamidv
+    generator_groups:
+      unknown_or_other:
+        - background_aug
+        - facefusion
+        - visomaster
+    eval_count_per_split: 500
+    train_ratio: 0.8
+    val_ratio: 0.1
+    batch_size: 16
+    real_per_batch: 8
+    fake_per_batch: 8
+    fake_generator_target_quota: 500
+    fake_generator_max_repeat: 4
+    train_fake_group_cap: 500
+    epochs: 20
+    lr: 0.0003
+    weight_decay: 0.01
+    binary_loss_weight: 1.0
+    generator_loss_weight: 0.25
+    binary_warmup_epochs: 2
+    generator_loss: cross_entropy
+    focal_beta: 0.999
+    focal_gamma: 2.0
+    seed: 0
+    dry_run: false
+  cached_loader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+fusion:
+  type: token_transformer
+  num_layers: 4
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.05
+  max_time_steps: 64
+  checkpoint_path: null
+head:
+  type: modality_gated_mil
+  hidden_dim: 1024
+  dropout: 0.15
+eye_gaze:
+  model_path: models/face_landmarker_v2_with_blendshapes.task
+  slot_count: 8
+rgb:
+  frames: 16
+  checkpoint_path: checkpoints/mvit_v2_s-ae3be167.pth
+  slot_count: 8
+face_mesh:
+  slot_count: 24
+depth:
+  model_id_or_path: models/depth-anything-v2-small-hf
+  feature_dim: 384
+  slot_count: 4
