@@ -33,6 +33,7 @@ from dataset import (
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
 from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.rgb import RGBExtractor
+from scripts.run_iterative_cached_ablation import split_examples as split_training_examples
 
 
 def fake_eye_gaze_detector(_: np.ndarray) -> dict[str, float]:
@@ -97,6 +98,16 @@ class DummyRGBEncoder(torch.nn.Module):
 
 
 class DatasetTest(unittest.TestCase):
+    def make_video_example(self, class_name: str, split: str, index: int) -> VideoExample:
+        label = 1 if class_name == "fake" else 0
+        return VideoExample(
+            path=Path(f"/dataset/{class_name}/{split}_{index}.mp4"),
+            label=label,
+            class_name=class_name,
+            source_id=f"{class_name}_{split}_{index}",
+            split=split,
+        )
+
     def write_meta(
         self,
         path: Path,
@@ -170,6 +181,53 @@ class DatasetTest(unittest.TestCase):
             self.assertEqual(sum(split["total"] for split in summary.values()), 8)
             self.assertEqual({example.class_name for example in loaded}, {"real", "fake"})
             self.assertEqual({example.split for example in loaded}, {"train", "val", "test"})
+
+    def test_training_split_examples_can_use_full_eval_splits(self):
+        examples = [
+            *[self.make_video_example("real", "train", index) for index in range(3)],
+            *[self.make_video_example("fake", "train", index) for index in range(5)],
+            *[self.make_video_example("real", "val", index) for index in range(4)],
+            *[self.make_video_example("fake", "val", index) for index in range(6)],
+            *[self.make_video_example("real", "test", index) for index in range(5)],
+            *[self.make_video_example("fake", "test", index) for index in range(7)],
+        ]
+
+        train, val, test = split_training_examples(
+            examples,
+            eval_count_per_split=4,
+            seed=0,
+            full_eval_splits=True,
+        )
+
+        self.assertEqual(len(train), 8)
+        self.assertEqual(len(val), 10)
+        self.assertEqual(len(test), 12)
+        self.assertEqual([example.split for example in val], ["val"] * 10)
+        self.assertEqual([example.split for example in test], ["test"] * 12)
+
+    def test_training_split_examples_default_caps_balanced_eval_splits(self):
+        examples = [
+            *[self.make_video_example("real", "train", index) for index in range(3)],
+            *[self.make_video_example("fake", "train", index) for index in range(5)],
+            *[self.make_video_example("real", "val", index) for index in range(4)],
+            *[self.make_video_example("fake", "val", index) for index in range(6)],
+            *[self.make_video_example("real", "test", index) for index in range(5)],
+            *[self.make_video_example("fake", "test", index) for index in range(7)],
+        ]
+
+        train, val, test = split_training_examples(
+            examples,
+            eval_count_per_split=4,
+            seed=0,
+        )
+
+        self.assertEqual(len(train), 8)
+        self.assertEqual(len(val), 4)
+        self.assertEqual(len(test), 4)
+        self.assertEqual(sum(example.class_name == "real" for example in val), 2)
+        self.assertEqual(sum(example.class_name == "fake" for example in val), 2)
+        self.assertEqual(sum(example.class_name == "real" for example in test), 2)
+        self.assertEqual(sum(example.class_name == "fake" for example in test), 2)
 
     def test_metadata_loader_rejects_duplicate_filenames(self):
         with tempfile.TemporaryDirectory() as tmpdir:

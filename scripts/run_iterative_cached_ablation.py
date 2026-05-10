@@ -8,13 +8,13 @@ import random
 import sys
 import time
 from collections import Counter, defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +58,12 @@ FAST_LADDER = (200, 500, 1000, 2000, 4000)
 TINY_LADDER = (40, 100, 200, 500)
 LARGE_LADDER = (1000, 2500, 5000)
 HEAD_TYPES = ("cls_linear", "cls_mlp", "attention_mil", "modality_gated_mil")
+TRAIN_BALANCE_MODES = (
+    "none",
+    "class_weighted_loss",
+    "class_balanced_batches",
+    "generator_balanced_batches",
+)
 CHECKPOINT_METRICS = (
     "val_accuracy",
     "val_balanced_accuracy",
@@ -79,7 +85,12 @@ RUN_ARG_DEFAULTS: dict[str, Any] = {
     "round_ladder": "fast",
     "round_targets": None,
     "eval_count_per_split": 500,
+    "full_eval_splits": False,
     "balanced_total": None,
+    "train_balance_mode": "none",
+    "fake_generator_cap_multiplier": None,
+    "fake_generator_cap_exemptions": (),
+    "fake_generator_loss_weights": None,
     "train_ratio": 0.8,
     "val_ratio": 0.1,
     "batch_size": 8,
@@ -104,6 +115,7 @@ RUN_ARG_DEFAULTS: dict[str, Any] = {
     "seed": 0,
     "overwrite_cache": False,
     "prefer_cached_selection": False,
+    "warm_start_checkpoint": None,
     "warm_start_rounds": False,
     "skip_failures": False,
     "video_decode_mode": "scan",
@@ -115,14 +127,27 @@ RUN_ARG_DEFAULTS: dict[str, Any] = {
     "dry_run": False,
 }
 
-PATH_RUN_ARGS = {"dataset_root", "cache_dir", "sharded_cache_dir", "output_dir", "clip_cache_dir"}
-SEQUENCE_RUN_ARGS = {"modalities", "round_targets", "occlusion_splits"}
+PATH_RUN_ARGS = {
+    "dataset_root",
+    "cache_dir",
+    "sharded_cache_dir",
+    "output_dir",
+    "clip_cache_dir",
+    "warm_start_checkpoint",
+}
+SEQUENCE_RUN_ARGS = {
+    "modalities",
+    "round_targets",
+    "occlusion_splits",
+    "fake_generator_cap_exemptions",
+}
 
 
 @dataclass(frozen=True)
 class PredictionRow:
     path: str
     class_name: str
+    generator_id: str
     label: int
     probability: float
     prediction: int
@@ -255,6 +280,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-count-per-split", type=int, default=None)
     parser.add_argument(
+        "--full-eval-splits",
+        action="store_true",
+        default=None,
+        help="Use every preserved val/test split example instead of balanced eval subsets.",
+    )
+    parser.add_argument(
         "--balanced-total",
         type=int,
         default=None,
@@ -262,6 +293,35 @@ def parse_args() -> argparse.Namespace:
             "Select this many videos across the whole dataset with equal real/fake counts, "
             "then derive train/val/test splits from that selected set."
         ),
+    )
+    parser.add_argument(
+        "--train-balance-mode",
+        choices=TRAIN_BALANCE_MODES,
+        default=None,
+        help=(
+            "Training-only balancing mode. Keeps validation/test selection unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--fake-generator-cap-multiplier",
+        type=float,
+        default=None,
+        help=(
+            "Training-pool fake generator cap as median_fake_generator_count * multiplier. "
+            "Keeps all real examples and caps overrepresented fake generators before round selection."
+        ),
+    )
+    parser.add_argument(
+        "--fake-generator-cap-exemptions",
+        nargs="*",
+        default=None,
+        help="Fake generator ids exempt from --fake-generator-cap-multiplier.",
+    )
+    parser.add_argument(
+        "--fake-generator-loss-weights",
+        nargs="*",
+        default=None,
+        help="Training loss weights for fake generators, e.g. dlc=1.5 visomaster=2.0.",
     )
     parser.add_argument("--train-ratio", type=float, default=None)
     parser.add_argument("--val-ratio", type=float, default=None)
@@ -346,6 +406,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=None,
         help="Initialize each train-count round from the previous round checkpoint for the same modality set.",
+    )
+    parser.add_argument(
+        "--warm-start-checkpoint",
+        type=Path,
+        default=None,
+        help="Initialize every requested training round from this checkpoint.",
     )
     parser.add_argument("--skip-failures", action="store_true", default=None)
     parser.add_argument(
@@ -434,6 +500,30 @@ def _coerce_modality_lr(value: Any) -> dict[str, float] | list[str] | None:
     raise ValueError("`training.run.modality_lr` must be a mapping, list, or null.")
 
 
+def _coerce_fake_generator_loss_weights(value: Any) -> dict[str, float] | list[str] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        parsed: dict[str, float] = {}
+        for generator_id, weight in value.items():
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or float(weight) <= 0.0
+            ):
+                raise ValueError(
+                    "training.run.fake_generator_loss_weights."
+                    f"{generator_id} must be a positive number."
+                )
+            parsed[str(generator_id)] = float(weight)
+        return parsed
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [str(item) for item in value]
+    raise ValueError(
+        "`training.run.fake_generator_loss_weights` must be a mapping, list, or null."
+    )
+
+
 def coerce_training_run_value(field_name: str, value: Any) -> Any:
     if field_name in PATH_RUN_ARGS:
         return _coerce_run_path(value, field_name)
@@ -441,6 +531,8 @@ def coerce_training_run_value(field_name: str, value: Any) -> Any:
         return _coerce_run_sequence(value, field_name)
     if field_name == "modality_lr":
         return _coerce_modality_lr(value)
+    if field_name == "fake_generator_loss_weights":
+        return _coerce_fake_generator_loss_weights(value)
     return value
 
 
@@ -695,6 +787,325 @@ def class_counts(examples: Sequence[VideoExample]) -> dict[str, int]:
     return counts
 
 
+def fake_generator_counts(examples: Sequence[VideoExample]) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for example in examples:
+        if example.class_name != "fake":
+            continue
+        counts[str(example.generator_id or "unknown")] += 1
+    return dict(sorted(counts.items()))
+
+
+def median_int(values: Sequence[int]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return float(ordered[midpoint])
+    return (float(ordered[midpoint - 1]) + float(ordered[midpoint])) / 2.0
+
+
+def resolve_fake_generator_cap(
+    counts: Mapping[str, int],
+    multiplier: float | None,
+) -> tuple[int | None, float | None]:
+    if multiplier is None:
+        return None, None
+    if multiplier <= 0.0:
+        raise ValueError("`--fake-generator-cap-multiplier` must be positive.")
+    median_count = median_int(list(counts.values()))
+    cap = max(1, int(median_count * multiplier))
+    return cap, median_count
+
+
+def cap_fake_generators(
+    examples: Sequence[VideoExample],
+    cap_multiplier: float | None,
+    seed: int,
+    cap_exemptions: Sequence[str] = (),
+    cache_score_by_path: Mapping[str, int] | None = None,
+) -> tuple[list[VideoExample], dict[str, Any]]:
+    original_counts = fake_generator_counts(examples)
+    exemptions = frozenset(str(item) for item in cap_exemptions if str(item))
+    cap, median_count = resolve_fake_generator_cap(original_counts, cap_multiplier)
+    if cap is None:
+        return list(examples), {
+            "enabled": False,
+            "multiplier": None,
+            "exemptions": sorted(exemptions),
+            "median_count": None,
+            "cap": None,
+            "original_fake_generator_counts": original_counts,
+            "selected_fake_generator_counts": original_counts,
+            "dropped_fake_count": 0,
+        }
+
+    real = [example for example in examples if example.class_name == "real"]
+    fake_by_generator: dict[str, list[VideoExample]] = defaultdict(list)
+    for example in examples:
+        if example.class_name == "fake":
+            fake_by_generator[str(example.generator_id or "unknown")].append(example)
+
+    selected_fake: list[VideoExample] = []
+    for offset, generator_id in enumerate(sorted(fake_by_generator)):
+        ordered = _shuffled(
+            fake_by_generator[generator_id],
+            seed + offset + 1,
+            cache_score_by_path=cache_score_by_path,
+        )
+        selected_fake.extend(ordered if generator_id in exemptions else ordered[:cap])
+
+    capped_examples = [*real, *selected_fake]
+    selected_counts = fake_generator_counts(capped_examples)
+    return capped_examples, {
+        "enabled": True,
+        "multiplier": cap_multiplier,
+        "exemptions": sorted(exemptions),
+        "median_count": median_count,
+        "cap": cap,
+        "original_fake_generator_counts": original_counts,
+        "selected_fake_generator_counts": selected_counts,
+        "dropped_fake_count": sum(original_counts.values()) - sum(selected_counts.values()),
+    }
+
+
+def label_index_groups(examples: Sequence[VideoExample]) -> dict[int, list[int]]:
+    groups: dict[int, list[int]] = defaultdict(list)
+    for index, example in enumerate(examples):
+        groups[int(example.label)].append(index)
+    return dict(groups)
+
+
+def fake_generator_index_groups(examples: Sequence[VideoExample]) -> dict[str, list[int]]:
+    groups: dict[str, list[int]] = defaultdict(list)
+    missing: list[str] = []
+    for index, example in enumerate(examples):
+        if int(example.label) != 1:
+            continue
+        generator_id = str(example.generator_id or "").strip()
+        if not generator_id:
+            missing.append(metadata_filename_for_example(example))
+            continue
+        groups[generator_id].append(index)
+    if missing:
+        sample = ", ".join(missing[:5])
+        raise ValueError(
+            "generator_balanced_batches requires generator_id for every fake "
+            f"training example. Missing examples: {sample}"
+        )
+    return dict(groups)
+
+
+def require_binary_train_labels(examples: Sequence[VideoExample]) -> dict[int, list[int]]:
+    groups = label_index_groups(examples)
+    real = groups.get(0, [])
+    fake = groups.get(1, [])
+    if not real or not fake:
+        raise ValueError(
+            "Train balancing requires both real and fake training examples "
+            f"(real={len(real)}, fake={len(fake)})."
+        )
+    return {0: real, 1: fake}
+
+
+def sample_indices_with_replacement(
+    indices: Sequence[int],
+    target_count: int,
+    rng: random.Random,
+) -> list[int]:
+    if target_count <= 0:
+        return []
+    if not indices:
+        raise ValueError("Cannot sample from an empty index group.")
+    sampled: list[int] = []
+    while len(sampled) < target_count:
+        chunk = list(indices)
+        rng.shuffle(chunk)
+        sampled.extend(chunk[: target_count - len(sampled)])
+    return sampled
+
+
+def interleave_label_indices(
+    real_indices: Sequence[int],
+    fake_indices: Sequence[int],
+    rng: random.Random,
+) -> list[int]:
+    labels = [0, 1]
+    rng.shuffle(labels)
+    positions = {0: 0, 1: 0}
+    by_label = {0: list(real_indices), 1: list(fake_indices)}
+    ordered: list[int] = []
+    remaining = len(real_indices) + len(fake_indices)
+    label_cursor = 0
+    while remaining > 0:
+        label = labels[label_cursor % len(labels)]
+        label_cursor += 1
+        position = positions[label]
+        if position >= len(by_label[label]):
+            continue
+        ordered.append(by_label[label][position])
+        positions[label] += 1
+        remaining -= 1
+    return ordered
+
+
+def generator_balanced_fake_indices(
+    generator_groups: Mapping[str, Sequence[int]],
+    target_count: int,
+    rng: random.Random,
+) -> list[int]:
+    generators = sorted(generator_groups)
+    if not generators:
+        raise ValueError("generator_balanced_batches requires at least one fake generator.")
+    rng.shuffle(generators)
+    base_quota = target_count // len(generators)
+    remainder = target_count % len(generators)
+    sampled: list[int] = []
+    for offset, generator_id in enumerate(generators):
+        quota = base_quota + (1 if offset < remainder else 0)
+        sampled.extend(sample_indices_with_replacement(generator_groups[generator_id], quota, rng))
+    rng.shuffle(sampled)
+    return sampled
+
+
+class BalancedTrainBatchSampler(Sampler[list[int]]):
+    def __init__(
+        self,
+        examples: Sequence[VideoExample],
+        batch_size: int,
+        mode: str,
+        seed: int,
+        shuffle: bool = True,
+    ) -> None:
+        if mode not in {"class_balanced_batches", "generator_balanced_batches"}:
+            raise ValueError(f"Unsupported balanced batch mode: {mode}")
+        if batch_size <= 0:
+            raise ValueError("`batch_size` must be positive.")
+        self.examples = list(examples)
+        self.batch_size = batch_size
+        self.mode = mode
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.label_groups = require_binary_train_labels(self.examples)
+        self.fake_generator_groups = (
+            fake_generator_index_groups(self.examples)
+            if mode == "generator_balanced_batches"
+            else {}
+        )
+        self.target_per_label = max(len(self.label_groups[0]), len(self.label_groups[1]))
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        real_indices = sample_indices_with_replacement(
+            self.label_groups[0],
+            self.target_per_label,
+            rng,
+        )
+        if self.mode == "generator_balanced_batches":
+            fake_indices = generator_balanced_fake_indices(
+                self.fake_generator_groups,
+                self.target_per_label,
+                rng,
+            )
+        else:
+            fake_indices = sample_indices_with_replacement(
+                self.label_groups[1],
+                self.target_per_label,
+                rng,
+            )
+        if not self.shuffle:
+            real_indices = sorted(real_indices)
+            fake_indices = sorted(fake_indices)
+        ordered = interleave_label_indices(real_indices, fake_indices, rng)
+        for start in range(0, len(ordered), self.batch_size):
+            yield ordered[start : start + self.batch_size]
+        self.epoch += 1
+
+    def __len__(self) -> int:
+        epoch_samples = self.target_per_label * 2
+        return (epoch_samples + self.batch_size - 1) // self.batch_size
+
+    def summary(self) -> dict[str, Any]:
+        generator_counts = {
+            generator_id: len(indices)
+            for generator_id, indices in sorted(self.fake_generator_groups.items())
+        }
+        return {
+            "sampler": self.mode,
+            "epoch_samples": self.target_per_label * 2,
+            "target_per_label": self.target_per_label,
+            "class_counts": class_counts(self.examples),
+            "fake_generator_counts": generator_counts,
+        }
+
+
+def train_pos_weight(examples: Sequence[VideoExample]) -> float:
+    groups = require_binary_train_labels(examples)
+    return len(groups[0]) / len(groups[1])
+
+
+def build_train_balance_summary(
+    examples: Sequence[VideoExample],
+    mode: str,
+    batch_size: int,
+    seed: int,
+) -> dict[str, Any]:
+    if mode not in TRAIN_BALANCE_MODES:
+        raise ValueError(f"Unsupported train_balance_mode: {mode}")
+    summary: dict[str, Any] = {
+        "mode": mode,
+        "class_counts": class_counts(examples),
+        "loss": {"type": "bce_with_logits", "pos_weight": None},
+        "sampler": None,
+        "epoch_samples": len(examples),
+    }
+    if mode == "none":
+        return summary
+    if mode == "class_weighted_loss":
+        summary["loss"] = {
+            "type": "bce_with_logits",
+            "pos_weight": train_pos_weight(examples),
+        }
+        return summary
+    sampler = BalancedTrainBatchSampler(
+        examples=examples,
+        batch_size=batch_size,
+        mode=mode,
+        seed=seed,
+    )
+    sampler_summary = sampler.summary()
+    return {**summary, **sampler_summary}
+
+
+def build_train_batch_sampler(
+    examples: Sequence[VideoExample],
+    batch_size: int,
+    mode: str,
+    seed: int,
+) -> BalancedTrainBatchSampler | None:
+    if mode in {"class_balanced_batches", "generator_balanced_batches"}:
+        return BalancedTrainBatchSampler(
+            examples=examples,
+            batch_size=batch_size,
+            mode=mode,
+            seed=seed,
+        )
+    return None
+
+
+def build_train_loss_fn(
+    examples: Sequence[VideoExample],
+    mode: str,
+    device: torch.device,
+) -> torch.nn.Module:
+    if mode == "class_weighted_loss":
+        pos_weight = torch.tensor([train_pos_weight(examples)], device=device)
+        return torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    return torch.nn.BCEWithLogitsLoss()
+
+
 def video_metadata_summary(examples: Sequence[VideoExample]) -> dict[str, Any]:
     return summarize_split_audit(examples)
 
@@ -918,8 +1329,15 @@ def split_examples(
     eval_count_per_split: int,
     seed: int,
     cache_score_by_path: Mapping[str, int] | None = None,
+    full_eval_splits: bool = False,
 ) -> tuple[list[VideoExample], list[VideoExample], list[VideoExample]]:
     train = [example for example in examples if example.split == "train"]
+    if full_eval_splits:
+        return (
+            train,
+            [example for example in examples if example.split == "val"],
+            [example for example in examples if example.split == "test"],
+        )
     val = select_balanced_subset(
         [example for example in examples if example.split == "val"],
         eval_count_per_split,
@@ -1032,6 +1450,43 @@ def parse_modality_lrs(values: Mapping[str, Any] | Sequence[str] | None) -> dict
         if lr <= 0.0:
             raise ValueError(f"`--modality-lr` must be positive, got {value!r}.")
         parsed[modality] = lr
+    return parsed
+
+
+def parse_fake_generator_loss_weights(
+    values: Mapping[str, Any] | Sequence[str] | None,
+) -> dict[str, float]:
+    if not values:
+        return {}
+    if isinstance(values, Mapping):
+        parsed: dict[str, float] = {}
+        for generator_id, raw_weight in values.items():
+            weight = float(raw_weight)
+            if weight <= 0.0:
+                raise ValueError(
+                    f"`fake_generator_loss_weights.{generator_id}` must be positive, "
+                    f"got {raw_weight!r}."
+                )
+            parsed[str(generator_id)] = weight
+        return parsed
+    parsed: dict[str, float] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(
+                f"`--fake-generator-loss-weights` must use generator=value, got {value!r}."
+            )
+        generator_id, raw_weight = value.split("=", 1)
+        generator_id = generator_id.strip()
+        if not generator_id:
+            raise ValueError(
+                f"`--fake-generator-loss-weights` has empty generator in {value!r}."
+            )
+        weight = float(raw_weight)
+        if weight <= 0.0:
+            raise ValueError(
+                f"`--fake-generator-loss-weights` must be positive, got {value!r}."
+            )
+        parsed[generator_id] = weight
     return parsed
 
 
@@ -1203,6 +1658,57 @@ def apply_training_modality_dropout(
     return {**batch, "dropped_modalities": dropped}
 
 
+def batch_generator_ids(batch: Mapping[str, Any]) -> tuple[str, ...]:
+    class_names = tuple(str(item) for item in batch["class_name"])
+    generator_ids = tuple(str(item or "") for item in batch.get("generator_id", ()))
+    if len(generator_ids) != len(class_names):
+        generator_ids = tuple("" for _ in class_names)
+    resolved: list[str] = []
+    for class_name, generator_id in zip(class_names, generator_ids):
+        if class_name == "real":
+            resolved.append("real")
+        else:
+            resolved.append(generator_id or "unknown")
+    return tuple(resolved)
+
+
+def fake_generator_sample_weights(
+    batch: Mapping[str, Any],
+    weights: Mapping[str, float],
+    device: torch.device,
+) -> torch.Tensor | None:
+    if not weights:
+        return None
+    class_names = tuple(str(item) for item in batch["class_name"])
+    generator_ids = batch_generator_ids(batch)
+    values = [
+        float(weights.get(generator_id, 1.0)) if class_name == "fake" else 1.0
+        for class_name, generator_id in zip(class_names, generator_ids)
+    ]
+    return torch.tensor(values, dtype=torch.float32, device=device).view(-1, 1)
+
+
+def compute_weighted_train_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    batch: Mapping[str, Any],
+    loss_fn: torch.nn.Module,
+    fake_generator_weights: Mapping[str, float],
+) -> torch.Tensor:
+    sample_weights = fake_generator_sample_weights(batch, fake_generator_weights, logits.device)
+    if sample_weights is None:
+        return loss_fn(logits, labels)
+    losses = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        labels,
+        pos_weight=getattr(loss_fn, "pos_weight", None),
+        reduction="none",
+    )
+    return (losses * sample_weights).sum() / sample_weights.sum().clamp_min(
+        torch.finfo(losses.dtype).tiny
+    )
+
+
 def gate_entropy_regularization(
     output: Any,
     weight: float,
@@ -1300,6 +1806,7 @@ def train_one_epoch(
     loader: DataLoader[dict[str, Any]],
     optimizer: torch.optim.Optimizer,
     loss_fn: torch.nn.Module,
+    fake_generator_loss_weights: Mapping[str, float] | None = None,
     regularization_config: TrainingRegularizationConfig | None = None,
     progress_label: str | None = None,
     progress_every: int = 0,
@@ -1315,6 +1822,7 @@ def train_one_epoch(
     false_negative = 0
     start = time.perf_counter()
     batch_count = len(loader)
+    generator_weights = fake_generator_loss_weights or {}
     for batch_index, batch in enumerate(loader, start=1):
         labels = batch["label"].to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -1324,7 +1832,13 @@ def train_one_epoch(
             resolved_regularization.modality_dropout,
         )
         output = model(move_tensor_batch_to_device(training_batch, device))
-        loss = loss_fn(output.logits, labels)
+        loss = compute_weighted_train_loss(
+            output.logits,
+            labels,
+            batch,
+            loss_fn,
+            generator_weights,
+        )
         entropy_loss = gate_entropy_regularization(
             output,
             resolved_regularization.gate_entropy_weight,
@@ -1502,11 +2016,13 @@ def predict_rows(
                     probabilities=probabilities,
                     predictions=predictions,
                 )
+            generator_ids = batch_generator_ids(batch)
             for index, probability in enumerate(probabilities.tolist()):
                 rows.append(
                     PredictionRow(
                         path=batch["path"][index],
                         class_name=batch["class_name"][index],
+                        generator_id=generator_ids[index],
                         label=int(labels[index].item()),
                         probability=float(probability),
                         prediction=int(predictions[index].item()),
@@ -1735,6 +2251,81 @@ def prediction_rows_metrics(rows: Sequence[PredictionRow]) -> BinaryMetrics:
     return binary_metrics_from_counts(tp, tn, fp, fn)
 
 
+def prediction_generator_metrics(rows: Sequence[PredictionRow]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str, str], list[PredictionRow]] = defaultdict(list)
+    for row in rows:
+        groups[(row.split, row.class_name, row.generator_id)].append(row)
+
+    summaries: list[dict[str, Any]] = []
+    for (split, class_name, generator_id), group_rows in groups.items():
+        metrics = prediction_rows_metrics(group_rows)
+        summaries.append(
+            {
+                "split": split,
+                "class_name": class_name,
+                "generator_id": generator_id,
+                "count": len(group_rows),
+                "accuracy": metrics.accuracy,
+                "balanced_accuracy": metrics.balanced_accuracy,
+                "precision": metrics.precision,
+                "recall": metrics.recall,
+                "f1": metrics.f1,
+                "specificity": metrics.specificity,
+                "false_positive": metrics.false_positive,
+                "false_negative": metrics.false_negative,
+                "true_positive": metrics.true_positive,
+                "true_negative": metrics.true_negative,
+            }
+        )
+    return sorted(
+        summaries,
+        key=lambda item: (
+            str(item["split"]),
+            str(item["class_name"]),
+            str(item["generator_id"]),
+        ),
+    )
+
+
+def write_generator_metrics(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "split",
+                "class_name",
+                "generator_id",
+                "count",
+                "accuracy",
+                "balanced_accuracy",
+                "precision",
+                "recall",
+                "f1",
+                "specificity",
+                "false_positive",
+                "false_negative",
+                "true_positive",
+                "true_negative",
+            ),
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    **row,
+                    "accuracy": f"{float(row['accuracy']):.8f}",
+                    "balanced_accuracy": f"{float(row['balanced_accuracy']):.8f}",
+                    "precision": f"{float(row['precision']):.8f}",
+                    "recall": f"{float(row['recall']):.8f}",
+                    "f1": f"{float(row['f1']):.8f}",
+                    "specificity": f"{float(row['specificity']):.8f}",
+                }
+            )
+
+
 def build_cached_loader(
     examples: Sequence[VideoExample],
     cache_dir: Path,
@@ -1744,6 +2335,7 @@ def build_cached_loader(
     shuffle: bool,
     dataset_root: Path,
     loader_config: CachedLoaderConfig | None = None,
+    batch_sampler: Sampler[list[int]] | None = None,
 ) -> DataLoader[dict[str, Any]]:
     resolved_loader_config = loader_config or CachedLoaderConfig()
     dataset = CachedFeatureDataset(
@@ -1755,12 +2347,15 @@ def build_cached_loader(
         dataset_root=dataset_root,
     )
     loader_kwargs: dict[str, Any] = {
-        "batch_size": batch_size,
-        "shuffle": shuffle,
         "collate_fn": collate_cached_feature_batch,
         "num_workers": resolved_loader_config.num_workers,
         "pin_memory": resolved_loader_config.pin_memory,
     }
+    if batch_sampler is None:
+        loader_kwargs["batch_size"] = batch_size
+        loader_kwargs["shuffle"] = shuffle
+    else:
+        loader_kwargs["batch_sampler"] = batch_sampler
     if resolved_loader_config.num_workers > 0:
         loader_kwargs["persistent_workers"] = resolved_loader_config.persistent_workers
         if resolved_loader_config.prefetch_factor is not None:
@@ -1781,6 +2376,7 @@ def build_sharded_cached_loader(
     loader_config: CachedLoaderConfig | None = None,
     sharded_loader_config: ShardedLoaderConfig | None = None,
     seed: int = 0,
+    batch_sampler: Sampler[list[int]] | None = None,
 ) -> DataLoader[dict[str, Any]]:
     resolved_loader_config = loader_config or CachedLoaderConfig()
     resolved_sharded_config = sharded_loader_config or ShardedLoaderConfig()
@@ -1791,15 +2387,17 @@ def build_sharded_cached_loader(
         dataset_root=dataset_root,
         allow_legacy_shards=resolved_sharded_config.allow_legacy_shards,
     )
-    batch_sampler = ShardedFeatureBatchSampler(
-        refs=dataset.refs,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        seed=seed,
-        batch_strategy=resolved_sharded_config.batch_strategy,
-    )
+    resolved_batch_sampler = batch_sampler
+    if resolved_batch_sampler is None:
+        resolved_batch_sampler = ShardedFeatureBatchSampler(
+            refs=dataset.refs,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            seed=seed,
+            batch_strategy=resolved_sharded_config.batch_strategy,
+        )
     loader_kwargs: dict[str, Any] = {
-        "batch_sampler": batch_sampler,
+        "batch_sampler": resolved_batch_sampler,
         "collate_fn": collate_cached_feature_batch,
         "num_workers": resolved_loader_config.num_workers,
         "pin_memory": resolved_loader_config.pin_memory,
@@ -3048,7 +3646,15 @@ def write_predictions(path: Path, rows: Sequence[PredictionRow]) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("path", "class_name", "label", "prediction", "probability", "split"),
+            fieldnames=(
+                "path",
+                "class_name",
+                "generator_id",
+                "label",
+                "prediction",
+                "probability",
+                "split",
+            ),
         )
         writer.writeheader()
         for row in rows:
@@ -3056,6 +3662,7 @@ def write_predictions(path: Path, rows: Sequence[PredictionRow]) -> None:
                 {
                     "path": row.path,
                     "class_name": row.class_name,
+                    "generator_id": row.generator_id,
                     "label": row.label,
                     "prediction": row.prediction,
                     "probability": f"{row.probability:.8f}",
@@ -3410,16 +4017,36 @@ def run_training_round(
         model.load_state_dict(state)
         print(f"loaded warm-start checkpoint: {warm_start_checkpoint}", flush=True)
     modality_lrs = parse_modality_lrs(args.modality_lr)
+    fake_generator_loss_weights = parse_fake_generator_loss_weights(
+        args.fake_generator_loss_weights
+    )
     loader_config = resolve_cached_loader_config(config)
     sharded_loader_config = resolve_sharded_loader_config(config)
     regularization_config = resolve_training_regularization_config(config, args)
+    train_balance_summary = build_train_balance_summary(
+        train_examples,
+        mode=args.train_balance_mode,
+        batch_size=args.batch_size,
+        seed=int(args.seed),
+    )
+    train_batch_sampler = build_train_batch_sampler(
+        train_examples,
+        batch_size=args.batch_size,
+        mode=args.train_balance_mode,
+        seed=int(args.seed),
+    )
     optimizer = build_optimizer(
         model,
         base_lr=args.lr,
         modality_lrs=modality_lrs,
         weight_decay=args.weight_decay,
     )
-    loss_fn = torch.nn.BCEWithLogitsLoss()
+    train_loss_fn = build_train_loss_fn(
+        train_examples,
+        mode=args.train_balance_mode,
+        device=build_result.device,
+    )
+    eval_loss_fn = torch.nn.BCEWithLogitsLoss()
 
     if sharded_cache_dir is not None:
         if all_cache_examples is None:
@@ -3434,6 +4061,7 @@ def run_training_round(
             loader_config=loader_config,
             sharded_loader_config=sharded_loader_config,
             seed=int(args.seed),
+            batch_sampler=train_batch_sampler,
         )
         val_loader = build_sharded_cached_loader(
             examples=val_examples,
@@ -3467,6 +4095,7 @@ def run_training_round(
             shuffle=True,
             dataset_root=dataset_root,
             loader_config=loader_config,
+            batch_sampler=train_batch_sampler,
         )
         val_loader = build_cached_loader(
             val_examples,
@@ -3499,8 +4128,10 @@ def run_training_round(
         f"train={len(train_examples)} val={len(val_examples)} test={len(test_examples)} "
         f"batch_size={args.batch_size} device={build_result.device} "
         f"loader={asdict(loader_config)} "
+        f"train_balance={train_balance_summary} "
         f"regularization={asdict(regularization_config)} "
         f"lr={args.lr} modality_lrs={modality_lrs} "
+        f"fake_generator_loss_weights={fake_generator_loss_weights} "
         f"weight_decay={args.weight_decay} "
         f"checkpoint_metric={args.checkpoint_metric} "
         f"early_stopping_patience={args.early_stopping_patience}",
@@ -3511,7 +4142,8 @@ def run_training_round(
             model,
             train_loader,
             optimizer,
-            loss_fn,
+            train_loss_fn,
+            fake_generator_loss_weights=fake_generator_loss_weights,
             regularization_config=regularization_config,
             progress_label=f"train epoch={epoch}",
             progress_every=int(args.progress_every),
@@ -3519,7 +4151,7 @@ def run_training_round(
         val_result = evaluate_loss_accuracy(
             model,
             val_loader,
-            loss_fn,
+            eval_loss_fn,
             progress_label=f"val epoch={epoch}",
             progress_every=int(args.progress_every),
         )
@@ -3609,6 +4241,7 @@ def run_training_round(
     train_metrics = prediction_rows_metrics(train_rows)
     val_metrics = prediction_rows_metrics(val_rows)
     test_metrics = prediction_rows_metrics(test_rows)
+    generator_metrics = prediction_generator_metrics([*train_rows, *val_rows, *test_rows])
     print(
         f"eval: train_accuracy={train_accuracy:.4f} "
         f"train_f1={train_metrics.f1:.4f} "
@@ -3621,6 +4254,7 @@ def run_training_round(
     output_dir.mkdir(parents=True, exist_ok=True)
     write_metrics(output_dir / "metrics.csv", metrics)
     write_predictions(output_dir / "predictions.csv", [*train_rows, *val_rows, *test_rows])
+    write_generator_metrics(output_dir / "generator_metrics.csv", generator_metrics)
     diagnostic_summary_rows = summarize_diagnostic_rows(diagnostic_rows)
     write_diagnostics(output_dir / "diagnostics.csv", diagnostic_rows)
     write_diagnostic_summary(output_dir / "diagnostics_summary.csv", diagnostic_summary_rows)
@@ -3668,9 +4302,11 @@ def run_training_round(
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "modality_lrs": modality_lrs,
+        "fake_generator_loss_weights": fake_generator_loss_weights,
         "batch_size": args.batch_size,
         "cached_loader": asdict(loader_config),
         "sharded_cache_dir": None if sharded_cache_dir is None else str(sharded_cache_dir),
+        "train_balance": train_balance_summary,
         "regularization": asdict(regularization_config),
         "checkpoint_metric": args.checkpoint_metric,
         "best_checkpoint_metric_value": best_metric_value,
@@ -3686,6 +4322,8 @@ def run_training_round(
         "train_metrics": asdict(train_metrics),
         "val_metrics": asdict(val_metrics),
         "test_metrics": asdict(test_metrics),
+        "generator_metrics": generator_metrics,
+        "generator_metrics_csv": str(output_dir / "generator_metrics.csv"),
         "diagnostics_csv": None if not diagnostic_rows else str(output_dir / "diagnostics.csv"),
         "diagnostics_summary_csv": None
         if not diagnostic_summary_rows
@@ -3915,6 +4553,10 @@ def main() -> None:
                 "No examples have valid cached features for all requested modalities. "
                 "Generate cache first or disable --prefer-cached-selection."
             )
+    if args.full_eval_splits and args.balanced_total is not None:
+        raise ValueError(
+            "--full-eval-splits requires preserved dataset splits; omit --balanced-total."
+        )
     cache_score_by_path = None
     if args.balanced_total is None:
         split_mode = "dataset_splits"
@@ -3923,6 +4565,7 @@ def main() -> None:
             eval_count_per_split=args.eval_count_per_split,
             seed=args.seed,
             cache_score_by_path=cache_score_by_path,
+            full_eval_splits=args.full_eval_splits,
         )
     else:
         split_mode = f"balanced_total_{args.balanced_total}"
@@ -3934,6 +4577,14 @@ def main() -> None:
             seed=args.seed,
             cache_score_by_path=cache_score_by_path,
         )
+    raw_train_pool = train_pool
+    train_pool, fake_generator_cap_summary = cap_fake_generators(
+        train_pool,
+        cap_multiplier=args.fake_generator_cap_multiplier,
+        seed=args.seed + 307,
+        cap_exemptions=args.fake_generator_cap_exemptions,
+        cache_score_by_path=cache_score_by_path,
+    )
     train_order = build_balanced_train_order(
         train_pool,
         args.seed + 101,
@@ -3967,6 +4618,7 @@ def main() -> None:
         f"regularization={asdict(resolve_training_regularization_config(config, args))}",
         flush=True,
     )
+    print(f"train_balance_mode={args.train_balance_mode}", flush=True)
     print(
         f"modality_sets={','.join(modality_set_name(item) for item in modality_sets)}", flush=True
     )
@@ -3982,7 +4634,11 @@ def main() -> None:
     for line in format_split_audit(dataset_examples):
         print(line, flush=True)
     print(f"split_mode={split_mode}", flush=True)
-    print(f"train_pool={len(train_pool)} counts={class_counts(train_pool)}", flush=True)
+    print(
+        f"train_pool={len(train_pool)} raw_train_pool={len(raw_train_pool)} "
+        f"counts={class_counts(train_pool)} fake_generator_cap={fake_generator_cap_summary}",
+        flush=True,
+    )
     print(f"val_fixed={len(val_examples)} counts={class_counts(val_examples)}", flush=True)
     print(f"test_fixed={len(test_examples)} counts={class_counts(test_examples)}", flush=True)
     print(f"round_targets={','.join(str(target) for target in round_targets)}", flush=True)
@@ -4001,6 +4657,12 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_examples = (
         examples if args.balanced_total is None else [*train_pool, *val_examples, *test_examples]
+    )
+    run_train_balance_summary = build_train_balance_summary(
+        max_train_examples,
+        mode=args.train_balance_mode,
+        batch_size=args.batch_size,
+        seed=int(args.seed),
     )
     write_dataset_manifest(manifest_examples, output_dir / "manifest.csv")
     write_json(
@@ -4021,7 +4683,14 @@ def main() -> None:
             if args.round_targets is not None
             else args.round_ladder,
             "eval_count_per_split": args.eval_count_per_split,
+            "full_eval_splits": args.full_eval_splits,
             "balanced_total": args.balanced_total,
+            "train_balance_mode": args.train_balance_mode,
+            "train_balance": run_train_balance_summary,
+            "fake_generator_cap": fake_generator_cap_summary,
+            "fake_generator_loss_weights": parse_fake_generator_loss_weights(
+                args.fake_generator_loss_weights
+            ),
             "split_mode": split_mode,
             "train_ratio": args.train_ratio,
             "val_ratio": args.val_ratio,
@@ -4169,10 +4838,11 @@ def main() -> None:
                 label=f"test/{name}",
             )
             previous = previous_by_modality_set.get(name)
-            warm_start_checkpoint = resolve_warm_start_checkpoint(
+            round_warm_start_checkpoint = resolve_warm_start_checkpoint(
                 previous,
-                enabled=args.warm_start_rounds,
+                enabled=args.warm_start_rounds and args.warm_start_checkpoint is None,
             )
+            warm_start_checkpoint = args.warm_start_checkpoint or round_warm_start_checkpoint
             summary = run_training_round(
                 args=args,
                 config=config,

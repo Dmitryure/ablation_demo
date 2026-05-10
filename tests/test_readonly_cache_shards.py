@@ -12,6 +12,8 @@ from dataset import VideoExample
 from feature_cache import (
     FEATURE_CACHE_MANIFEST_COLUMNS,
     FeatureCacheSpec,
+    ShardedFeatureBatchSampler,
+    ShardedFeatureRef,
     feature_cache_manifest_path,
 )
 from scripts.build_readonly_cache_shards import (
@@ -87,6 +89,30 @@ class ReadOnlyCacheShardTest(unittest.TestCase):
         self.assertEqual(len(ordered), len(examples))
         for shard in shards:
             self.assertEqual({item.class_name for item in shard}, {"real", "fake"})
+
+    def test_mixed_sharded_batch_sampler_does_not_duplicate_indices(self):
+        examples = [
+            example("real", "r0.mp4"),
+            example("real", "r1.mp4"),
+            example("fake", "gen/f0.mp4"),
+            example("fake", "gen/f1.mp4"),
+        ]
+        refs = [
+            ShardedFeatureRef(example=item, shard_index=0, row_index=index)
+            for index, item in enumerate(examples)
+        ]
+
+        sampler = ShardedFeatureBatchSampler(
+            refs=refs,
+            batch_size=4,
+            shuffle=False,
+            seed=0,
+            batch_strategy="mixed_shard_local",
+        )
+        sampled = [index for batch in sampler for index in batch]
+
+        self.assertEqual(len(sampled), 4)
+        self.assertEqual(set(sampled), set(range(4)))
 
     def test_v2_locations_include_label_and_filename(self):
         examples = [example("real", "r.mp4"), example("fake", "gen/f.mp4")]
