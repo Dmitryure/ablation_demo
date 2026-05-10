@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -9,6 +10,8 @@ from branches.compression import DEFAULT_SLOT_COUNTS, validate_branch_token_conf
 from encoders import FAUEncoder, RGBEncoder, RPPGEncoder, build_local_encoders
 from extractors import (
     EYE_GAZE_COLUMNS,
+    EYE_GAZE_RICH_COLUMNS,
+    EYE_GAZE_RICH_FEATURE_DIM,
     FACE_MESH_CONTOUR_INDICES,
     DepthExtractor,
     EyeGazeExtractor,
@@ -113,6 +116,38 @@ class DummyMetadataBranch(ModalityBranch):
 
 def fake_eye_gaze_detector(_: np.ndarray):
     return {name: index / 10.0 for index, name in enumerate(EYE_GAZE_COLUMNS, start=1)}
+
+
+def fake_eye_gaze_result(face_count: int = 1):
+    landmarks = [SimpleNamespace(x=0.0, y=0.0, z=0.0) for _ in range(478)]
+    coordinates = {
+        33: (0.10, 0.20),
+        133: (0.30, 0.20),
+        159: (0.20, 0.15),
+        145: (0.20, 0.25),
+        160: (0.15, 0.16),
+        144: (0.15, 0.24),
+        362: (0.70, 0.20),
+        263: (0.90, 0.20),
+        386: (0.80, 0.15),
+        374: (0.80, 0.25),
+        385: (0.85, 0.16),
+        380: (0.85, 0.24),
+    }
+    for index, (x, y) in coordinates.items():
+        landmarks[index] = SimpleNamespace(x=x, y=y, z=0.0)
+
+    blendshapes = [
+        [
+            SimpleNamespace(category_name=name, score=index / 100.0)
+            for index, name in enumerate(EYE_GAZE_RICH_COLUMNS[:14], start=1)
+        ]
+        for _ in range(face_count)
+    ]
+    return SimpleNamespace(
+        face_blendshapes=blendshapes,
+        face_landmarks=[landmarks for _ in range(face_count)],
+    )
 
 
 def fake_face_mesh_detector(_: np.ndarray):
@@ -359,6 +394,38 @@ class RegistryTest(unittest.TestCase):
         self.assertAlmostEqual(float(tensor[0, 0]), 0.1, places=6)
         self.assertAlmostEqual(float(tensor[0, -1]), 0.8, places=6)
 
+    def test_eye_gaze_rich_extractor_tensor_shape_with_fake_result(self):
+        extractor = EyeGazeExtractor(
+            feature_variant="rich_v1",
+            detect_result_fn=lambda _frame: fake_eye_gaze_result(face_count=1),
+        )
+        frames = [np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3)]
+
+        tensor = extractor.extract_tensor(frames)
+
+        self.assertEqual(tuple(tensor.shape), (3, EYE_GAZE_RICH_FEATURE_DIM))
+        self.assertAlmostEqual(float(tensor[0, 0]), 0.01, places=6)
+        self.assertAlmostEqual(float(tensor[0, 13]), 0.14, places=6)
+        self.assertGreater(float(torch.count_nonzero(tensor[:, 14:])), 0.0)
+
+    def test_eye_gaze_rich_extractor_zero_when_detection_count_not_one(self):
+        extractor = EyeGazeExtractor(
+            feature_variant="rich_v1",
+            detect_result_fn=lambda _frame: fake_eye_gaze_result(face_count=0),
+        )
+        multiple_face_extractor = EyeGazeExtractor(
+            feature_variant="rich_v1",
+            detect_result_fn=lambda _frame: fake_eye_gaze_result(face_count=2),
+        )
+        frames = [np.zeros((8, 8, 3), dtype=np.uint8)]
+
+        no_face = extractor.extract_tensor(frames)
+        multiple_faces = multiple_face_extractor.extract_tensor(frames)
+
+        self.assertEqual(tuple(no_face.shape), (1, EYE_GAZE_RICH_FEATURE_DIM))
+        self.assertTrue(torch.equal(no_face, torch.zeros_like(no_face)))
+        self.assertTrue(torch.equal(multiple_faces, torch.zeros_like(multiple_faces)))
+
     def test_eye_gaze_branch_output_contract(self):
         registry = build_registry(dim=16)
         eye_gaze = torch.randn(1, 4, 8)
@@ -368,6 +435,27 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(tuple(output.tokens.shape), (1, 4, 16))
         self.assertEqual(tuple(output.time_ids.shape), (4,))
         self.assertTrue(torch.equal(output.time_ids, torch.tensor([0, 1, 2, 3])))
+
+    def test_eye_gaze_branch_accepts_configured_rich_feature_dim(self):
+        registry = build_registry(
+            dim=16,
+            config={"eye_gaze": {"feature_dim": EYE_GAZE_RICH_FEATURE_DIM, "slot_count": 16}},
+        )
+        eye_gaze = torch.randn(1, 4, EYE_GAZE_RICH_FEATURE_DIM)
+
+        output = registry["eye_gaze"].encode({"eye_gaze": eye_gaze})
+
+        self.assertEqual(tuple(output.tokens.shape), (1, 16, 16))
+        self.assertEqual(registry["eye_gaze"].feature_dim, EYE_GAZE_RICH_FEATURE_DIM)
+
+    def test_eye_gaze_branch_rejects_wrong_configured_feature_dim(self):
+        registry = build_registry(
+            dim=16,
+            config={"eye_gaze": {"feature_dim": EYE_GAZE_RICH_FEATURE_DIM}},
+        )
+
+        with self.assertRaisesRegex(ValueError, r"\[B, N, 32\]"):
+            registry["eye_gaze"].encode({"eye_gaze": torch.randn(1, 4, 8)})
 
     def test_eye_gaze_temporal_pooling_changes_when_frame_order_changes(self):
         registry = build_registry(dim=16)
@@ -681,6 +769,15 @@ class RegistryTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "RGB checkpoint_path is required"):
             build_local_encoders(config, modalities=("rgb",))
+
+    def test_build_local_encoders_ignores_configs_for_unrequested_modalities(self):
+        result = build_local_encoders({}, modalities=("eye_gaze",))
+
+        self.assertIsNone(result.rgb_encoder)
+        self.assertIsNone(result.fau_encoder)
+        self.assertIsNone(result.rppg_encoder)
+        self.assertIsNone(result.depth_encoder)
+        self.assertEqual(result.warnings, ())
 
     def test_masked_disabled_slots_do_not_change_cls_token(self):
         fusion_module = self.build_test_fusion(dim=10)

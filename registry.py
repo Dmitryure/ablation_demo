@@ -16,7 +16,11 @@ from branches import (
     RPPGBranch,
     STFTBranch,
 )
-from branches.compression import resolve_slot_count, validate_branch_token_config
+from branches.compression import (
+    resolve_slot_count,
+    validate_branch_token_config,
+    validate_positive_int,
+)
 
 FULL_MODALITIES: tuple[str, ...] = (
     "rgb",
@@ -51,6 +55,22 @@ PENDING_MODALITIES: tuple[str, ...] = tuple(
 SUPPORTED_FRAME_COUNTS: tuple[int, ...] = (16, 32, 64, 128)
 
 
+def resolve_feature_dim(
+    config: Mapping[str, Any] | None,
+    modality_name: str,
+    default: int,
+) -> int:
+    if config is None:
+        return default
+    section = config.get(modality_name, {})
+    if section is None:
+        return default
+    if not isinstance(section, Mapping):
+        raise ValueError(f"`{modality_name}` must be a YAML mapping when provided.")
+    value = section.get("feature_dim", default)
+    return validate_positive_int(value, f"{modality_name}.feature_dim")
+
+
 def build_registry(dim: int, config: Mapping[str, Any] | None = None) -> nn.ModuleDict:
     validate_branch_token_config(config, modalities=CURRENT_MODALITIES)
     return nn.ModuleDict(
@@ -58,7 +78,11 @@ def build_registry(dim: int, config: Mapping[str, Any] | None = None) -> nn.Modu
             "rgb": RGBBranch(dim=dim, slot_count=resolve_slot_count(config, "rgb")),
             "fau": FAUBranch(dim=dim, slot_count=resolve_slot_count(config, "fau")),
             "rppg": RPPGBranch(dim=dim, slot_count=resolve_slot_count(config, "rppg")),
-            "eye_gaze": EyeGazeBranch(dim=dim, slot_count=resolve_slot_count(config, "eye_gaze")),
+            "eye_gaze": EyeGazeBranch(
+                dim=dim,
+                slot_count=resolve_slot_count(config, "eye_gaze"),
+                feature_dim=resolve_feature_dim(config, "eye_gaze", 8),
+            ),
             "face_mesh": FaceMeshBranch(
                 dim=dim, slot_count=resolve_slot_count(config, "face_mesh")
             ),

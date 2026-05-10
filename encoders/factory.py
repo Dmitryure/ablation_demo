@@ -61,9 +61,9 @@ def build_local_encoders(
     modalities: Sequence[str] | None = None,
 ) -> EncoderFactoryResult:
     enabled = set(modalities or ("rgb", "fau", "rppg", "depth"))
-    rgb_config = _require_mapping(config, "rgb")
-    fau_config = _require_mapping(config, "fau")
-    rppg_config = _require_mapping(config, "rppg")
+    rgb_config = _require_mapping(config, "rgb") if "rgb" in enabled else {}
+    fau_config = _require_mapping(config, "fau") if "fau" in enabled else {}
+    rppg_config = _require_mapping(config, "rppg") if "rppg" in enabled else {}
     depth_config = _require_mapping(config, "depth") if "depth" in enabled else {}
 
     rgb_checkpoint_path = _optional_path(rgb_config, "checkpoint_path")

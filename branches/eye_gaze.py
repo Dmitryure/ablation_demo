@@ -11,14 +11,22 @@ from branches.compression import (
     validate_positive_int,
 )
 
+DEFAULT_EYE_GAZE_FEATURE_DIM = 8
+
 
 class EyeGazeBranch(ModalityBranch):
     name = "eye_gaze"
 
-    def __init__(self, dim: int, slot_count: int = DEFAULT_SLOT_COUNTS["eye_gaze"]):
+    def __init__(
+        self,
+        dim: int,
+        slot_count: int = DEFAULT_SLOT_COUNTS["eye_gaze"],
+        feature_dim: int = DEFAULT_EYE_GAZE_FEATURE_DIM,
+    ):
         super().__init__()
         self.slot_count = validate_positive_int(slot_count, "eye_gaze.slot_count")
-        self.proj = mlp(8, dim, dim)
+        self.feature_dim = validate_positive_int(feature_dim, "eye_gaze.feature_dim")
+        self.proj = mlp(self.feature_dim, dim, dim)
         self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
 
     def required_keys(self) -> tuple[str, ...]:
@@ -26,8 +34,11 @@ class EyeGazeBranch(ModalityBranch):
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> ModalityOutput:
         eye_gaze = batch["eye_gaze"]
-        if eye_gaze.ndim != 3 or eye_gaze.shape[-1] != 8:
-            raise ValueError(f"`eye_gaze` must have shape [B, N, 8], got {tuple(eye_gaze.shape)}")
+        if eye_gaze.ndim != 3 or eye_gaze.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"`eye_gaze` must have shape [B, N, {self.feature_dim}], "
+                f"got {tuple(eye_gaze.shape)}"
+            )
 
         projected_tokens = self.proj(eye_gaze)
         tokens = self.pool(projected_tokens)
@@ -40,6 +51,7 @@ class EyeGazeBranch(ModalityBranch):
             "token_count": tokens.shape[1],
             "num_frames": num_frames,
             "slot_count": self.slot_count,
+            "feature_dim": self.feature_dim,
             "time_ids": tuple(time_ids.tolist()),
         }
         return ModalityOutput(tokens=tokens, time_ids=time_ids, debug=debug)

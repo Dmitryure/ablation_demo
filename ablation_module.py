@@ -29,6 +29,8 @@ from dataset import (
 from encoders import DEFAULT_DEPTH_FEATURE_DIM, DEFAULT_DEPTH_MODEL_ID, DepthAnythingEncoder
 from extractors import (
     EYE_GAZE_COLUMNS,
+    EYE_GAZE_RICH_COLUMNS,
+    EYE_GAZE_RICH_FEATURE_DIM,
     FACE_MESH_CONTOUR_INDICES,
     DepthExtractor,
     EyeGazeExtractor,
@@ -92,6 +94,8 @@ __all__ = [
     "DEFAULT_DEPTH_FEATURE_DIM",
     "DEFAULT_DEPTH_MODEL_ID",
     "EYE_GAZE_COLUMNS",
+    "EYE_GAZE_RICH_COLUMNS",
+    "EYE_GAZE_RICH_FEATURE_DIM",
     "FACE_MESH_CONTOUR_INDICES",
     "FIXED_SLOT_MODALITIES",
     "FULL_MODALITIES",

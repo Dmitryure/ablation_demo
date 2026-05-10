@@ -1,6 +1,12 @@
 from extractors.base import FeatureExtractor
 from extractors.depth import DepthExtractor
-from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor, build_eye_gaze_extractor
+from extractors.eye_gaze import (
+    EYE_GAZE_COLUMNS,
+    EYE_GAZE_RICH_COLUMNS,
+    EYE_GAZE_RICH_FEATURE_DIM,
+    EyeGazeExtractor,
+    build_eye_gaze_extractor,
+)
 from extractors.face_mesh import (
     FACE_MESH_CONTOUR_INDICES,
     FaceMeshExtractor,
@@ -19,6 +25,8 @@ from extractors.stft import STFTExtractor
 
 __all__ = [
     "EYE_GAZE_COLUMNS",
+    "EYE_GAZE_RICH_COLUMNS",
+    "EYE_GAZE_RICH_FEATURE_DIM",
     "FACE_MESH_CONTOUR_INDICES",
     "DepthExtractor",
     "ExtractorFactoryResult",

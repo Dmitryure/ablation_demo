@@ -12,6 +12,8 @@ FACE_CROP_DEFAULT_DETECTION_FREQUENCY = 16
 FACE_CROP_DEFAULT_LARGE_BOX_COEF = 1.5
 FACE_CROP_DEFAULT_FALLBACK = "full_frame"
 RPPG_CACHE_VARIANT = "rppg_v2_contiguous128_facecrop_haar_diffnorm128"
+EYE_GAZE_RICH_FEATURE_VARIANT = "rich_v1"
+EYE_GAZE_RICH_CACHE_VARIANT = "eye_gaze_rich_v1"
 
 
 def _variant_part(value: str) -> str:
@@ -92,6 +94,23 @@ def modality_cache_variant(config: Mapping[str, Any], modality: str) -> str | No
     modality_config = config_section(config, modality)
     if modality == "rppg":
         return RPPG_CACHE_VARIANT
+    if modality == "eye_gaze":
+        feature_variant = modality_config.get("feature_variant")
+        if feature_variant is not None and str(feature_variant) != EYE_GAZE_RICH_FEATURE_VARIANT:
+            raise ValueError(
+                f"Unsupported eye_gaze.feature_variant: {feature_variant!r}. "
+                f"Expected {EYE_GAZE_RICH_FEATURE_VARIANT!r} or omit it for legacy features."
+            )
+        crop_variant = face_crop_cache_variant(
+            global_config=config,
+            modality_config=modality_config,
+            default_enabled=False,
+        )
+        if feature_variant is None:
+            return crop_variant
+        if crop_variant is None:
+            return EYE_GAZE_RICH_CACHE_VARIANT
+        return f"{EYE_GAZE_RICH_CACHE_VARIANT}_{crop_variant}"
     return face_crop_cache_variant(
         global_config=config,
         modality_config=modality_config,

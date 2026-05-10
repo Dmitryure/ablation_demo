@@ -366,6 +366,43 @@ class MinimalFeatureCacheTest(unittest.TestCase):
                 feature_cache_item_path(root / "cache", example, disabled_spec, dataset_root=root),
             )
 
+    def test_rich_eye_gaze_cache_variant_does_not_reuse_legacy_eye_gaze_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            example = build_example(
+                root / "videos" / "real" / "clip.mp4",
+                "real",
+                "clip.mp4",
+                generator_id="real",
+            )
+            legacy_spec = build_feature_cache_specs(
+                {
+                    "frames": {"default": 32},
+                    "image_size": 224,
+                    "face_crop": {"enabled": True},
+                    "eye_gaze": {},
+                },
+                ("eye_gaze",),
+            )["eye_gaze"]
+            rich_spec = build_feature_cache_specs(
+                {
+                    "frames": {"default": 32},
+                    "image_size": 224,
+                    "face_crop": {"enabled": True},
+                    "eye_gaze": {"feature_variant": "rich_v1", "feature_dim": 32},
+                },
+                ("eye_gaze",),
+            )["eye_gaze"]
+
+            self.assertIsNotNone(legacy_spec.cache_variant)
+            self.assertIsNotNone(rich_spec.cache_variant)
+            self.assertIn("eye_gaze_rich_v1", rich_spec.cache_variant)
+            self.assertNotEqual(legacy_spec.cache_variant, rich_spec.cache_variant)
+            self.assertNotEqual(
+                feature_cache_item_path(root / "cache", example, legacy_spec, dataset_root=root),
+                feature_cache_item_path(root / "cache", example, rich_spec, dataset_root=root),
+            )
+
     def test_rppg_cache_roundtrip_requires_signal_features(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
