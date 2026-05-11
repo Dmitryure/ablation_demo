@@ -1,0 +1,378 @@
+{
+  "best_checkpoint": "runs/night_sweep/seed0_lr3e4_gen0p15_warm2_e26/best.pt",
+  "best_checkpoint_score": 0.9169610637553166,
+  "cache_dir": null,
+  "cached_loader": {
+    "num_workers": 4,
+    "persistent_workers": true,
+    "pin_memory": true,
+    "prefetch_factor": 2
+  },
+  "calibration": {
+    "binary_threshold": 0.5,
+    "fake_count": 555.0,
+    "fake_recall": 0.8990990990990991,
+    "generator_confidence_threshold": 0.95,
+    "generator_margin_threshold": 0.5,
+    "known_fake_count": 440.0,
+    "known_generator_coverage": 0.5954545454545455,
+    "known_generator_precision": 0.9961832061068703,
+    "selection_score": 0.9961832061068703,
+    "unknown_or_low_confidence_rate": 0.42702702702702705
+  },
+  "config_path": "/home/comp/ablation_task/runs/configs/night_sweep/09_seed0_lr3e4_gen0p15_warm2_e26.yaml",
+  "counts": {
+    "test": {
+      "fake_generator_groups": {
+        "dlc": 91,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "unknown_or_other": 87
+      },
+      "fake_generators": {
+        "background_aug": 19,
+        "dlc": 91,
+        "facefusion": 40,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "visomaster": 28
+      },
+      "real_fake": {
+        "fake": 520,
+        "real": 515
+      }
+    },
+    "train": {
+      "fake_generator_groups": {
+        "dlc": 500,
+        "liveavatar": 500,
+        "ltx2": 500,
+        "ovi": 389,
+        "sadtalker": 500,
+        "unknown_or_other": 431
+      },
+      "fake_generators": {
+        "background_aug": 50,
+        "dlc": 500,
+        "facefusion": 266,
+        "liveavatar": 500,
+        "ltx2": 500,
+        "ovi": 389,
+        "sadtalker": 500,
+        "visomaster": 115
+      },
+      "real_fake": {
+        "fake": 2820,
+        "real": 3095
+      }
+    },
+    "val": {
+      "fake_generator_groups": {
+        "dlc": 98,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "unknown_or_other": 115
+      },
+      "fake_generators": {
+        "background_aug": 19,
+        "dlc": 98,
+        "facefusion": 69,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "visomaster": 27
+      },
+      "real_fake": {
+        "fake": 555,
+        "real": 516
+      }
+    }
+  },
+  "dataset_root": "/mnt/d/final_dataset",
+  "epochs": 26,
+  "excluded_generators": [
+    "dreamidv"
+  ],
+  "extra_fake_holdout": {
+    "count": 5695,
+    "fake_generator_groups": {
+      "dlc": 529,
+      "liveavatar": 1672,
+      "ltx2": 3111,
+      "sadtalker": 383
+    },
+    "raw_fake_generators": {
+      "dlc": 529,
+      "liveavatar": 1672,
+      "ltx2": 3111,
+      "sadtalker": 383
+    }
+  },
+  "extra_fake_holdout_summary": {
+    "count": 5695,
+    "fake_recall": 0.959964881474978,
+    "fake_recall_by_group": {
+      "dlc": 0.8865784499054821,
+      "liveavatar": 0.9324162679425837,
+      "ltx2": 0.98424943747991,
+      "sadtalker": 0.9843342036553525
+    },
+    "false_negative_rate": 0.04003511852502195,
+    "known_generator_coverage": 0.7436347673397717,
+    "known_generator_precision": 0.9929161747343566,
+    "low_confidence_or_unknown_rate": 0.2163301141352063,
+    "mean_fake_probability": 0.9574731541306101,
+    "median_fake_probability": 0.9997279047966003
+  },
+  "generator_groups": {
+    "unknown_or_other": [
+      "background_aug",
+      "facefusion",
+      "visomaster"
+    ]
+  },
+  "modalities": [
+    "rgb",
+    "eye_gaze",
+    "face_mesh",
+    "depth"
+  ],
+  "output_dir": "runs/night_sweep/seed0_lr3e4_gen0p15_warm2_e26",
+  "sampler": {
+    "base_fake_generator_samples": 3000,
+    "batch_size": 16,
+    "epoch_batches": 375,
+    "epoch_fake_samples": 3000,
+    "epoch_real_samples": 3000,
+    "fake_generator_quotas": {
+      "dlc": 500,
+      "liveavatar": 500,
+      "ltx2": 500,
+      "ovi": 500,
+      "sadtalker": 500,
+      "unknown_or_other": 500
+    },
+    "fake_per_batch": 8,
+    "max_repeat": 4,
+    "padding_fake_samples": 0,
+    "real_per_batch": 8,
+    "target_quota": 500
+  },
+  "sharded_cache_dir": "shards/v2_no_fau_with_v1_rppg_mixed_v2",
+  "sharded_loader": {
+    "allow_legacy_shards": false,
+    "batch_strategy": "mixed_shard_local"
+  },
+  "split_summaries": {
+    "test": {
+      "binary_metrics": {
+        "accuracy": 0.9449275362318841,
+        "balanced_accuracy": 0.9450336071695296,
+        "f1": 0.9439528023598821,
+        "false_negative": 40,
+        "false_positive": 17,
+        "precision": 0.96579476861167,
+        "recall": 0.9230769230769231,
+        "specificity": 0.9669902912621359,
+        "true_negative": 498,
+        "true_positive": 480
+      },
+      "generator_metrics": [
+        {
+          "binary_recall": 0.978021978021978,
+          "count": 91,
+          "generator_id": "dlc",
+          "generator_recall": 0.6923076923076923
+        },
+        {
+          "binary_recall": 0.900990099009901,
+          "count": 101,
+          "generator_id": "liveavatar",
+          "generator_recall": 0.8514851485148515
+        },
+        {
+          "binary_recall": 0.9844961240310077,
+          "count": 129,
+          "generator_id": "ltx2",
+          "generator_recall": 0.9767441860465116
+        },
+        {
+          "binary_recall": 0.9347826086956522,
+          "count": 46,
+          "generator_id": "ovi",
+          "generator_recall": 0.9347826086956522
+        },
+        {
+          "binary_recall": 0.9545454545454546,
+          "count": 66,
+          "generator_id": "sadtalker",
+          "generator_recall": 0.8787878787878788
+        },
+        {
+          "binary_recall": 0.7701149425287356,
+          "count": 87,
+          "generator_id": "unknown_or_other",
+          "generator_recall": 0.7931034482758621
+        }
+      ],
+      "known_generator_quality": {
+        "known_generator_correct_named_count": 366.0,
+        "known_generator_count": 433.0,
+        "known_generator_coverage": 0.8914549653579676,
+        "known_generator_named_count": 386.0,
+        "known_generator_precision": 0.9481865284974094,
+        "known_generator_precision_at_coverage": 0.9481865284974094
+      },
+      "macro_generator_recall": 0.8545351604380748,
+      "worst_generator_recall": 0.6923076923076923
+    },
+    "train": {
+      "binary_metrics": {
+        "accuracy": 0.9602704987320372,
+        "balanced_accuracy": 0.9613266077750662,
+        "f1": 0.9593777009507347,
+        "false_negative": 45,
+        "false_positive": 190,
+        "precision": 0.9359190556492412,
+        "recall": 0.9840425531914894,
+        "specificity": 0.938610662358643,
+        "true_negative": 2905,
+        "true_positive": 2775
+      },
+      "generator_metrics": [
+        {
+          "binary_recall": 0.956,
+          "count": 500,
+          "generator_id": "dlc",
+          "generator_recall": 0.91
+        },
+        {
+          "binary_recall": 0.992,
+          "count": 500,
+          "generator_id": "liveavatar",
+          "generator_recall": 0.93
+        },
+        {
+          "binary_recall": 0.998,
+          "count": 500,
+          "generator_id": "ltx2",
+          "generator_recall": 0.994
+        },
+        {
+          "binary_recall": 0.987146529562982,
+          "count": 389,
+          "generator_id": "ovi",
+          "generator_recall": 0.9897172236503856
+        },
+        {
+          "binary_recall": 1.0,
+          "count": 500,
+          "generator_id": "sadtalker",
+          "generator_recall": 0.982
+        },
+        {
+          "binary_recall": 0.9698375870069605,
+          "count": 431,
+          "generator_id": "unknown_or_other",
+          "generator_recall": 0.814385150812065
+        }
+      ],
+      "known_generator_quality": {
+        "known_generator_correct_named_count": 2272.0,
+        "known_generator_count": 2389.0,
+        "known_generator_coverage": 0.969861866889912,
+        "known_generator_named_count": 2317.0,
+        "known_generator_precision": 0.9805783340526543,
+        "known_generator_precision_at_coverage": 0.9805783340526543
+      },
+      "macro_generator_recall": 0.9366837290770751,
+      "worst_generator_recall": 0.814385150812065
+    },
+    "val": {
+      "binary_metrics": {
+        "accuracy": 0.9131652661064426,
+        "balanced_accuracy": 0.913696836371255,
+        "f1": 0.9147571035747022,
+        "false_negative": 56,
+        "false_positive": 37,
+        "precision": 0.9309701492537313,
+        "recall": 0.8990990990990991,
+        "specificity": 0.9282945736434108,
+        "true_negative": 479,
+        "true_positive": 499
+      },
+      "generator_metrics": [
+        {
+          "binary_recall": 0.9081632653061225,
+          "count": 98,
+          "generator_id": "dlc",
+          "generator_recall": 0.8163265306122449
+        },
+        {
+          "binary_recall": 0.9108910891089109,
+          "count": 101,
+          "generator_id": "liveavatar",
+          "generator_recall": 0.8613861386138614
+        },
+        {
+          "binary_recall": 0.9922480620155039,
+          "count": 129,
+          "generator_id": "ltx2",
+          "generator_recall": 0.937984496124031
+        },
+        {
+          "binary_recall": 0.9782608695652174,
+          "count": 46,
+          "generator_id": "ovi",
+          "generator_recall": 0.9130434782608695
+        },
+        {
+          "binary_recall": 0.9848484848484849,
+          "count": 66,
+          "generator_id": "sadtalker",
+          "generator_recall": 0.9696969696969697
+        },
+        {
+          "binary_recall": 0.6956521739130435,
+          "count": 115,
+          "generator_id": "unknown_or_other",
+          "generator_recall": 0.9304347826086956
+        }
+      ],
+      "known_generator_quality": {
+        "known_generator_correct_named_count": 384.0,
+        "known_generator_count": 440.0,
+        "known_generator_coverage": 0.9136363636363637,
+        "known_generator_named_count": 402.0,
+        "known_generator_precision": 0.9552238805970149,
+        "known_generator_precision_at_coverage": 0.9552238805970149
+      },
+      "macro_generator_recall": 0.904812065986112,
+      "worst_generator_recall": 0.8163265306122449
+    }
+  },
+  "target": {
+    "generator_names": [
+      "dlc",
+      "liveavatar",
+      "ltx2",
+      "ovi",
+      "sadtalker",
+      "unknown_or_other"
+    ],
+    "raw_to_group": {
+      "background_aug": "unknown_or_other",
+      "facefusion": "unknown_or_other",
+      "visomaster": "unknown_or_other"
+    },
+    "unknown_group_name": "unknown_or_other"
+  },
+  "train_fake_group_cap": 500
+}

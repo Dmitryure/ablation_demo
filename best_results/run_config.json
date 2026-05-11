@@ -1,0 +1,149 @@
+{
+  "cache_dir": null,
+  "config_path": "/home/comp/ablation_task/runs/configs/night_sweep/09_seed0_lr3e4_gen0p15_warm2_e26.yaml",
+  "counts": {
+    "test": {
+      "fake_generator_groups": {
+        "dlc": 91,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "unknown_or_other": 87
+      },
+      "fake_generators": {
+        "background_aug": 19,
+        "dlc": 91,
+        "facefusion": 40,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "visomaster": 28
+      },
+      "real_fake": {
+        "fake": 520,
+        "real": 515
+      }
+    },
+    "train": {
+      "fake_generator_groups": {
+        "dlc": 500,
+        "liveavatar": 500,
+        "ltx2": 500,
+        "ovi": 389,
+        "sadtalker": 500,
+        "unknown_or_other": 431
+      },
+      "fake_generators": {
+        "background_aug": 50,
+        "dlc": 500,
+        "facefusion": 266,
+        "liveavatar": 500,
+        "ltx2": 500,
+        "ovi": 389,
+        "sadtalker": 500,
+        "visomaster": 115
+      },
+      "real_fake": {
+        "fake": 2820,
+        "real": 3095
+      }
+    },
+    "val": {
+      "fake_generator_groups": {
+        "dlc": 98,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "unknown_or_other": 115
+      },
+      "fake_generators": {
+        "background_aug": 19,
+        "dlc": 98,
+        "facefusion": 69,
+        "liveavatar": 101,
+        "ltx2": 129,
+        "ovi": 46,
+        "sadtalker": 66,
+        "visomaster": 27
+      },
+      "real_fake": {
+        "fake": 555,
+        "real": 516
+      }
+    }
+  },
+  "dataset_root": "/mnt/d/final_dataset",
+  "excluded_generators": [
+    "dreamidv"
+  ],
+  "extra_fake_holdout": {
+    "count": 5695,
+    "fake_generator_groups": {
+      "dlc": 529,
+      "liveavatar": 1672,
+      "ltx2": 3111,
+      "sadtalker": 383
+    },
+    "raw_fake_generators": {
+      "dlc": 529,
+      "liveavatar": 1672,
+      "ltx2": 3111,
+      "sadtalker": 383
+    }
+  },
+  "generator_groups": {
+    "unknown_or_other": [
+      "background_aug",
+      "facefusion",
+      "visomaster"
+    ]
+  },
+  "modalities": [
+    "rgb",
+    "eye_gaze",
+    "face_mesh",
+    "depth"
+  ],
+  "output_dir": "runs/night_sweep/seed0_lr3e4_gen0p15_warm2_e26",
+  "sampler": {
+    "base_fake_generator_samples": 3000,
+    "batch_size": 16,
+    "epoch_batches": 375,
+    "epoch_fake_samples": 3000,
+    "epoch_real_samples": 3000,
+    "fake_generator_quotas": {
+      "dlc": 500,
+      "liveavatar": 500,
+      "ltx2": 500,
+      "ovi": 500,
+      "sadtalker": 500,
+      "unknown_or_other": 500
+    },
+    "fake_per_batch": 8,
+    "max_repeat": 4,
+    "padding_fake_samples": 0,
+    "real_per_batch": 8,
+    "target_quota": 500
+  },
+  "sharded_cache_dir": "shards/v2_no_fau_with_v1_rppg_mixed_v2",
+  "target": {
+    "generator_names": [
+      "dlc",
+      "liveavatar",
+      "ltx2",
+      "ovi",
+      "sadtalker",
+      "unknown_or_other"
+    ],
+    "raw_to_group": {
+      "background_aug": "unknown_or_other",
+      "facefusion": "unknown_or_other",
+      "visomaster": "unknown_or_other"
+    },
+    "unknown_group_name": "unknown_or_other"
+  },
+  "train_fake_group_cap": 500
+}

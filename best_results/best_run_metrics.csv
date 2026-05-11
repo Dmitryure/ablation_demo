@@ -1,0 +1,24 @@
+metric,value
+run,seed0_lr3e4_gen0p15_warm2_e26
+checkpoint,runs/night_sweep/seed0_lr3e4_gen0p15_warm2_e26/best.pt
+score,0.9169610637553166
+modalities,"rgb, eye_gaze, face_mesh, depth"
+sharded_cache_dir,shards/v2_no_fau_with_v1_rppg_mixed_v2
+val_balanced_accuracy,0.913696836371255
+test_balanced_accuracy,0.9450336071695296
+test_accuracy,0.9449275362318841
+test_fake_recall,0.9230769230769231
+test_real_specificity,0.9669902912621359
+test_fake_precision,0.96579476861167
+test_f1,0.9439528023598821
+test_macro_generator_recall,0.8545351604380748
+test_worst_generator_recall,0.6923076923076923
+test_macro_binary_recall_by_generator,0.9204918678054549
+calibration_known_generator_precision,0.9961832061068703
+calibration_known_generator_coverage,0.5954545454545455
+calibration_unknown_or_low_confidence_rate,0.42702702702702705
+holdout_fake_recall,0.959964881474978
+holdout_false_negative_rate,0.04003511852502195
+holdout_known_generator_precision,0.9929161747343566
+holdout_known_generator_coverage,0.7436347673397717
+holdout_low_confidence_or_unknown_rate,0.2163301141352063
