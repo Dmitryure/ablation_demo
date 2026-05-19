@@ -186,6 +186,7 @@ class ClipFusionPipeline(nn.Module):
         self.extractors = dict(extractors or {})
         self.encoder_modules = encoder_modules if encoder_modules is not None else nn.ModuleDict()
         self.last_feature_timings: dict[str, float] = {}
+        self.last_feature_batch: dict[str, Any] = {}
 
     def _device(self) -> torch.device:
         parameter = next(self.parameters(), None)
@@ -261,6 +262,7 @@ class ClipFusionPipeline(nn.Module):
             feature_timings[name] = time.perf_counter() - extract_start
             feature_batch.update(extracted)
         self.last_feature_timings = feature_timings
+        self.last_feature_batch = dict(feature_batch)
         return feature_batch
 
     def fuse(self, batch: Mapping[str, Any]) -> FusionOutput:
