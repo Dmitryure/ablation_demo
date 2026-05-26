@@ -84,6 +84,24 @@ def generator_loss_fn(
     raise ValueError(f"Unsupported generator loss type: {loss_type}")
 
 
+def generator_max_probability_loss(logits: torch.Tensor) -> torch.Tensor:
+    if logits.numel() == 0:
+        return logits.sum() * 0.0
+    probabilities = torch.softmax(logits, dim=-1)
+    max_probabilities = probabilities.max(dim=-1).values
+    return max_probabilities.square().mean()
+
+
+def safe_generator_loss(
+    generator_loss: torch.nn.Module,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    if labels.numel() == 0:
+        return logits.sum() * 0.0
+    return generator_loss(logits, labels)
+
+
 def multitask_loss(
     binary_logits: torch.Tensor,
     binary_labels: torch.Tensor,
@@ -92,12 +110,33 @@ def multitask_loss(
     binary_weight: float,
     generator_weight: float,
     generator_loss: torch.nn.Module,
+    real_generator_logits: torch.Tensor | None = None,
+    real_generator_suppression_weight: float = 0.0,
+    pseudo_unknown_generator_logits: torch.Tensor | None = None,
+    pseudo_unknown_suppression_weight: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     binary = F.binary_cross_entropy_with_logits(binary_logits, binary_labels)
-    generator = generator_loss(generator_logits, generator_labels)
-    total = binary_weight * binary + generator_weight * generator
+    generator = safe_generator_loss(generator_loss, generator_logits, generator_labels)
+    real_generator_suppression = (
+        generator_max_probability_loss(real_generator_logits)
+        if real_generator_logits is not None and real_generator_suppression_weight > 0.0
+        else binary_logits.sum() * 0.0
+    )
+    pseudo_unknown_suppression = (
+        generator_max_probability_loss(pseudo_unknown_generator_logits)
+        if pseudo_unknown_generator_logits is not None and pseudo_unknown_suppression_weight > 0.0
+        else binary_logits.sum() * 0.0
+    )
+    total = (
+        binary_weight * binary
+        + generator_weight * generator
+        + real_generator_suppression_weight * real_generator_suppression
+        + pseudo_unknown_suppression_weight * pseudo_unknown_suppression
+    )
     return total, {
         "binary_loss": float(binary.detach().item()),
         "generator_loss": float(generator.detach().item()),
+        "real_generator_suppression_loss": float(real_generator_suppression.detach().item()),
+        "pseudo_unknown_suppression_loss": float(pseudo_unknown_suppression.detach().item()),
         "loss": float(total.detach().item()),
     }

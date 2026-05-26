@@ -8,7 +8,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,7 @@ from dataset import (
     VideoExample,
     build_metadata_real_fake_examples,
     build_real_fake_examples,
+    load_dataset_manifest,
     split_metadata_examples,
 )
 from feature_cache import build_feature_cache_specs
@@ -46,6 +47,7 @@ from training_losses import generator_loss_fn, multitask_loss
 from training_metrics import (
     PredictionRecord,
     binary_metrics,
+    binary_robust_checkpoint_score,
     composite_checkpoint_score,
     generator_confusion,
     generator_metrics,
@@ -56,6 +58,8 @@ from training_metrics import (
     write_dict_rows,
     write_predictions,
 )
+
+CHECKPOINT_SCORE_TYPES = ("generator_aware", "binary_robust")
 from training_samplers import MultitaskGeneratorBatchSampler
 from training_targets import (
     GeneratorTargetSpec,
@@ -67,6 +71,14 @@ from training_targets import (
     grouped_generator_name,
     real_fake_counts,
 )
+
+
+@dataclass(frozen=True)
+class PseudoUnknownConfig:
+    enabled: bool = False
+    mode: str = "epoch_rotate"
+    exclude_groups: tuple[str, ...] = ("unknown_or_other",)
+    suppression_weight: float = 0.05
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +147,84 @@ def float_value(run: Mapping[str, Any], key: str, default: float) -> float:
     return float(value)
 
 
+def bool_value(section: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = section.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"`{key}` must be a boolean.")
+    return value
+
+
+def nonnegative_float_value(section: Mapping[str, Any], key: str, default: float) -> float:
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"`{key}` must be a number.")
+    result = float(value)
+    if result < 0.0:
+        raise ValueError(f"`{key}` must be non-negative.")
+    return result
+
+
+def resolve_pseudo_unknown_config(run: Mapping[str, Any]) -> PseudoUnknownConfig:
+    raw = run.get("pseudo_unknown", {})
+    if raw is None:
+        return PseudoUnknownConfig()
+    if not isinstance(raw, Mapping):
+        raise ValueError("`training.run.pseudo_unknown` must be a mapping.")
+    mode = str(raw.get("mode", "epoch_rotate"))
+    if mode != "epoch_rotate":
+        raise ValueError("`training.run.pseudo_unknown.mode` must be `epoch_rotate`.")
+    exclude_groups = sequence_value(raw, "exclude_groups", ("unknown_or_other",))
+    return PseudoUnknownConfig(
+        enabled=bool_value(raw, "enabled", False),
+        mode=mode,
+        exclude_groups=exclude_groups,
+        suppression_weight=nonnegative_float_value(raw, "suppression_weight", 0.05),
+    )
+
+
+def pseudo_unknown_group_for_epoch(
+    epoch: int,
+    target: GeneratorTargetSpec,
+    config: PseudoUnknownConfig,
+) -> str | None:
+    if not config.enabled:
+        return None
+    if epoch <= 0:
+        raise ValueError("`epoch` must be positive.")
+    excluded = set(config.exclude_groups)
+    eligible = [name for name in target.generator_names if name not in excluded]
+    if not eligible:
+        return None
+    return eligible[(epoch - 1) % len(eligible)]
+
+
+def resolve_checkpoint_score_type(run: Mapping[str, Any]) -> str:
+    raw = run.get("checkpoint_score", "generator_aware")
+    value = raw.get("type", "generator_aware") if isinstance(raw, Mapping) else raw
+    score_type = str(value)
+    if score_type not in CHECKPOINT_SCORE_TYPES:
+        allowed = ", ".join(CHECKPOINT_SCORE_TYPES)
+        raise ValueError(f"`training.run.checkpoint_score.type` must be one of: {allowed}.")
+    return score_type
+
+
+def checkpoint_score(
+    score_type: str,
+    binary: Any,
+    macro_recall: float,
+    known_precision_at_coverage: float,
+) -> float:
+    if score_type == "binary_robust":
+        return binary_robust_checkpoint_score(binary)
+    if score_type == "generator_aware":
+        return composite_checkpoint_score(
+            binary,
+            macro_recall,
+            known_precision_at_coverage,
+        )
+    raise ValueError(f"Unsupported checkpoint score type: {score_type}")
+
+
 def resolve_head_config(config: Mapping[str, Any]) -> dict[str, Any]:
     raw = config.get("head", {})
     if raw is None:
@@ -174,6 +264,30 @@ def load_filtered_examples(
         eval_fake_count=eval_count_per_split,
     )
     return filter_excluded_generators(examples, excluded_generators)
+
+
+def load_run_examples(
+    dataset_root: Path,
+    dataset_manifest: Path | None,
+    excluded_generators: Sequence[str],
+    eval_count_per_split: int,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+) -> list[VideoExample]:
+    if dataset_manifest is not None:
+        return filter_excluded_generators(
+            load_dataset_manifest(dataset_manifest),
+            excluded_generators,
+        )
+    return load_filtered_examples(
+        dataset_root=dataset_root,
+        excluded_generators=excluded_generators,
+        eval_count_per_split=eval_count_per_split,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+    )
 
 
 def split_examples(examples: Sequence[VideoExample]) -> dict[str, list[VideoExample]]:
@@ -432,12 +546,17 @@ def train_epoch(
     target: GeneratorTargetSpec,
     binary_weight: float,
     generator_weight: float,
+    real_generator_suppression_weight: float = 0.0,
+    pseudo_unknown_group: str | None = None,
+    pseudo_unknown_suppression_weight: float = 0.0,
 ) -> dict[str, float]:
     device = model_device(model)
     model.train()
     total_loss = 0.0
     total_binary_loss = 0.0
     total_generator_loss = 0.0
+    total_real_generator_suppression_loss = 0.0
+    total_pseudo_unknown_suppression_loss = 0.0
     total_count = 0
     start = time.perf_counter()
     for batch in loader:
@@ -445,14 +564,41 @@ def train_epoch(
         labels = binary_labels_for_batch(batch, device)
         fake_indices, generator_labels = generator_labels_for_batch(batch, target, device)
         output = model(move_tensor_batch_to_device(batch, device))
+        normal_fake_indices = fake_indices
+        normal_generator_labels = generator_labels
+        pseudo_unknown_indices = torch.empty(0, dtype=torch.long, device=device)
+        if pseudo_unknown_group is not None:
+            pseudo_unknown_label = target.name_to_index.get(pseudo_unknown_group)
+            if pseudo_unknown_label is not None and generator_labels.numel():
+                pseudo_unknown_mask = generator_labels == pseudo_unknown_label
+                normal_mask = ~pseudo_unknown_mask
+                pseudo_unknown_indices = fake_indices.index_select(
+                    0,
+                    torch.nonzero(pseudo_unknown_mask, as_tuple=False).view(-1),
+                )
+                normal_fake_indices = fake_indices.index_select(
+                    0,
+                    torch.nonzero(normal_mask, as_tuple=False).view(-1),
+                )
+                normal_generator_labels = generator_labels.index_select(
+                    0,
+                    torch.nonzero(normal_mask, as_tuple=False).view(-1),
+                )
+        real_indices = torch.nonzero(labels.view(-1) <= 0.5, as_tuple=False).view(-1)
         loss, parts = multitask_loss(
             binary_logits=output.binary_logits,
             binary_labels=labels,
-            generator_logits=output.generator_logits.index_select(0, fake_indices),
-            generator_labels=generator_labels,
+            generator_logits=output.generator_logits.index_select(0, normal_fake_indices),
+            generator_labels=normal_generator_labels,
             binary_weight=binary_weight,
             generator_weight=generator_weight,
             generator_loss=generator_loss,
+            real_generator_logits=output.generator_logits.index_select(0, real_indices),
+            real_generator_suppression_weight=real_generator_suppression_weight,
+            pseudo_unknown_generator_logits=output.generator_logits.index_select(
+                0, pseudo_unknown_indices
+            ),
+            pseudo_unknown_suppression_weight=pseudo_unknown_suppression_weight,
         )
         loss.backward()
         optimizer.step()
@@ -461,11 +607,17 @@ def train_epoch(
         total_loss += parts["loss"] * count
         total_binary_loss += parts["binary_loss"] * count
         total_generator_loss += parts["generator_loss"] * count
+        total_real_generator_suppression_loss += parts["real_generator_suppression_loss"] * count
+        total_pseudo_unknown_suppression_loss += parts["pseudo_unknown_suppression_loss"] * count
     elapsed = time.perf_counter() - start
     return {
         "loss": total_loss / max(1, total_count),
         "binary_loss": total_binary_loss / max(1, total_count),
         "generator_loss": total_generator_loss / max(1, total_count),
+        "real_generator_suppression_loss": total_real_generator_suppression_loss
+        / max(1, total_count),
+        "pseudo_unknown_suppression_loss": total_pseudo_unknown_suppression_loss
+        / max(1, total_count),
         "elapsed_seconds": elapsed,
     }
 
@@ -773,6 +925,7 @@ def main() -> None:
     dataset_root = path_value(run, "dataset_root", "/mnt/d/final_dataset")
     if dataset_root is None:
         raise ValueError("Missing dataset_root.")
+    dataset_manifest = path_value(run, "dataset_manifest")
     cache_dir = path_value(run, "cache_dir")
     sharded_cache_dir = path_value(run, "sharded_cache_dir")
     output_dir = path_value(run, "output_dir", "runs/generator_multitask")
@@ -787,6 +940,9 @@ def main() -> None:
     real_per_batch = int_value(run, "real_per_batch", batch_size // 2)
     fake_per_batch = int_value(run, "fake_per_batch", batch_size - real_per_batch)
     epochs = int_value(run, "epochs", 20)
+    early_stopping_patience = int_value(run, "early_stopping_patience", 0)
+    if early_stopping_patience < 0:
+        raise ValueError("`training.run.early_stopping_patience` must be non-negative.")
     lr = float_value(run, "lr", 1e-3)
     weight_decay = float_value(run, "weight_decay", 1e-2)
     target_quota = int_value(run, "fake_generator_target_quota", 500)
@@ -798,10 +954,18 @@ def main() -> None:
     generator_loss_type = str(run.get("generator_loss", "class_balanced_focal"))
     focal_beta = float_value(run, "focal_beta", 0.999)
     focal_gamma = float_value(run, "focal_gamma", 2.0)
+    pseudo_unknown_config = resolve_pseudo_unknown_config(run)
+    real_generator_suppression_weight = nonnegative_float_value(
+        run,
+        "real_generator_suppression_weight",
+        0.0,
+    )
+    checkpoint_score_type = resolve_checkpoint_score_type(run)
 
     torch.manual_seed(seed)
-    all_examples = load_filtered_examples(
+    all_examples = load_run_examples(
         dataset_root=dataset_root,
+        dataset_manifest=dataset_manifest,
         excluded_generators=excluded_generators,
         eval_count_per_split=eval_count_per_split,
         train_ratio=float_value(run, "train_ratio", 0.8),
@@ -840,6 +1004,7 @@ def main() -> None:
     run_config = {
         "config_path": str(args.config),
         "dataset_root": str(dataset_root),
+        "dataset_manifest": None if dataset_manifest is None else str(dataset_manifest),
         "cache_dir": None if cache_dir is None else str(cache_dir),
         "sharded_cache_dir": None if sharded_cache_dir is None else str(sharded_cache_dir),
         "output_dir": str(output_dir),
@@ -862,6 +1027,26 @@ def main() -> None:
             "fake_generator_groups": count_fake_groups(extra_fake_holdout, target),
         },
         "sampler": train_sampler.summary(),
+        "early_stopping": {
+            "patience": early_stopping_patience,
+            "monitor": "checkpoint_score",
+            "mode": "max",
+        },
+        "checkpoint_score": {
+            "type": checkpoint_score_type,
+        },
+        "pseudo_unknown": {
+            "enabled": pseudo_unknown_config.enabled,
+            "mode": pseudo_unknown_config.mode,
+            "exclude_groups": list(pseudo_unknown_config.exclude_groups),
+            "suppression_weight": pseudo_unknown_config.suppression_weight,
+            "eligible_groups": [
+                name
+                for name in target.generator_names
+                if name not in set(pseudo_unknown_config.exclude_groups)
+            ],
+        },
+        "real_generator_suppression_weight": real_generator_suppression_weight,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "run_config.json", run_config)
@@ -901,8 +1086,25 @@ def main() -> None:
     best_score: float | None = None
     best_path = output_dir / "best.pt"
     epoch_rows: list[dict[str, object]] = []
+    no_improve_epochs = 0
+    completed_epochs = 0
+    stopped_early = False
     for epoch in range(1, epochs + 1):
+        completed_epochs = epoch
         current_generator_weight = 0.0 if epoch <= binary_warmup_epochs else generator_weight
+        pseudo_unknown_group = pseudo_unknown_group_for_epoch(
+            epoch,
+            target,
+            pseudo_unknown_config,
+        )
+        current_real_suppression_weight = (
+            0.0 if epoch <= binary_warmup_epochs else real_generator_suppression_weight
+        )
+        current_pseudo_unknown_suppression_weight = (
+            0.0
+            if epoch <= binary_warmup_epochs or pseudo_unknown_group is None
+            else pseudo_unknown_config.suppression_weight
+        )
         train_result = train_epoch(
             model=model,
             loader=loaders["train"],
@@ -911,6 +1113,9 @@ def main() -> None:
             target=target,
             binary_weight=binary_weight,
             generator_weight=current_generator_weight,
+            real_generator_suppression_weight=current_real_suppression_weight,
+            pseudo_unknown_group=pseudo_unknown_group,
+            pseudo_unknown_suppression_weight=current_pseudo_unknown_suppression_weight,
         )
         val_records = predict(model, loaders["val"], target, split="val")
         val_binary = binary_metrics(val_records)
@@ -922,15 +1127,24 @@ def main() -> None:
             val_records,
             unknown_group_name=target.unknown_group_name,
         )
-        score = composite_checkpoint_score(
-            val_binary,
-            macro_recall,
-            float(known_quality["known_generator_precision_at_coverage"]),
+        score = checkpoint_score(
+            checkpoint_score_type,
+            binary=val_binary,
+            macro_recall=macro_recall,
+            known_precision_at_coverage=float(
+                known_quality["known_generator_precision_at_coverage"]
+            ),
         )
         improved = best_score is None or score > best_score
         if improved:
             best_score = score
             torch.save(model.state_dict(), best_path)
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+        should_stop = early_stopping_patience > 0 and no_improve_epochs >= early_stopping_patience
+        if should_stop:
+            stopped_early = True
         epoch_rows.append(
             {
                 "epoch": epoch,
@@ -958,7 +1172,15 @@ def main() -> None:
                     f"{known_quality['known_generator_precision_at_coverage']:.8f}"
                 ),
                 "generator_loss_weight": f"{current_generator_weight:.8f}",
+                "real_generator_suppression_weight": (f"{current_real_suppression_weight:.8f}"),
+                "pseudo_unknown_group": pseudo_unknown_group or "",
+                "pseudo_unknown_suppression_weight": (
+                    f"{current_pseudo_unknown_suppression_weight:.8f}"
+                ),
                 "checkpoint_score": f"{score:.8f}",
+                "checkpoint_score_type": checkpoint_score_type,
+                "no_improve_epochs": no_improve_epochs,
+                "early_stopped": int(should_stop),
                 "best_checkpoint": int(improved),
             }
         )
@@ -972,9 +1194,18 @@ def main() -> None:
             f"val_macro_gen_recall={macro_recall:.4f} "
             f"val_worst_gen_recall={worst_recall:.4f} score={score:.4f} "
             f"known_gen_pac={known_quality['known_generator_precision_at_coverage']:.4f} "
-            f"best={int(improved)}",
+            f"pseudo_unknown={pseudo_unknown_group or '<none>'} "
+            f"best={int(improved)} no_improve={no_improve_epochs} "
+            f"early_stop={int(should_stop)}",
             flush=True,
         )
+        if should_stop:
+            print(
+                f"early stopping: epoch={epoch} patience={early_stopping_patience} "
+                f"best_score={best_score:.4f}",
+                flush=True,
+            )
+            break
 
     model.load_state_dict(
         torch.load(best_path, map_location=build_result.device, weights_only=False)
@@ -1057,6 +1288,8 @@ def main() -> None:
             **run_config,
             **loader_summary,
             "epochs": epochs,
+            "completed_epochs": completed_epochs,
+            "stopped_early": stopped_early,
             "best_checkpoint": str(best_path),
             "best_checkpoint_score": best_score,
             "calibration": calibration,

@@ -156,9 +156,18 @@ def composite_checkpoint_score(
     macro_recall: float,
     known_precision_at_coverage: float,
 ) -> float:
+    binary_robust = min(binary.specificity, binary.recall)
     return (
-        0.80 * binary.balanced_accuracy + 0.10 * macro_recall + 0.10 * known_precision_at_coverage
+        0.50 * binary_robust
+        + 0.30 * binary.balanced_accuracy
+        + 0.15 * known_precision_at_coverage
+        + 0.05 * macro_recall
     )
+
+
+def binary_robust_checkpoint_score(binary: BinaryMetrics) -> float:
+    binary_robust = min(binary.specificity, binary.recall)
+    return 0.60 * binary_robust + 0.40 * binary.balanced_accuracy
 
 
 def generator_confusion(records: Sequence[PredictionRecord]) -> list[dict[str, object]]:

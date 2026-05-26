@@ -15,11 +15,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset import LabeledVideoDataset, VIDEO_EXTENSIONS, VideoExample
+from dataset import (
+    VIDEO_EXTENSIONS,
+    LabeledVideoDataset,
+    VideoExample,
+    sample_contiguous_center_indices,
+)
 from feature_cache import build_feature_cache_specs, feature_cache_spec_id
 from video_model_fps import (
-    modality_configs,
     modalities_for_selection,
+    modality_configs,
     pipeline_config_for_selection,
     read_json,
     selection_from_checkpoint,
@@ -34,9 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Export sampled/cropped/resized input frames used before feature extraction."
     )
-    parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--video-path", type=Path, default=None)
+    parser.add_argument("--frame-count", type=int, default=None)
     parser.add_argument("--class-filter", choices=CLASS_FILTERS, default="all")
     parser.add_argument("--generator-filter", default=None)
     parser.add_argument("--limit", type=int, default=6)
@@ -101,6 +108,23 @@ def safe_name(value: str, max_length: int = 140) -> str:
     return cleaned[:max_length] or "video"
 
 
+def apply_frame_count_override(config: dict[str, Any], frame_count: int | None) -> dict[str, Any]:
+    if frame_count is None:
+        return config
+    if frame_count <= 0:
+        raise ValueError("`--frame-count` must be positive.")
+    updated = dict(config)
+    frames = updated.get("frames")
+    if isinstance(frames, dict):
+        updated["frames"] = {**frames, "default": frame_count}
+    else:
+        updated["frames"] = frame_count
+    for key, value in list(updated.items()):
+        if isinstance(value, dict) and "frames" in value:
+            updated[key] = {**value, "frames": frame_count}
+    return updated
+
+
 def load_checkpoint_config(checkpoint: Path) -> tuple[dict[str, Any], tuple[str, ...]]:
     selection = selection_from_checkpoint(checkpoint, model_kind="auto")
     summary = read_json(selection.summary_path)
@@ -131,6 +155,34 @@ def filtered_examples(
     return selected[start_index : start_index + limit]
 
 
+def class_name_from_video_path(path: Path) -> str:
+    if path.parent.name in {"real", "fake"}:
+        return path.parent.name
+    return "unknown"
+
+
+def single_video_example(path: Path, dataset_root: Path | None) -> VideoExample:
+    if not is_video_file(path):
+        raise FileNotFoundError(f"Video file not found or unsupported: {path}")
+    class_name = class_name_from_video_path(path)
+    metadata_filename = path.name
+    if dataset_root is not None:
+        try:
+            metadata_filename = str(path.relative_to(dataset_root))
+        except ValueError:
+            metadata_filename = path.name
+    return VideoExample(
+        path=path,
+        label=1 if class_name == "fake" else 0,
+        class_name=class_name,
+        source_id=path.stem,
+        split="test",
+        metadata_filename=metadata_filename,
+        generator_id=class_name,
+        source_id_kind="single_video",
+    )
+
+
 def frame_indices(count: int, sheet_frames: int) -> list[int]:
     if count <= 0:
         return []
@@ -139,6 +191,55 @@ def frame_indices(count: int, sheet_frames: int) -> list[int]:
     if count <= sheet_frames:
         return list(range(count))
     return sorted({int(round(value)) for value in np.linspace(0, count - 1, sheet_frames)})
+
+
+def sampled_frame_indices(total_frames: int, num_frames: int, modality: str) -> list[int]:
+    if modality == "rppg":
+        return sample_contiguous_center_indices(total_frames, num_frames)
+    if total_frames < num_frames:
+        raise RuntimeError(f"Video has only {total_frames} frames, need at least {num_frames}")
+    return [int(round(value)) for value in np.linspace(0, total_frames - 1, num_frames)]
+
+
+def read_original_rgb_frames(
+    path: Path,
+    num_frames: int,
+    modality: str,
+    decode_mode: str,
+) -> list[np.ndarray]:
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    indices = sampled_frame_indices(total_frames, num_frames, modality)
+    frames: list[np.ndarray] = []
+    if decode_mode == "seek" or modality == "rppg":
+        for frame_index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = cap.read()
+            if not ok:
+                cap.release()
+                raise RuntimeError(f"Failed to read frame {frame_index} from {path}")
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    else:
+        target_by_frame = {int(frame_index): target for target, frame_index in enumerate(indices)}
+        selected_frames: list[np.ndarray | None] = [None] * len(indices)
+        max_frame_index = int(indices[-1])
+        for frame_index in range(max_frame_index + 1):
+            ok, frame = cap.read()
+            if not ok:
+                cap.release()
+                raise RuntimeError(f"Failed to read frame {frame_index} from {path}")
+            target = target_by_frame.get(frame_index)
+            if target is not None:
+                selected_frames[target] = frame
+        for target, frame in enumerate(selected_frames):
+            if frame is None:
+                cap.release()
+                raise RuntimeError(f"Failed to collect sampled frame {indices[target]} from {path}")
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    return frames
 
 
 def resize_tile(frame: np.ndarray, size: int = 192) -> np.ndarray:
@@ -173,8 +274,18 @@ def write_rgb_image(path: Path, frame: np.ndarray) -> None:
     cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
 
+def write_frame_set(output_dir: Path, frames: list[np.ndarray]) -> str:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for frame_index, frame in enumerate(frames):
+        write_rgb_image(output_dir / f"frame_{frame_index:03d}.jpg", frame)
+    return str(output_dir)
+
+
 def example_output_dir(output_dir: Path, index: int, example: VideoExample) -> Path:
-    return output_dir / f"{index:03d}_{example.class_name}_{safe_name(example.metadata_filename or example.path.name)}"
+    return (
+        output_dir
+        / f"{index:03d}_{example.class_name}_{safe_name(example.metadata_filename or example.path.name)}"
+    )
 
 
 def dataset_for_example(
@@ -228,11 +339,22 @@ def export_example_frames(
     for modality in modalities:
         frames = list(frames_by_modality[modality])
         modality_dir = video_dir / modality
-        modality_dir.mkdir(parents=True, exist_ok=True)
-        for frame_index, frame in enumerate(frames):
-            write_rgb_image(modality_dir / f"frame_{frame_index:03d}.jpg", frame)
+        frames_dir = write_frame_set(modality_dir, frames)
         sheet_path = video_dir / f"{modality}_sheet.jpg"
         write_rgb_image(sheet_path, contact_sheet(frames, sheet_frames=sheet_frames))
+        original_frames = read_original_rgb_frames(
+            path=example.path,
+            num_frames=specs[modality].frame_count,
+            modality=modality,
+            decode_mode=decode_mode,
+        )
+        original_dir = video_dir / "original" / modality
+        original_frames_dir = write_frame_set(original_dir, original_frames)
+        original_sheet_path = video_dir / f"original_{modality}_sheet.jpg"
+        write_rgb_image(
+            original_sheet_path,
+            contact_sheet(original_frames, sheet_frames=sheet_frames),
+        )
         status_value = face_status.get(modality, "")
         modality_rows.append(
             {
@@ -242,7 +364,9 @@ def export_example_frames(
                 "image_size": specs[modality].image_size,
                 "face_crop_status": status_value,
                 "sheet_path": str(sheet_path),
-                "frames_dir": str(modality_dir),
+                "frames_dir": frames_dir,
+                "original_sheet_path": str(original_sheet_path),
+                "original_frames_dir": original_frames_dir,
             }
         )
 
@@ -268,7 +392,14 @@ def export_example_frames(
 
 def write_index(output_dir: Path, rows: list[dict[str, Any]]) -> None:
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
-        fieldnames = ("index", "class_name", "generator_id", "metadata_filename", "path", "output_dir")
+        fieldnames = (
+            "index",
+            "class_name",
+            "generator_id",
+            "metadata_filename",
+            "path",
+            "output_dir",
+        )
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
@@ -277,13 +408,19 @@ def write_index(output_dir: Path, rows: list[dict[str, Any]]) -> None:
 def main() -> None:
     args = parse_args()
     config, modalities = load_checkpoint_config(args.checkpoint)
-    examples = filtered_examples(
-        discover_ffpp_examples(args.dataset_root),
-        class_filter=args.class_filter,
-        generator_filter=args.generator_filter,
-        start_index=args.start_index,
-        limit=args.limit,
-    )
+    config = apply_frame_count_override(config, args.frame_count)
+    if args.video_path is not None:
+        examples = [single_video_example(args.video_path, args.dataset_root)]
+    else:
+        if args.dataset_root is None:
+            raise ValueError("`--dataset-root` is required unless `--video-path` is set.")
+        examples = filtered_examples(
+            discover_ffpp_examples(args.dataset_root),
+            class_filter=args.class_filter,
+            generator_filter=args.generator_filter,
+            start_index=args.start_index,
+            limit=args.limit,
+        )
     if not examples:
         raise ValueError("No examples selected.")
 
