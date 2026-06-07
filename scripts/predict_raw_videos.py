@@ -102,6 +102,7 @@ def discover_ffpp_examples(dataset_root: Path) -> list[dict[str, Any]]:
                     "true_label": 0,
                     "source_id": path.stem,
                     "metadata_filename": str(path.relative_to(dataset_root)),
+                    "source_id_kind": "ffpp",
                 }
             )
 
@@ -122,6 +123,7 @@ def discover_ffpp_examples(dataset_root: Path) -> list[dict[str, Any]]:
                         "true_label": 1,
                         "source_id": path.stem,
                         "metadata_filename": str(path.relative_to(dataset_root)),
+                        "source_id_kind": "ffpp",
                     }
                 )
 
@@ -289,7 +291,9 @@ def read_existing_prediction_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
-        missing = [column for column in PREDICTION_COLUMNS if column not in (reader.fieldnames or ())]
+        missing = [
+            column for column in PREDICTION_COLUMNS if column not in (reader.fieldnames or ())
+        ]
         if missing:
             raise ValueError(f"Existing output is missing columns: {', '.join(missing)}")
         return [dict(row) for row in reader]
@@ -334,11 +338,7 @@ def write_prediction_feature_cache(
 
 def write_summary(path: Path, rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
     ok_rows = [row for row in rows if row["status"] == "ok"]
-    correct = [
-        row
-        for row in ok_rows
-        if str(row["true_label"]) == str(row["binary_prediction"])
-    ]
+    correct = [row for row in ok_rows if str(row["true_label"]) == str(row["binary_prediction"])]
     by_class = Counter(str(row["class_name"]) for row in ok_rows)
     by_prediction = Counter(str(row["prediction"]) for row in ok_rows)
     payload = {

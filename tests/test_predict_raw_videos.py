@@ -33,6 +33,21 @@ def test_discover_celebdf_examples_uses_directory_labels(tmp_path: Path) -> None
     assert example.generator_id == "Celeb-synthesis"
 
 
+def test_discover_ffpp_examples_sets_source_id_kind(tmp_path: Path) -> None:
+    touch_video(tmp_path / "original" / "000.mp4")
+    touch_video(tmp_path / "Deepfakes" / "000_001.mp4")
+
+    rows = discover_examples(tmp_path)
+
+    assert [row["source_id_kind"] for row in rows] == ["ffpp", "ffpp"]
+    assert [row["class_name"] for row in rows] == ["real", "fake"]
+    assert rows[-1]["generator_id"] == "Deepfakes"
+
+    example = to_video_example(rows[-1])
+
+    assert example.source_id_kind == "ffpp"
+
+
 def test_discover_examples_rejects_unknown_layout(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="Unsupported raw prediction dataset layout"):
         discover_examples(tmp_path)
