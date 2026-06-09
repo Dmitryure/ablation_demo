@@ -192,6 +192,47 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(registry["fau"].slot_count, DEFAULT_SLOT_COUNTS["fau"])
         self.assertEqual(registry["depth"].slot_count, DEFAULT_SLOT_COUNTS["depth"])
 
+    def test_build_registry_applies_pooling_config_to_selected_modalities(self):
+        registry = build_registry(
+            dim=16,
+            config={
+                "rgb": {
+                    "pooling": {
+                        "layers": 1,
+                        "heads": 4,
+                        "mlp_ratio": 2.0,
+                        "position_weight": 1.75,
+                    }
+                },
+                "depth": {
+                    "pooling": {
+                        "layers": 3,
+                        "heads": 2,
+                        "mlp_ratio": 3.0,
+                        "position_weight": 1.25,
+                    }
+                },
+                "face_mesh": {
+                    "pooling": {
+                        "layers": 2,
+                        "heads": 4,
+                        "mlp_ratio": 2.5,
+                        "position_weight": 1.5,
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(registry["rgb"].pool.pool.num_layers, 1)
+        self.assertEqual(registry["rgb"].pool.pool.num_heads, 4)
+        self.assertEqual(registry["rgb"].pool.position_weight, 1.75)
+        self.assertEqual(registry["depth"].pool.pool.num_layers, 3)
+        self.assertEqual(registry["depth"].pool.pool.num_heads, 2)
+        self.assertEqual(registry["depth"].pool.position_weight, 1.25)
+        self.assertEqual(registry["face_mesh"].point_pool.num_layers, 2)
+        self.assertEqual(registry["face_mesh"].clip_pool.pool.num_heads, 4)
+        self.assertEqual(registry["face_mesh"].clip_pool.position_weight, 1.5)
+
     def test_registry_required_keys_for_video_modalities(self):
         registry = build_registry(dim=32)
 
@@ -846,6 +887,36 @@ class RegistryTest(unittest.TestCase):
         fusion_module = build_fusion_from_config(config)
 
         self.assertIsInstance(fusion_module, TokenBankFusion)
+
+    def test_fusion_summary_modalities_keep_public_token_shape(self):
+        config = {
+            "dim": 16,
+            "fusion": {
+                "type": "token_transformer",
+                "num_layers": 2,
+                "num_heads": 4,
+                "mlp_ratio": 2.0,
+                "dropout": 0.0,
+                "max_time_steps": 32,
+                "summary_modalities": ["rgb", "depth"],
+                "checkpoint_path": None,
+            },
+        }
+        fusion_module = build_fusion_from_config(config)
+        tokens = torch.randn(2, 3, 16)
+        token_mask = torch.tensor([True, False, True])
+        time_ids = torch.arange(3)
+        modality_ids = torch.tensor(
+            [MODALITY_TO_ID["rgb"], MODALITY_TO_ID["depth"], MODALITY_TO_ID["depth"]]
+        )
+
+        cls_token, fused_tokens = fusion_module(tokens, token_mask, time_ids, modality_ids)
+
+        self.assertEqual(
+            fusion_module.summary_modality_ids, (MODALITY_TO_ID["rgb"], MODALITY_TO_ID["depth"])
+        )
+        self.assertEqual(tuple(cls_token.shape), (2, 16))
+        self.assertEqual(tuple(fused_tokens.shape), (2, 4, 16))
 
 
 if __name__ == "__main__":

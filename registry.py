@@ -17,6 +17,7 @@ from branches import (
     STFTBranch,
 )
 from branches.compression import (
+    resolve_pooling_config,
     resolve_slot_count,
     validate_branch_token_config,
     validate_positive_int,
@@ -75,18 +76,29 @@ def build_registry(dim: int, config: Mapping[str, Any] | None = None) -> nn.Modu
     validate_branch_token_config(config, modalities=CURRENT_MODALITIES)
     return nn.ModuleDict(
         {
-            "rgb": RGBBranch(dim=dim, slot_count=resolve_slot_count(config, "rgb")),
+            "rgb": RGBBranch(
+                dim=dim,
+                slot_count=resolve_slot_count(config, "rgb"),
+                pooling_config=resolve_pooling_config(config, "rgb"),
+            ),
             "fau": FAUBranch(dim=dim, slot_count=resolve_slot_count(config, "fau")),
             "rppg": RPPGBranch(dim=dim, slot_count=resolve_slot_count(config, "rppg")),
             "eye_gaze": EyeGazeBranch(
                 dim=dim,
                 slot_count=resolve_slot_count(config, "eye_gaze"),
                 feature_dim=resolve_feature_dim(config, "eye_gaze", 8),
+                pooling_config=resolve_pooling_config(config, "eye_gaze"),
             ),
             "face_mesh": FaceMeshBranch(
-                dim=dim, slot_count=resolve_slot_count(config, "face_mesh")
+                dim=dim,
+                slot_count=resolve_slot_count(config, "face_mesh"),
+                pooling_config=resolve_pooling_config(config, "face_mesh"),
             ),
-            "depth": DepthBranch(dim=dim, slot_count=resolve_slot_count(config, "depth")),
+            "depth": DepthBranch(
+                dim=dim,
+                slot_count=resolve_slot_count(config, "depth"),
+                pooling_config=resolve_pooling_config(config, "depth"),
+            ),
             "fft": FFTBranch(dim=dim, slot_count=resolve_slot_count(config, "fft")),
             "stft": STFTBranch(dim=dim, slot_count=resolve_slot_count(config, "stft")),
         }

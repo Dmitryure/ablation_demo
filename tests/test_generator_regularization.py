@@ -11,9 +11,14 @@ from scripts.run_generator_multitask_training import (
     pseudo_unknown_group_for_epoch,
     resolve_checkpoint_score_type,
     resolve_pseudo_unknown_config,
+    scheduled_generator_weight,
     train_epoch,
 )
-from training_losses import generator_max_probability_loss, multitask_loss
+from training_losses import (
+    binary_probability_margin_loss,
+    generator_max_probability_loss,
+    multitask_loss,
+)
 from training_targets import GeneratorTargetSpec
 
 
@@ -60,6 +65,35 @@ def test_multitask_loss_allows_empty_generator_ce_with_suppression() -> None:
     assert parts["generator_loss"] == 0.0
     assert parts["real_generator_suppression_loss"] > 0.0
     assert parts["pseudo_unknown_suppression_loss"] > 0.0
+
+
+def test_binary_probability_margin_loss_penalizes_uncertain_real_and_fake() -> None:
+    good_logits = torch.tensor([[-4.0], [4.0]])
+    weak_logits = torch.tensor([[0.0], [0.0]])
+    labels = torch.tensor([[0.0], [1.0]])
+
+    good = binary_probability_margin_loss(
+        good_logits,
+        labels,
+        real_margin=0.2,
+        fake_margin=0.8,
+    )
+    weak = binary_probability_margin_loss(
+        weak_logits,
+        labels,
+        real_margin=0.2,
+        fake_margin=0.8,
+    )
+
+    assert weak > good
+
+
+def test_scheduled_generator_weight_warmup_and_ramp() -> None:
+    assert scheduled_generator_weight(1, 0.15, warmup_epochs=2, ramp_epochs=3) == 0.0
+    assert scheduled_generator_weight(2, 0.15, warmup_epochs=2, ramp_epochs=3) == 0.0
+    assert abs(scheduled_generator_weight(3, 0.15, warmup_epochs=2, ramp_epochs=3) - 0.05) < 1e-9
+    assert abs(scheduled_generator_weight(4, 0.15, warmup_epochs=2, ramp_epochs=3) - 0.10) < 1e-9
+    assert abs(scheduled_generator_weight(5, 0.15, warmup_epochs=2, ramp_epochs=3) - 0.15) < 1e-9
 
 
 def test_pseudo_unknown_group_rotates_and_excludes_unknown_group() -> None:
@@ -169,12 +203,16 @@ def test_train_epoch_masks_pseudo_unknown_fake_and_suppresses_real() -> None:
         target=target,
         binary_weight=1.0,
         generator_weight=0.15,
+        binary_margin_weight=0.1,
+        real_probability_margin=0.2,
+        fake_probability_margin=0.8,
         real_generator_suppression_weight=0.05,
         pseudo_unknown_group="liveavatar",
         pseudo_unknown_suppression_weight=0.05,
     )
 
     assert result["binary_loss"] > 0.0
+    assert result["binary_margin_loss"] >= 0.0
     assert result["generator_loss"] > 0.0
     assert result["real_generator_suppression_loss"] > 0.0
     assert result["pseudo_unknown_suppression_loss"] > 0.0

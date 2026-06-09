@@ -8,6 +8,7 @@ import torch.nn as nn
 from branches.base import ModalityBranch, ModalityOutput
 from branches.compression import (
     DEFAULT_SLOT_COUNTS,
+    PoolingConfig,
     TemporalLatentQueryPooling,
     validate_positive_int,
 )
@@ -16,11 +17,24 @@ from branches.compression import (
 class DepthBranch(ModalityBranch):
     name = "depth"
 
-    def __init__(self, dim: int, slot_count: int = DEFAULT_SLOT_COUNTS["depth"]):
+    def __init__(
+        self,
+        dim: int,
+        slot_count: int = DEFAULT_SLOT_COUNTS["depth"],
+        pooling_config: PoolingConfig | None = None,
+    ):
         super().__init__()
+        pooling = pooling_config or PoolingConfig()
         self.slot_count = validate_positive_int(slot_count, "depth.slot_count")
         self.proj = nn.LazyLinear(dim)
-        self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
+        self.pool = TemporalLatentQueryPooling(
+            dim=dim,
+            output_tokens=self.slot_count,
+            num_layers=pooling.layers,
+            num_heads=pooling.heads,
+            mlp_ratio=pooling.mlp_ratio,
+            position_weight=pooling.position_weight,
+        )
 
     def required_keys(self) -> tuple[str, ...]:
         return ("depth_features",)

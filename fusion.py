@@ -135,6 +135,7 @@ class TokenBankFusion(nn.Module):
         dropout: float,
         max_time_steps: int,
         num_modalities: int,
+        summary_modality_ids: Sequence[int] = (),
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -159,7 +160,12 @@ class TokenBankFusion(nn.Module):
         self.dim = dim
         self.max_time_steps = max_time_steps
         self.num_modalities = num_modalities
+        self.summary_modality_ids = validate_summary_modality_ids(
+            summary_modality_ids=summary_modality_ids,
+            num_modalities=num_modalities,
+        )
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.modality_summary_tokens = nn.Parameter(torch.zeros(num_modalities, dim))
         self.time_embedding = nn.Embedding(max_time_steps, dim)
         self.modality_embedding = nn.Embedding(num_modalities, dim)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -174,6 +180,7 @@ class TokenBankFusion(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_norm = nn.LayerNorm(dim)
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.modality_summary_tokens, mean=0.0, std=0.02)
 
     def forward(
         self,
@@ -220,11 +227,18 @@ class TokenBankFusion(nn.Module):
 
         batch_size = token_states.shape[0]
         cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        fused_tokens = torch.cat([cls_tokens, token_states], dim=1)
+        summary_tokens, summary_valid_mask = self.build_summary_tokens(
+            batch_size=batch_size,
+            valid_token_mask=valid_token_mask,
+            modality_ids=modality_ids,
+            device=tokens.device,
+        )
+        fused_tokens = torch.cat([cls_tokens, summary_tokens, token_states], dim=1)
         cls_padding = torch.zeros((batch_size, 1), dtype=torch.bool, device=tokens.device)
         src_key_padding_mask = torch.cat(
             [
                 cls_padding,
+                (~summary_valid_mask).unsqueeze(0).expand(batch_size, -1),
                 (~valid_token_mask).unsqueeze(0).expand(batch_size, -1),
             ],
             dim=1,
@@ -232,4 +246,53 @@ class TokenBankFusion(nn.Module):
         fused_tokens = self.encoder(fused_tokens, src_key_padding_mask=src_key_padding_mask)
         fused_tokens = self.output_norm(fused_tokens)
         cls_token = fused_tokens[:, 0, :]
-        return cls_token, fused_tokens
+        token_start = 1 + summary_tokens.shape[1]
+        public_fused_tokens = torch.cat(
+            [fused_tokens[:, :1, :], fused_tokens[:, token_start:, :]], dim=1
+        )
+        return cls_token, public_fused_tokens
+
+    def build_summary_tokens(
+        self,
+        batch_size: int,
+        valid_token_mask: torch.Tensor,
+        modality_ids: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.summary_modality_ids:
+            return (
+                self.modality_summary_tokens.new_zeros((batch_size, 0, self.dim)),
+                torch.zeros(0, dtype=torch.bool, device=device),
+            )
+
+        summary_ids = torch.tensor(self.summary_modality_ids, dtype=torch.long, device=device)
+        summary_tokens = self.modality_summary_tokens[summary_ids]
+        summary_tokens = summary_tokens + self.modality_embedding(summary_ids)
+        summary_tokens = summary_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+        summary_valid_mask = torch.stack(
+            [
+                ((modality_ids == modality_id) & valid_token_mask).any()
+                for modality_id in summary_ids
+            ],
+            dim=0,
+        )
+        return summary_tokens, summary_valid_mask
+
+
+def validate_summary_modality_ids(
+    summary_modality_ids: Sequence[int],
+    num_modalities: int,
+) -> tuple[int, ...]:
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for raw_id in summary_modality_ids:
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            raise ValueError("`summary_modality_ids` must contain integer modality ids.")
+        if raw_id < 0 or raw_id >= num_modalities:
+            raise ValueError(
+                f"`summary_modality_ids` contains {raw_id}, outside [0, {num_modalities})."
+            )
+        if raw_id not in seen:
+            seen.add(raw_id)
+            normalized.append(raw_id)
+    return tuple(normalized)

@@ -8,6 +8,7 @@ from branches.base import ModalityBranch, ModalityOutput, mlp
 from branches.compression import (
     DEFAULT_SLOT_COUNTS,
     LatentQueryPooling,
+    PoolingConfig,
     TemporalLatentQueryPooling,
     validate_positive_int,
 )
@@ -18,12 +19,31 @@ POINT_QUERY_TOKENS = 1
 class FaceMeshBranch(ModalityBranch):
     name = "face_mesh"
 
-    def __init__(self, dim: int, slot_count: int = DEFAULT_SLOT_COUNTS["face_mesh"]):
+    def __init__(
+        self,
+        dim: int,
+        slot_count: int = DEFAULT_SLOT_COUNTS["face_mesh"],
+        pooling_config: PoolingConfig | None = None,
+    ):
         super().__init__()
+        pooling = pooling_config or PoolingConfig()
         self.slot_count = validate_positive_int(slot_count, "face_mesh.slot_count")
         self.proj = mlp(3, dim, dim)
-        self.point_pool = LatentQueryPooling(dim=dim, output_tokens=POINT_QUERY_TOKENS)
-        self.clip_pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
+        self.point_pool = LatentQueryPooling(
+            dim=dim,
+            output_tokens=POINT_QUERY_TOKENS,
+            num_layers=pooling.layers,
+            num_heads=pooling.heads,
+            mlp_ratio=pooling.mlp_ratio,
+        )
+        self.clip_pool = TemporalLatentQueryPooling(
+            dim=dim,
+            output_tokens=self.slot_count,
+            num_layers=pooling.layers,
+            num_heads=pooling.heads,
+            mlp_ratio=pooling.mlp_ratio,
+            position_weight=pooling.position_weight,
+        )
 
     def required_keys(self) -> tuple[str, ...]:
         return ("face_mesh",)

@@ -10,6 +10,7 @@ import torch.nn as nn
 from fusion import FusionOutput
 from pipeline import ClipFusionPipeline
 from task_models.heads import (
+    _build_gate_context,
     _build_gated_attention,
     _build_modality_masks,
     _masked_softmax,
@@ -50,9 +51,16 @@ class MultitaskModalityGatedMILHead(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_generators),
         )
-        self.gate = nn.Sequential(
-            nn.LayerNorm(dim * 2),
-            nn.Linear(dim * 2, hidden_dim),
+        self.binary_gate = nn.Sequential(
+            nn.LayerNorm(dim * 4),
+            nn.Linear(dim * 4, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.generator_gate = nn.Sequential(
+            nn.LayerNorm(dim * 4),
+            nn.Linear(dim * 4, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -76,24 +84,28 @@ class MultitaskModalityGatedMILHead(nn.Module):
             modality_masks=modality_masks,
         )
         modality_valid_mask = modality_masks.any(dim=1)
-        gate_context = torch.cat(
-            [cls_token.unsqueeze(1).expand(-1, modality_pools.shape[1], -1), modality_pools],
-            dim=2,
+        gate_context = _build_gate_context(cls_token, modality_pools, modality_valid_mask)
+        binary_gate_weights = _masked_softmax(
+            self.binary_gate(gate_context).squeeze(-1), modality_valid_mask
         )
-        gate_weights = _masked_softmax(self.gate(gate_context).squeeze(-1), modality_valid_mask)
+        generator_gate_weights = _masked_softmax(
+            self.generator_gate(gate_context).squeeze(-1), modality_valid_mask
+        )
         binary_expert_logits = self.binary_expert(modality_pools).squeeze(-1)
         generator_expert_logits = self.generator_expert(modality_pools)
         binary_logits = self.binary_cls_projection(cls_token) + (
-            gate_weights * binary_expert_logits
+            binary_gate_weights * binary_expert_logits
         ).sum(dim=1, keepdim=True)
         generator_logits = self.generator_cls_projection(cls_token) + (
-            gate_weights.unsqueeze(-1) * generator_expert_logits
+            generator_gate_weights.unsqueeze(-1) * generator_expert_logits
         ).sum(dim=1)
         return (
             binary_logits,
             generator_logits,
             {
-                "modality_gate_weights": gate_weights,
+                "modality_gate_weights": binary_gate_weights,
+                "binary_modality_gate_weights": binary_gate_weights,
+                "generator_modality_gate_weights": generator_gate_weights,
                 "binary_modality_expert_logits": binary_expert_logits,
                 "generator_modality_expert_logits": generator_expert_logits,
                 "modality_valid_mask": modality_valid_mask,

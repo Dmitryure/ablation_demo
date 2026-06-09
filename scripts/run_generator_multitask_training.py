@@ -225,6 +225,28 @@ def checkpoint_score(
     raise ValueError(f"Unsupported checkpoint score type: {score_type}")
 
 
+def scheduled_generator_weight(
+    epoch: int,
+    target_weight: float,
+    warmup_epochs: int,
+    ramp_epochs: int,
+) -> float:
+    if epoch <= 0:
+        raise ValueError("`epoch` must be positive.")
+    if target_weight < 0.0:
+        raise ValueError("`target_weight` must be non-negative.")
+    if warmup_epochs < 0:
+        raise ValueError("`warmup_epochs` must be non-negative.")
+    if ramp_epochs < 0:
+        raise ValueError("`ramp_epochs` must be non-negative.")
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0:
+        return target_weight
+    ramp_step = min(ramp_epochs, epoch - warmup_epochs)
+    return target_weight * ramp_step / ramp_epochs
+
+
 def resolve_head_config(config: Mapping[str, Any]) -> dict[str, Any]:
     raw = config.get("head", {})
     if raw is None:
@@ -546,6 +568,9 @@ def train_epoch(
     target: GeneratorTargetSpec,
     binary_weight: float,
     generator_weight: float,
+    binary_margin_weight: float = 0.0,
+    real_probability_margin: float = 0.20,
+    fake_probability_margin: float = 0.80,
     real_generator_suppression_weight: float = 0.0,
     pseudo_unknown_group: str | None = None,
     pseudo_unknown_suppression_weight: float = 0.0,
@@ -554,6 +579,7 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     total_binary_loss = 0.0
+    total_binary_margin_loss = 0.0
     total_generator_loss = 0.0
     total_real_generator_suppression_loss = 0.0
     total_pseudo_unknown_suppression_loss = 0.0
@@ -593,6 +619,9 @@ def train_epoch(
             binary_weight=binary_weight,
             generator_weight=generator_weight,
             generator_loss=generator_loss,
+            binary_margin_weight=binary_margin_weight,
+            real_probability_margin=real_probability_margin,
+            fake_probability_margin=fake_probability_margin,
             real_generator_logits=output.generator_logits.index_select(0, real_indices),
             real_generator_suppression_weight=real_generator_suppression_weight,
             pseudo_unknown_generator_logits=output.generator_logits.index_select(
@@ -606,6 +635,7 @@ def train_epoch(
         total_count += count
         total_loss += parts["loss"] * count
         total_binary_loss += parts["binary_loss"] * count
+        total_binary_margin_loss += parts["binary_margin_loss"] * count
         total_generator_loss += parts["generator_loss"] * count
         total_real_generator_suppression_loss += parts["real_generator_suppression_loss"] * count
         total_pseudo_unknown_suppression_loss += parts["pseudo_unknown_suppression_loss"] * count
@@ -613,6 +643,7 @@ def train_epoch(
     return {
         "loss": total_loss / max(1, total_count),
         "binary_loss": total_binary_loss / max(1, total_count),
+        "binary_margin_loss": total_binary_margin_loss / max(1, total_count),
         "generator_loss": total_generator_loss / max(1, total_count),
         "real_generator_suppression_loss": total_real_generator_suppression_loss
         / max(1, total_count),
@@ -951,6 +982,17 @@ def main() -> None:
     binary_weight = float_value(run, "binary_loss_weight", 1.0)
     generator_weight = float_value(run, "generator_loss_weight", 0.5)
     binary_warmup_epochs = int_value(run, "binary_warmup_epochs", 0)
+    generator_ramp_epochs = int_value(run, "generator_ramp_epochs", 0)
+    if generator_ramp_epochs < 0:
+        raise ValueError("`training.run.generator_ramp_epochs` must be non-negative.")
+    binary_margin_weight = nonnegative_float_value(run, "binary_margin_weight", 0.0)
+    real_probability_margin = float_value(run, "real_probability_margin", 0.20)
+    fake_probability_margin = float_value(run, "fake_probability_margin", 0.80)
+    if not 0.0 <= real_probability_margin < fake_probability_margin <= 1.0:
+        raise ValueError(
+            "`real_probability_margin` must be smaller than `fake_probability_margin`, "
+            "and both must be in [0.0, 1.0]."
+        )
     generator_loss_type = str(run.get("generator_loss", "class_balanced_focal"))
     focal_beta = float_value(run, "focal_beta", 0.999)
     focal_gamma = float_value(run, "focal_gamma", 2.0)
@@ -1035,6 +1077,16 @@ def main() -> None:
         "checkpoint_score": {
             "type": checkpoint_score_type,
         },
+        "binary_margin": {
+            "weight": binary_margin_weight,
+            "real_probability_margin": real_probability_margin,
+            "fake_probability_margin": fake_probability_margin,
+        },
+        "generator_schedule": {
+            "target_weight": generator_weight,
+            "binary_warmup_epochs": binary_warmup_epochs,
+            "generator_ramp_epochs": generator_ramp_epochs,
+        },
         "pseudo_unknown": {
             "enabled": pseudo_unknown_config.enabled,
             "mode": pseudo_unknown_config.mode,
@@ -1091,7 +1143,12 @@ def main() -> None:
     stopped_early = False
     for epoch in range(1, epochs + 1):
         completed_epochs = epoch
-        current_generator_weight = 0.0 if epoch <= binary_warmup_epochs else generator_weight
+        current_generator_weight = scheduled_generator_weight(
+            epoch=epoch,
+            target_weight=generator_weight,
+            warmup_epochs=binary_warmup_epochs,
+            ramp_epochs=generator_ramp_epochs,
+        )
         pseudo_unknown_group = pseudo_unknown_group_for_epoch(
             epoch,
             target,
@@ -1113,6 +1170,9 @@ def main() -> None:
             target=target,
             binary_weight=binary_weight,
             generator_weight=current_generator_weight,
+            binary_margin_weight=binary_margin_weight,
+            real_probability_margin=real_probability_margin,
+            fake_probability_margin=fake_probability_margin,
             real_generator_suppression_weight=current_real_suppression_weight,
             pseudo_unknown_group=pseudo_unknown_group,
             pseudo_unknown_suppression_weight=current_pseudo_unknown_suppression_weight,

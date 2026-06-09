@@ -155,7 +155,8 @@ def describe_module(module: nn.Module) -> str:
         return (
             "TemporalLatentQueryPooling("
             f"output_tokens={module.pool.output_tokens}, layers={module.pool.num_layers}, "
-            f"heads={module.pool.num_heads}, position=token_plus_bias)"
+            f"heads={module.pool.num_heads}, position=token_plus_bias, "
+            f"position_weight={module.position_weight})"
         )
     if isinstance(module, TemporalPositionEncoding):
         return f"TemporalPositionEncoding(dim={module.dim}, scale=learned)"
@@ -641,6 +642,7 @@ def _normalize_fusion_stage(
 
 def build_fusion_component(config: Mapping[str, Any], total_tokens: int) -> ComponentSpec:
     fusion_config = config["fusion"]
+    summary_modalities = tuple(fusion_config.get("summary_modalities") or ())
     fusion = TokenBankFusion(
         dim=int(config["dim"]),
         num_layers=int(fusion_config["num_layers"]),
@@ -649,6 +651,7 @@ def build_fusion_component(config: Mapping[str, Any], total_tokens: int) -> Comp
         dropout=float(fusion_config["dropout"]),
         max_time_steps=int(fusion_config["max_time_steps"]),
         num_modalities=len(MODALITY_TO_ID),
+        summary_modality_ids=tuple(MODALITY_TO_ID[name] for name in summary_modalities),
     )
     events = extract_assignment_events(fusion.forward)
     normalized_stages = [
@@ -677,10 +680,14 @@ def build_fusion_component(config: Mapping[str, Any], total_tokens: int) -> Comp
         output_summary=f"cls_token [B, {config['dim']}] + fused_tokens [B, {1 + total_tokens}, {config['dim']}]",
         token_formula=(
             f"layers={fusion_config['num_layers']}, heads={fusion_config['num_heads']}, "
-            f"mlp_ratio={fusion_config['mlp_ratio']}"
+            f"mlp_ratio={fusion_config['mlp_ratio']}, summary_modalities={summary_modalities}"
         ),
         token_count=None,
-        note="Time and modality embeddings are added before CLS prepend, transformer mixing, and output norm.",
+        note=(
+            "Time and modality embeddings are added before internal modality summary tokens, "
+            "CLS prepend, transformer mixing, and output norm. Summary tokens are stripped from "
+            "the public fused token output."
+        ),
         stroke_color="#295C8A",
         fill_color="#DCEAF7",
         source=source_ref(fusion.forward, "TokenBankFusion.forward"),

@@ -14,6 +14,7 @@ from task_models import (
     ModalityGatedMILBinaryHead,
     build_binary_head,
 )
+from task_models.generator_multitask_classifier import MultitaskModalityGatedMILHead
 from task_models.heads import _masked_softmax
 
 
@@ -193,6 +194,28 @@ class TaskModelTest(unittest.TestCase):
 
         self.assertIn("modality_gate_weights", output.diagnostics)
         self.assertIn("token_attention_weights", output.diagnostics)
+
+    def test_multitask_modality_head_reports_separate_task_gates(self):
+        head = MultitaskModalityGatedMILHead(
+            dim=4,
+            num_generators=3,
+            hidden_dim=8,
+            dropout=0.0,
+        )
+        fusion = build_token_fusion_output()
+
+        binary_logits, generator_logits, diagnostics = head(fusion)
+
+        self.assertEqual(tuple(binary_logits.shape), (2, 1))
+        self.assertEqual(tuple(generator_logits.shape), (2, 3))
+        self.assertEqual(tuple(diagnostics["binary_modality_gate_weights"].shape), (2, 2))
+        self.assertEqual(tuple(diagnostics["generator_modality_gate_weights"].shape), (2, 2))
+        self.assertTrue(
+            torch.allclose(
+                diagnostics["modality_gate_weights"],
+                diagnostics["binary_modality_gate_weights"],
+            )
+        )
 
 
 if __name__ == "__main__":

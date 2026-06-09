@@ -117,7 +117,26 @@ def build_fusion_from_config(config: Mapping[str, Any]) -> TokenBankFusion:
         dropout=_require_float(fusion, "dropout"),
         max_time_steps=_require_int(fusion, "max_time_steps"),
         num_modalities=len(MODALITY_TO_ID),
+        summary_modality_ids=resolve_summary_modality_ids(fusion),
     )
+
+
+def resolve_summary_modality_ids(fusion_config: Mapping[str, Any]) -> tuple[int, ...]:
+    value = fusion_config.get("summary_modalities", ())
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        raise ValueError("`fusion.summary_modalities` must be a YAML list of modality names.")
+
+    summary_ids: list[int] = []
+    for modality_name in value:
+        if not isinstance(modality_name, str) or not modality_name.strip():
+            raise ValueError("`fusion.summary_modalities` must contain non-empty strings.")
+        normalized_name = modality_name.strip()
+        if normalized_name not in MODALITY_TO_ID:
+            raise ValueError(f"Unknown fusion summary modality: `{normalized_name}`.")
+        summary_ids.append(MODALITY_TO_ID[normalized_name])
+    return tuple(summary_ids)
 
 
 def load_fusion_checkpoint(

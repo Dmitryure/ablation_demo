@@ -102,6 +102,35 @@ def safe_generator_loss(
     return generator_loss(logits, labels)
 
 
+def binary_probability_margin_loss(
+    binary_logits: torch.Tensor,
+    binary_labels: torch.Tensor,
+    real_margin: float,
+    fake_margin: float,
+) -> torch.Tensor:
+    if real_margin < 0.0 or real_margin > 1.0:
+        raise ValueError("`real_margin` must be in [0.0, 1.0].")
+    if fake_margin < 0.0 or fake_margin > 1.0:
+        raise ValueError("`fake_margin` must be in [0.0, 1.0].")
+    if real_margin >= fake_margin:
+        raise ValueError("`real_margin` must be smaller than `fake_margin`.")
+    probabilities = torch.sigmoid(binary_logits)
+    real_mask = binary_labels <= 0.5
+    fake_mask = binary_labels > 0.5
+    zero = binary_logits.sum() * 0.0
+    real_loss = (
+        (probabilities[real_mask] - real_margin).clamp_min(0.0).square().mean()
+        if torch.any(real_mask)
+        else zero
+    )
+    fake_loss = (
+        (fake_margin - probabilities[fake_mask]).clamp_min(0.0).square().mean()
+        if torch.any(fake_mask)
+        else zero
+    )
+    return real_loss + fake_loss
+
+
 def multitask_loss(
     binary_logits: torch.Tensor,
     binary_labels: torch.Tensor,
@@ -114,8 +143,21 @@ def multitask_loss(
     real_generator_suppression_weight: float = 0.0,
     pseudo_unknown_generator_logits: torch.Tensor | None = None,
     pseudo_unknown_suppression_weight: float = 0.0,
+    binary_margin_weight: float = 0.0,
+    real_probability_margin: float = 0.20,
+    fake_probability_margin: float = 0.80,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     binary = F.binary_cross_entropy_with_logits(binary_logits, binary_labels)
+    binary_margin = (
+        binary_probability_margin_loss(
+            binary_logits=binary_logits,
+            binary_labels=binary_labels,
+            real_margin=real_probability_margin,
+            fake_margin=fake_probability_margin,
+        )
+        if binary_margin_weight > 0.0
+        else binary_logits.sum() * 0.0
+    )
     generator = safe_generator_loss(generator_loss, generator_logits, generator_labels)
     real_generator_suppression = (
         generator_max_probability_loss(real_generator_logits)
@@ -129,12 +171,14 @@ def multitask_loss(
     )
     total = (
         binary_weight * binary
+        + binary_margin_weight * binary_margin
         + generator_weight * generator
         + real_generator_suppression_weight * real_generator_suppression
         + pseudo_unknown_suppression_weight * pseudo_unknown_suppression
     )
     return total, {
         "binary_loss": float(binary.detach().item()),
+        "binary_margin_loss": float(binary_margin.detach().item()),
         "generator_loss": float(generator.detach().item()),
         "real_generator_suppression_loss": float(real_generator_suppression.detach().item()),
         "pseudo_unknown_suppression_loss": float(pseudo_unknown_suppression.detach().item()),

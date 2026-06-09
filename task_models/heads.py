@@ -77,8 +77,8 @@ class ModalityGatedMILBinaryHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
         self.gate = nn.Sequential(
-            nn.LayerNorm(dim * 2),
-            nn.Linear(dim * 2, hidden_dim),
+            nn.LayerNorm(dim * 4),
+            nn.Linear(dim * 4, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -100,10 +100,7 @@ class ModalityGatedMILBinaryHead(nn.Module):
         )
         modality_valid_mask = modality_masks.any(dim=1)
         expert_logits = self.expert(modality_pools).squeeze(-1)
-        gate_context = torch.cat(
-            [cls_token.unsqueeze(1).expand(-1, modality_pools.shape[1], -1), modality_pools],
-            dim=2,
-        )
+        gate_context = _build_gate_context(cls_token, modality_pools, modality_valid_mask)
         gate_weights = _masked_softmax(self.gate(gate_context).squeeze(-1), modality_valid_mask)
         mixed_logit = (gate_weights * expert_logits).sum(dim=1, keepdim=True)
         logits = self.cls_projection(cls_token) + mixed_logit
@@ -238,6 +235,37 @@ def _pool_by_modality(
         batch_size, _, dim = tokens.shape
         return tokens.new_zeros((batch_size, 0, dim)), token_attention
     return torch.stack(pools, dim=1), token_attention
+
+
+def _build_gate_context(
+    cls_token: torch.Tensor,
+    modality_pools: torch.Tensor,
+    modality_valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    if modality_pools.ndim != 3:
+        raise ValueError(
+            f"`modality_pools` must have shape [B, M, dim], got {tuple(modality_pools.shape)}"
+        )
+    if modality_valid_mask.ndim != 1 or modality_valid_mask.shape[0] != modality_pools.shape[1]:
+        raise ValueError("`modality_valid_mask` must have shape [M] and match modality pools.")
+    if cls_token.ndim != 2 or cls_token.shape[0] != modality_pools.shape[0]:
+        raise ValueError("`cls_token` must have shape [B, dim] and match modality pools.")
+
+    valid = modality_valid_mask.to(device=modality_pools.device, dtype=modality_pools.dtype)
+    valid = valid.view(1, -1, 1)
+    denominator = valid.sum(dim=1).clamp_min(1.0)
+    global_pool = (modality_pools * valid).sum(dim=1) / denominator
+    expanded_cls = cls_token.unsqueeze(1).expand(-1, modality_pools.shape[1], -1)
+    expanded_global = global_pool.unsqueeze(1).expand(-1, modality_pools.shape[1], -1)
+    return torch.cat(
+        [
+            expanded_cls,
+            modality_pools,
+            expanded_global,
+            torch.abs(modality_pools - expanded_global),
+        ],
+        dim=2,
+    )
 
 
 def detach_diagnostics(diagnostics: Mapping[str, torch.Tensor]) -> HeadDiagnostics:

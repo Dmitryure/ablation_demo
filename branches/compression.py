@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -32,10 +33,30 @@ DEFAULT_SLOT_COUNTS = {
 }
 
 
+@dataclass(frozen=True)
+class PoolingConfig:
+    layers: int = 2
+    heads: int | None = None
+    mlp_ratio: float = 4.0
+    position_weight: float = 1.0
+
+
 def validate_positive_int(value: int, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"`{field_name}` must be a positive integer.")
     return value
+
+
+def validate_optional_positive_int(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return validate_positive_int(value, field_name)
+
+
+def validate_positive_float(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0.0:
+        raise ValueError(f"`{field_name}` must be a positive number.")
+    return float(value)
 
 
 def resolve_slot_count(config: Mapping[str, Any] | None, modality_name: str) -> int:
@@ -57,6 +78,42 @@ def resolve_slot_count(config: Mapping[str, Any] | None, modality_name: str) -> 
     if value is None:
         return default_value
     return validate_positive_int(value, f"{modality_name}.{field_name}")
+
+
+def resolve_pooling_config(config: Mapping[str, Any] | None, modality_name: str) -> PoolingConfig:
+    if config is None:
+        return PoolingConfig()
+
+    section = config.get(modality_name, {})
+    if section is None:
+        return PoolingConfig()
+    if not isinstance(section, Mapping):
+        raise ValueError(f"`{modality_name}` must be a YAML mapping when provided.")
+
+    pooling = section.get("pooling", {})
+    if pooling is None:
+        return PoolingConfig()
+    if not isinstance(pooling, Mapping):
+        raise ValueError(f"`{modality_name}.pooling` must be a YAML mapping when provided.")
+
+    return PoolingConfig(
+        layers=validate_positive_int(
+            pooling.get("layers", PoolingConfig.layers),
+            f"{modality_name}.pooling.layers",
+        ),
+        heads=validate_optional_positive_int(
+            pooling.get("heads"),
+            f"{modality_name}.pooling.heads",
+        ),
+        mlp_ratio=validate_positive_float(
+            pooling.get("mlp_ratio", PoolingConfig.mlp_ratio),
+            f"{modality_name}.pooling.mlp_ratio",
+        ),
+        position_weight=validate_positive_float(
+            pooling.get("position_weight", PoolingConfig.position_weight),
+            f"{modality_name}.pooling.position_weight",
+        ),
+    )
 
 
 def require_modality_frames(config: Mapping[str, Any]) -> int:
@@ -268,16 +325,31 @@ class LatentQueryPoolingBlock(nn.Module):
 
 
 class TemporalLatentQueryPooling(nn.Module):
-    def __init__(self, dim: int, output_tokens: int) -> None:
+    def __init__(
+        self,
+        dim: int,
+        output_tokens: int,
+        num_layers: int = 2,
+        num_heads: int | None = None,
+        mlp_ratio: float = 4.0,
+        position_weight: float = 1.0,
+    ) -> None:
         super().__init__()
         self.position_encoding = TemporalPositionEncoding(dim)
-        self.pool = LatentQueryPooling(dim=dim, output_tokens=output_tokens)
+        self.position_weight = validate_positive_float(position_weight, "position_weight")
+        self.pool = LatentQueryPooling(
+            dim=dim,
+            output_tokens=output_tokens,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+        )
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError(f"`tokens` must have shape [B, N, dim], got {tuple(tokens.shape)}")
 
-        position_tokens = self.position_encoding(
+        position_tokens = self.position_weight * self.position_encoding(
             num_tokens=tokens.shape[1],
             device=tokens.device,
             dtype=tokens.dtype,

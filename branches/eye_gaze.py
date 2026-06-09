@@ -7,6 +7,7 @@ import torch
 from branches.base import ModalityBranch, ModalityOutput, mlp
 from branches.compression import (
     DEFAULT_SLOT_COUNTS,
+    PoolingConfig,
     TemporalLatentQueryPooling,
     validate_positive_int,
 )
@@ -22,12 +23,21 @@ class EyeGazeBranch(ModalityBranch):
         dim: int,
         slot_count: int = DEFAULT_SLOT_COUNTS["eye_gaze"],
         feature_dim: int = DEFAULT_EYE_GAZE_FEATURE_DIM,
+        pooling_config: PoolingConfig | None = None,
     ):
         super().__init__()
+        pooling = pooling_config or PoolingConfig()
         self.slot_count = validate_positive_int(slot_count, "eye_gaze.slot_count")
         self.feature_dim = validate_positive_int(feature_dim, "eye_gaze.feature_dim")
         self.proj = mlp(self.feature_dim, dim, dim)
-        self.pool = TemporalLatentQueryPooling(dim=dim, output_tokens=self.slot_count)
+        self.pool = TemporalLatentQueryPooling(
+            dim=dim,
+            output_tokens=self.slot_count,
+            num_layers=pooling.layers,
+            num_heads=pooling.heads,
+            mlp_ratio=pooling.mlp_ratio,
+            position_weight=pooling.position_weight,
+        )
 
     def required_keys(self) -> tuple[str, ...]:
         return ("eye_gaze",)
