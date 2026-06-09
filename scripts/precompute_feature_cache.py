@@ -171,8 +171,20 @@ def rebase_manifest_examples(
     rebased: list[VideoExample] = []
     for example in examples:
         path = example.path
-        if not path.exists() and example.metadata_filename:
-            path = video_root / example.class_name / example.metadata_filename
+        if not path.exists():
+            parts = path.parts
+            candidates: list[Path] = []
+            if "videos" in parts:
+                videos_index = parts.index("videos")
+                candidates.append(video_root / Path(*parts[videos_index + 1 :]))
+            if example.metadata_filename:
+                candidates.append(video_root / example.class_name / example.metadata_filename)
+            for candidate in candidates:
+                if candidate.exists():
+                    path = candidate
+                    break
+            else:
+                path = candidates[0] if candidates else path
         rebased.append(
             VideoExample(
                 path=path,
