@@ -152,11 +152,16 @@ def describe_module(module: nn.Module) -> str:
     if isinstance(module, nn.Linear):
         return f"Linear({module.in_features}->{module.out_features})"
     if isinstance(module, TemporalLatentQueryPooling):
+        anomaly = (
+            f", anomaly_top_k={module.anomaly_top_k}"
+            if getattr(module, "anomaly_top_k", 0) > 0
+            else ""
+        )
         return (
             "TemporalLatentQueryPooling("
             f"output_tokens={module.pool.output_tokens}, layers={module.pool.num_layers}, "
             f"heads={module.pool.num_heads}, position=token_plus_bias, "
-            f"position_weight={module.position_weight})"
+            f"position_weight={module.position_weight}{anomaly})"
         )
     if isinstance(module, TemporalPositionEncoding):
         return f"TemporalPositionEncoding(dim={module.dim}, scale=learned)"

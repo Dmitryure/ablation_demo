@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -243,6 +244,36 @@ def safe_name(paths: list[Path], class_filter: str) -> str:
     return f"{names}_{class_filter}" if names else class_filter
 
 
+def binary_auc(records: Sequence[Any]) -> float | None:
+    labels = [int(record.binary_label) for record in records]
+    scores = [float(record.binary_probability) for record in records]
+    positive_count = sum(labels)
+    negative_count = len(labels) - positive_count
+    if positive_count == 0 or negative_count == 0:
+        return None
+
+    pairs = sorted(zip(scores, labels, strict=True), key=lambda item: item[0])
+    rank_sum = 0.0
+    index = 0
+    while index < len(pairs):
+        next_index = index + 1
+        while next_index < len(pairs) and pairs[next_index][0] == pairs[index][0]:
+            next_index += 1
+        average_rank = (index + 1 + next_index) / 2.0
+        rank_sum += average_rank * sum(label for _, label in pairs[index:next_index])
+        index = next_index
+
+    return (rank_sum - positive_count * (positive_count + 1) / 2.0) / (
+        positive_count * negative_count
+    )
+
+
+def format_optional_metric(value: float | None) -> str:
+    if value is None:
+        return "undefined"
+    return f"{value:.4f}"
+
+
 def main() -> None:
     args = parse_args()
     run_config = load_json(args.run_dir / "run_config.json")
@@ -288,6 +319,7 @@ def main() -> None:
 
     output_dir = args.output_dir / safe_name(args.cache_dir, args.class_filter)
     metrics = binary_metrics(records)
+    auc = binary_auc(records)
     summary = prediction_summary(records)
     gen_metrics = generator_metrics(records)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +339,7 @@ def main() -> None:
                 for cache_dir, cache_examples in examples_by_cache.items()
             },
             "binary_metrics": asdict(metrics),
+            "binary_auc": auc,
             "prediction_summary": summary,
             "generator_metrics": gen_metrics,
             "predictions_csv": str(output_dir / "predictions.csv"),
@@ -315,8 +348,15 @@ def main() -> None:
     model.pipeline.close()
     print(
         f"external cache eval: count={len(records)} "
+        f"accuracy={metrics.accuracy:.4f} "
+        f"balanced_accuracy={metrics.balanced_accuracy:.4f} "
+        f"f1={metrics.f1:.4f} "
+        f"auc={format_optional_metric(auc)} "
+        f"precision={metrics.precision:.4f} "
+        f"recall={metrics.recall:.4f} "
         f"specificity={metrics.specificity:.4f} "
         f"false_positive={metrics.false_positive} "
+        f"false_negative={metrics.false_negative} "
         f"output={output_dir}",
         flush=True,
     )

@@ -81,6 +81,14 @@ class PseudoUnknownConfig:
     suppression_weight: float = 0.05
 
 
+@dataclass(frozen=True)
+class ModalityDropoutConfig:
+    enabled: bool = False
+    probability: float = 0.0
+    max_drop: int = 1
+    modalities: tuple[str, ...] = ()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a read-only cached real/fake + fake-generator multitask model."
@@ -162,6 +170,51 @@ def nonnegative_float_value(section: Mapping[str, Any], key: str, default: float
     if result < 0.0:
         raise ValueError(f"`{key}` must be non-negative.")
     return result
+
+
+def probability_config_value(section: Mapping[str, Any], key: str, default: float) -> float:
+    value = nonnegative_float_value(section, key, default)
+    if value > 1.0:
+        raise ValueError(f"`{key}` must be in [0.0, 1.0].")
+    return value
+
+
+def positive_float_value(section: Mapping[str, Any], key: str, default: float) -> float:
+    value = float_value(section, key, default)
+    if value <= 0.0:
+        raise ValueError(f"`training.run.{key}` must be positive.")
+    return value
+
+
+def resolve_modality_dropout_config(
+    run: Mapping[str, Any],
+    enabled_modalities: Sequence[str],
+) -> ModalityDropoutConfig:
+    raw = run.get("modality_dropout", {})
+    if raw is None:
+        return ModalityDropoutConfig()
+    if not isinstance(raw, Mapping):
+        raise ValueError("`training.run.modality_dropout` must be a mapping.")
+    enabled = bool_value(raw, "enabled", False)
+    probability = probability_config_value(raw, "probability", 0.0)
+    max_drop = int_value(raw, "max_drop", 1)
+    if max_drop <= 0:
+        raise ValueError("`training.run.modality_dropout.max_drop` must be positive.")
+    raw_modalities = raw.get("modalities", enabled_modalities)
+    if isinstance(raw_modalities, str) or not isinstance(raw_modalities, Sequence):
+        raise ValueError("`training.run.modality_dropout.modalities` must be a list.")
+    modalities = tuple(str(name) for name in raw_modalities)
+    unknown = sorted(set(modalities) - set(enabled_modalities))
+    if unknown:
+        raise ValueError(
+            f"`training.run.modality_dropout.modalities` has unknown entries: {unknown}"
+        )
+    return ModalityDropoutConfig(
+        enabled=enabled,
+        probability=probability,
+        max_drop=max_drop,
+        modalities=modalities,
+    )
 
 
 def resolve_pseudo_unknown_config(run: Mapping[str, Any]) -> PseudoUnknownConfig:
@@ -560,6 +613,26 @@ def model_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters()).device
 
 
+def apply_modality_dropout(
+    batch: Mapping[str, Any],
+    enabled_modalities: Sequence[str],
+    config: ModalityDropoutConfig,
+    rng: random.Random,
+) -> tuple[Mapping[str, Any], int]:
+    if not config.enabled or config.probability <= 0.0 or len(enabled_modalities) <= 1:
+        return batch, 0
+    if rng.random() >= config.probability:
+        return batch, 0
+
+    candidates = [name for name in config.modalities if name in enabled_modalities]
+    max_drop = min(config.max_drop, len(enabled_modalities) - 1, len(candidates))
+    if max_drop <= 0:
+        return batch, 0
+    drop_count = rng.randint(1, max_drop)
+    dropped = tuple(sorted(rng.sample(candidates, drop_count)))
+    return {**batch, "dropped_modalities": dropped}, drop_count
+
+
 def train_epoch(
     model: GeneratorMultitaskClassifier,
     loader: Any,
@@ -568,25 +641,42 @@ def train_epoch(
     target: GeneratorTargetSpec,
     binary_weight: float,
     generator_weight: float,
+    auxiliary_binary_weight: float = 0.0,
     binary_margin_weight: float = 0.0,
     real_probability_margin: float = 0.20,
     fake_probability_margin: float = 0.80,
     real_generator_suppression_weight: float = 0.0,
     pseudo_unknown_group: str | None = None,
     pseudo_unknown_suppression_weight: float = 0.0,
+    contrastive_weight: float = 0.0,
+    contrastive_temperature: float = 0.20,
+    modality_dropout_config: ModalityDropoutConfig | None = None,
+    enabled_modalities: Sequence[str] = (),
+    dropout_seed: int = 0,
 ) -> dict[str, float]:
     device = model_device(model)
     model.train()
+    rng = random.Random(dropout_seed)
+    resolved_modality_dropout = modality_dropout_config or ModalityDropoutConfig()
     total_loss = 0.0
     total_binary_loss = 0.0
     total_binary_margin_loss = 0.0
+    total_auxiliary_binary_loss = 0.0
+    total_contrastive_loss = 0.0
     total_generator_loss = 0.0
     total_real_generator_suppression_loss = 0.0
     total_pseudo_unknown_suppression_loss = 0.0
+    total_modality_drop_count = 0
     total_count = 0
     start = time.perf_counter()
     for batch in loader:
         optimizer.zero_grad(set_to_none=True)
+        batch, modality_drop_count = apply_modality_dropout(
+            batch=batch,
+            enabled_modalities=enabled_modalities,
+            config=resolved_modality_dropout,
+            rng=rng,
+        )
         labels = binary_labels_for_batch(batch, device)
         fake_indices, generator_labels = generator_labels_for_batch(batch, target, device)
         output = model(move_tensor_batch_to_device(batch, device))
@@ -619,6 +709,13 @@ def train_epoch(
             binary_weight=binary_weight,
             generator_weight=generator_weight,
             generator_loss=generator_loss,
+            auxiliary_binary_logits=output.diagnostics.get("binary_modality_expert_logits")
+            if hasattr(output, "diagnostics")
+            else None,
+            modality_valid_mask=output.diagnostics.get("modality_valid_mask")
+            if hasattr(output, "diagnostics")
+            else None,
+            auxiliary_binary_weight=auxiliary_binary_weight,
             binary_margin_weight=binary_margin_weight,
             real_probability_margin=real_probability_margin,
             fake_probability_margin=fake_probability_margin,
@@ -628,6 +725,9 @@ def train_epoch(
                 0, pseudo_unknown_indices
             ),
             pseudo_unknown_suppression_weight=pseudo_unknown_suppression_weight,
+            contrastive_embeddings=output.fusion.cls_token,
+            contrastive_weight=contrastive_weight,
+            contrastive_temperature=contrastive_temperature,
         )
         loss.backward()
         optimizer.step()
@@ -636,19 +736,25 @@ def train_epoch(
         total_loss += parts["loss"] * count
         total_binary_loss += parts["binary_loss"] * count
         total_binary_margin_loss += parts["binary_margin_loss"] * count
+        total_auxiliary_binary_loss += parts["auxiliary_binary_loss"] * count
+        total_contrastive_loss += parts["contrastive_loss"] * count
         total_generator_loss += parts["generator_loss"] * count
         total_real_generator_suppression_loss += parts["real_generator_suppression_loss"] * count
         total_pseudo_unknown_suppression_loss += parts["pseudo_unknown_suppression_loss"] * count
+        total_modality_drop_count += modality_drop_count
     elapsed = time.perf_counter() - start
     return {
         "loss": total_loss / max(1, total_count),
         "binary_loss": total_binary_loss / max(1, total_count),
         "binary_margin_loss": total_binary_margin_loss / max(1, total_count),
+        "auxiliary_binary_loss": total_auxiliary_binary_loss / max(1, total_count),
+        "contrastive_loss": total_contrastive_loss / max(1, total_count),
         "generator_loss": total_generator_loss / max(1, total_count),
         "real_generator_suppression_loss": total_real_generator_suppression_loss
         / max(1, total_count),
         "pseudo_unknown_suppression_loss": total_pseudo_unknown_suppression_loss
         / max(1, total_count),
+        "modality_drop_count": total_modality_drop_count,
         "elapsed_seconds": elapsed,
     }
 
@@ -981,6 +1087,9 @@ def main() -> None:
     train_fake_group_cap = int_value(run, "train_fake_group_cap", 500)
     binary_weight = float_value(run, "binary_loss_weight", 1.0)
     generator_weight = float_value(run, "generator_loss_weight", 0.5)
+    auxiliary_binary_weight = nonnegative_float_value(run, "auxiliary_binary_loss_weight", 0.0)
+    contrastive_weight = nonnegative_float_value(run, "contrastive_loss_weight", 0.0)
+    contrastive_temperature = positive_float_value(run, "contrastive_temperature", 0.20)
     binary_warmup_epochs = int_value(run, "binary_warmup_epochs", 0)
     generator_ramp_epochs = int_value(run, "generator_ramp_epochs", 0)
     if generator_ramp_epochs < 0:
@@ -996,6 +1105,7 @@ def main() -> None:
     generator_loss_type = str(run.get("generator_loss", "class_balanced_focal"))
     focal_beta = float_value(run, "focal_beta", 0.999)
     focal_gamma = float_value(run, "focal_gamma", 2.0)
+    modality_dropout_config = resolve_modality_dropout_config(run, modalities)
     pseudo_unknown_config = resolve_pseudo_unknown_config(run)
     real_generator_suppression_weight = nonnegative_float_value(
         run,
@@ -1081,6 +1191,17 @@ def main() -> None:
             "weight": binary_margin_weight,
             "real_probability_margin": real_probability_margin,
             "fake_probability_margin": fake_probability_margin,
+        },
+        "auxiliary_binary_loss_weight": auxiliary_binary_weight,
+        "contrastive": {
+            "weight": contrastive_weight,
+            "temperature": contrastive_temperature,
+        },
+        "modality_dropout": {
+            "enabled": modality_dropout_config.enabled,
+            "probability": modality_dropout_config.probability,
+            "max_drop": modality_dropout_config.max_drop,
+            "modalities": list(modality_dropout_config.modalities),
         },
         "generator_schedule": {
             "target_weight": generator_weight,
@@ -1170,12 +1291,18 @@ def main() -> None:
             target=target,
             binary_weight=binary_weight,
             generator_weight=current_generator_weight,
+            auxiliary_binary_weight=auxiliary_binary_weight,
             binary_margin_weight=binary_margin_weight,
             real_probability_margin=real_probability_margin,
             fake_probability_margin=fake_probability_margin,
             real_generator_suppression_weight=current_real_suppression_weight,
             pseudo_unknown_group=pseudo_unknown_group,
             pseudo_unknown_suppression_weight=current_pseudo_unknown_suppression_weight,
+            contrastive_weight=contrastive_weight,
+            contrastive_temperature=contrastive_temperature,
+            modality_dropout_config=modality_dropout_config,
+            enabled_modalities=modalities,
+            dropout_seed=seed + epoch,
         )
         val_records = predict(model, loaders["val"], target, split="val")
         val_binary = binary_metrics(val_records)
@@ -1247,6 +1374,9 @@ def main() -> None:
         write_epoch_metrics(output_dir / "metrics.csv", epoch_rows)
         print(
             f"epoch={epoch}/{epochs} loss={train_result['loss']:.4f} "
+            f"aux_bin={train_result['auxiliary_binary_loss']:.4f} "
+            f"contrastive={train_result['contrastive_loss']:.4f} "
+            f"mod_drop={int(train_result['modality_drop_count'])} "
             f"val_binary_bal_acc={val_binary.balanced_accuracy:.4f} "
             f"val_pred_fake_rate={float(val_prediction_summary['binary_predicted_fake_rate']):.4f} "
             f"val_real_p={float(val_prediction_summary['real_binary_probability_mean']):.4f} "

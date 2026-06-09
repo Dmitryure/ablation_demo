@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 
 from branches import ModalityBranch, ModalityOutput
-from branches.compression import DEFAULT_SLOT_COUNTS, validate_branch_token_config
+from branches.compression import (
+    DEFAULT_SLOT_COUNTS,
+    TemporalLatentQueryPooling,
+    top_k_anomaly_tokens,
+    validate_branch_token_config,
+)
 from encoders import FAUEncoder, RGBEncoder, RPPGEncoder, build_local_encoders
 from extractors import (
     EYE_GAZE_COLUMNS,
@@ -202,6 +207,7 @@ class RegistryTest(unittest.TestCase):
                         "heads": 4,
                         "mlp_ratio": 2.0,
                         "position_weight": 1.75,
+                        "anomaly_top_k": 2,
                     }
                 },
                 "depth": {
@@ -226,12 +232,43 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(registry["rgb"].pool.pool.num_layers, 1)
         self.assertEqual(registry["rgb"].pool.pool.num_heads, 4)
         self.assertEqual(registry["rgb"].pool.position_weight, 1.75)
+        self.assertEqual(registry["rgb"].pool.anomaly_top_k, 2)
         self.assertEqual(registry["depth"].pool.pool.num_layers, 3)
         self.assertEqual(registry["depth"].pool.pool.num_heads, 2)
         self.assertEqual(registry["depth"].pool.position_weight, 1.25)
         self.assertEqual(registry["face_mesh"].point_pool.num_layers, 2)
         self.assertEqual(registry["face_mesh"].clip_pool.pool.num_heads, 4)
         self.assertEqual(registry["face_mesh"].clip_pool.position_weight, 1.5)
+
+    def test_top_k_anomaly_tokens_selects_largest_centered_outliers_in_time_order(self):
+        tokens = torch.tensor(
+            [
+                [
+                    [0.0, 0.0],
+                    [10.0, 0.0],
+                    [0.0, 0.0],
+                    [0.0, -9.0],
+                ]
+            ]
+        )
+
+        selected = top_k_anomaly_tokens(tokens, top_k=2)
+
+        self.assertTrue(torch.equal(selected, tokens[:, [1, 3], :]))
+
+    def test_temporal_pooling_with_anomaly_tokens_preserves_output_count(self):
+        torch.manual_seed(0)
+        pooling = TemporalLatentQueryPooling(
+            dim=8,
+            output_tokens=4,
+            num_layers=1,
+            num_heads=2,
+            anomaly_top_k=2,
+        )
+
+        output = pooling(torch.randn(2, 6, 8))
+
+        self.assertEqual(tuple(output.shape), (2, 4, 8))
 
     def test_registry_required_keys_for_video_modalities(self):
         registry = build_registry(dim=32)

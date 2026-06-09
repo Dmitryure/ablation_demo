@@ -34,6 +34,7 @@ class RGBBranch(ModalityBranch):
             num_heads=pooling.heads,
             mlp_ratio=pooling.mlp_ratio,
             position_weight=pooling.position_weight,
+            anomaly_top_k=pooling.anomaly_top_k,
         )
 
     def required_keys(self) -> tuple[str, ...]:

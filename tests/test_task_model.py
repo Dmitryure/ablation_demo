@@ -210,6 +210,7 @@ class TaskModelTest(unittest.TestCase):
         self.assertEqual(tuple(generator_logits.shape), (2, 3))
         self.assertEqual(tuple(diagnostics["binary_modality_gate_weights"].shape), (2, 2))
         self.assertEqual(tuple(diagnostics["generator_modality_gate_weights"].shape), (2, 2))
+        self.assertEqual(tuple(diagnostics["binary_modality_expert_logits"].shape), (2, 2))
         self.assertTrue(
             torch.allclose(
                 diagnostics["modality_gate_weights"],

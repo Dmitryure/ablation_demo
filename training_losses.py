@@ -131,6 +131,76 @@ def binary_probability_margin_loss(
     return real_loss + fake_loss
 
 
+def auxiliary_modality_binary_loss(
+    auxiliary_logits: torch.Tensor | None,
+    binary_labels: torch.Tensor,
+    modality_valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if auxiliary_logits is None:
+        return binary_labels.sum() * 0.0
+    if auxiliary_logits.ndim != 2:
+        raise ValueError(
+            "`auxiliary_logits` must have shape [batch, modalities], "
+            f"got {tuple(auxiliary_logits.shape)}."
+        )
+    labels = binary_labels.view(-1, 1).to(
+        device=auxiliary_logits.device, dtype=auxiliary_logits.dtype
+    )
+    if labels.shape[0] != auxiliary_logits.shape[0]:
+        raise ValueError("`binary_labels` batch size must match `auxiliary_logits`.")
+    losses = F.binary_cross_entropy_with_logits(
+        auxiliary_logits,
+        labels.expand_as(auxiliary_logits),
+        reduction="none",
+    )
+    if modality_valid_mask is None:
+        return losses.mean()
+    if modality_valid_mask.ndim != 1 or modality_valid_mask.shape[0] != auxiliary_logits.shape[1]:
+        raise ValueError("`modality_valid_mask` must have shape [modalities].")
+    valid = modality_valid_mask.to(device=auxiliary_logits.device, dtype=torch.bool).view(1, -1)
+    if not torch.any(valid):
+        return auxiliary_logits.sum() * 0.0
+    return losses.masked_select(valid.expand_as(losses)).mean()
+
+
+def supervised_binary_contrastive_loss(
+    embeddings: torch.Tensor | None,
+    binary_labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    if embeddings is None:
+        return binary_labels.sum() * 0.0
+    if temperature <= 0.0:
+        raise ValueError("`temperature` must be positive.")
+    if embeddings.ndim != 2:
+        raise ValueError(
+            f"`embeddings` must have shape [batch, dim], got {tuple(embeddings.shape)}"
+        )
+
+    labels = binary_labels.view(-1).to(device=embeddings.device)
+    if labels.shape[0] != embeddings.shape[0]:
+        raise ValueError("`binary_labels` batch size must match `embeddings`.")
+    if embeddings.shape[0] < 2:
+        return embeddings.sum() * 0.0
+
+    normalized = F.normalize(embeddings, dim=1)
+    logits = torch.matmul(normalized, normalized.transpose(0, 1)) / temperature
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+    self_mask = torch.eye(logits.shape[0], dtype=torch.bool, device=logits.device)
+    positive_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask
+    valid_anchor_mask = positive_mask.any(dim=1)
+    if not torch.any(valid_anchor_mask):
+        return embeddings.sum() * 0.0
+
+    logits = logits.masked_fill(self_mask, torch.finfo(logits.dtype).min)
+    log_probabilities = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    positive_counts = positive_mask.sum(dim=1).clamp_min(1)
+    mean_positive_log_probability = (
+        log_probabilities.masked_fill(~positive_mask, 0.0).sum(dim=1) / positive_counts
+    )
+    return -mean_positive_log_probability[valid_anchor_mask].mean()
+
+
 def multitask_loss(
     binary_logits: torch.Tensor,
     binary_labels: torch.Tensor,
@@ -146,6 +216,12 @@ def multitask_loss(
     binary_margin_weight: float = 0.0,
     real_probability_margin: float = 0.20,
     fake_probability_margin: float = 0.80,
+    auxiliary_binary_logits: torch.Tensor | None = None,
+    modality_valid_mask: torch.Tensor | None = None,
+    auxiliary_binary_weight: float = 0.0,
+    contrastive_embeddings: torch.Tensor | None = None,
+    contrastive_weight: float = 0.0,
+    contrastive_temperature: float = 0.20,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     binary = F.binary_cross_entropy_with_logits(binary_logits, binary_labels)
     binary_margin = (
@@ -169,16 +245,38 @@ def multitask_loss(
         if pseudo_unknown_generator_logits is not None and pseudo_unknown_suppression_weight > 0.0
         else binary_logits.sum() * 0.0
     )
+    auxiliary_binary = (
+        auxiliary_modality_binary_loss(
+            auxiliary_logits=auxiliary_binary_logits,
+            binary_labels=binary_labels,
+            modality_valid_mask=modality_valid_mask,
+        )
+        if auxiliary_binary_weight > 0.0
+        else binary_logits.sum() * 0.0
+    )
+    contrastive = (
+        supervised_binary_contrastive_loss(
+            embeddings=contrastive_embeddings,
+            binary_labels=binary_labels,
+            temperature=contrastive_temperature,
+        )
+        if contrastive_weight > 0.0
+        else binary_logits.sum() * 0.0
+    )
     total = (
         binary_weight * binary
         + binary_margin_weight * binary_margin
         + generator_weight * generator
         + real_generator_suppression_weight * real_generator_suppression
         + pseudo_unknown_suppression_weight * pseudo_unknown_suppression
+        + auxiliary_binary_weight * auxiliary_binary
+        + contrastive_weight * contrastive
     )
     return total, {
         "binary_loss": float(binary.detach().item()),
         "binary_margin_loss": float(binary_margin.detach().item()),
+        "auxiliary_binary_loss": float(auxiliary_binary.detach().item()),
+        "contrastive_loss": float(contrastive.detach().item()),
         "generator_loss": float(generator.detach().item()),
         "real_generator_suppression_loss": float(real_generator_suppression.detach().item()),
         "pseudo_unknown_suppression_loss": float(pseudo_unknown_suppression.detach().item()),

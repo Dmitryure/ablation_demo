@@ -39,6 +39,7 @@ class PoolingConfig:
     heads: int | None = None
     mlp_ratio: float = 4.0
     position_weight: float = 1.0
+    anomaly_top_k: int = 0
 
 
 def validate_positive_int(value: int, field_name: str) -> int:
@@ -51,6 +52,12 @@ def validate_optional_positive_int(value: Any, field_name: str) -> int | None:
     if value is None:
         return None
     return validate_positive_int(value, field_name)
+
+
+def validate_nonnegative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"`{field_name}` must be a non-negative integer.")
+    return value
 
 
 def validate_positive_float(value: Any, field_name: str) -> float:
@@ -112,6 +119,10 @@ def resolve_pooling_config(config: Mapping[str, Any] | None, modality_name: str)
         position_weight=validate_positive_float(
             pooling.get("position_weight", PoolingConfig.position_weight),
             f"{modality_name}.pooling.position_weight",
+        ),
+        anomaly_top_k=validate_nonnegative_int(
+            pooling.get("anomaly_top_k", PoolingConfig.anomaly_top_k),
+            f"{modality_name}.pooling.anomaly_top_k",
         ),
     )
 
@@ -333,10 +344,15 @@ class TemporalLatentQueryPooling(nn.Module):
         num_heads: int | None = None,
         mlp_ratio: float = 4.0,
         position_weight: float = 1.0,
+        anomaly_top_k: int = 0,
     ) -> None:
         super().__init__()
+        if anomaly_top_k > output_tokens:
+            raise ValueError("`anomaly_top_k` cannot exceed `output_tokens`.")
         self.position_encoding = TemporalPositionEncoding(dim)
         self.position_weight = validate_positive_float(position_weight, "position_weight")
+        self.anomaly_top_k = validate_nonnegative_int(anomaly_top_k, "anomaly_top_k")
+        self.anomaly_norm = nn.LayerNorm(dim)
         self.pool = LatentQueryPooling(
             dim=dim,
             output_tokens=output_tokens,
@@ -360,4 +376,30 @@ class TemporalLatentQueryPooling(nn.Module):
             self.pool.dim
         )
         attention_bias = attention_bias.unsqueeze(0).expand(tokens.shape[0], -1, -1)
-        return self.pool(position_aware_tokens, attention_bias=attention_bias)
+        pooled_tokens = self.pool(position_aware_tokens, attention_bias=attention_bias)
+        if self.anomaly_top_k <= 0:
+            return pooled_tokens
+
+        anomaly_tokens = self.anomaly_norm(
+            top_k_anomaly_tokens(position_aware_tokens, self.anomaly_top_k)
+        )
+        pooled_keep = pooled_tokens.shape[1] - self.anomaly_top_k
+        if pooled_keep <= 0:
+            return anomaly_tokens
+        return torch.cat([pooled_tokens[:, :pooled_keep, :], anomaly_tokens], dim=1)
+
+
+def top_k_anomaly_tokens(tokens: torch.Tensor, top_k: int) -> torch.Tensor:
+    if tokens.ndim != 3:
+        raise ValueError(f"`tokens` must have shape [B, N, dim], got {tuple(tokens.shape)}")
+    if top_k <= 0:
+        return tokens[:, :0, :]
+    if top_k > tokens.shape[1]:
+        raise ValueError("`top_k` cannot exceed the number of input tokens.")
+
+    centered = tokens - tokens.mean(dim=1, keepdim=True)
+    scores = centered.square().mean(dim=-1)
+    top_indices = torch.topk(scores, k=top_k, dim=1, sorted=False).indices
+    top_indices = torch.sort(top_indices, dim=1).values
+    gather_indices = top_indices.unsqueeze(-1).expand(-1, -1, tokens.shape[-1])
+    return torch.gather(tokens, dim=1, index=gather_indices)
