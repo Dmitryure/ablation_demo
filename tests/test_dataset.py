@@ -33,6 +33,7 @@ from dataset import (
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
 from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.rgb import RGBExtractor
+from frame_sampling import resolve_frame_sampling_config, sample_frame_indices
 from scripts.run_iterative_cached_ablation import split_examples as split_training_examples
 
 
@@ -405,6 +406,21 @@ class DatasetTest(unittest.TestCase):
 
         self.assertEqual(tuple(output["rgb_features"].shape), (2, 8, 12))
 
+    def test_rgb_extractor_chunks_long_clips_for_fixed_temporal_encoder(self):
+        class ChunkedRGBEncoder(torch.nn.Module):
+            temporal_size = 2
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                values = x.mean(dim=(1, 2, 3, 4), keepdim=False).view(-1, 1, 1)
+                return values.expand(-1, 3, 4)
+
+        extractor = RGBExtractor(ChunkedRGBEncoder(), image_size=4)
+        clip = [np.full((4, 4, 3), index, dtype=np.uint8) for index in range(6)]
+
+        output = extractor.extract({"video_rgb_frames": [clip]})
+
+        self.assertEqual(tuple(output["rgb_features"].shape), (1, 9, 4))
+
     def test_eye_gaze_extractor_supports_batched_clip_sequences(self):
         extractor = EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector)
         clip = [np.zeros((6, 6, 3), dtype=np.uint8) for _ in range(4)]
@@ -517,6 +533,28 @@ class DatasetTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "need at least 8"):
             sample_contiguous_center_indices(total_frames=7, num_frames=8)
+
+    def test_center_stride_sampler_uses_middle_window_and_repeat_pads_short_video(self):
+        config = resolve_frame_sampling_config(
+            {
+                "frame_sampling": {
+                    "name": "center_stride",
+                    "output_frames": 96,
+                    "source_window_frames": 192,
+                    "stride": 2,
+                    "short_video": "repeat_pad",
+                }
+            }
+        )
+
+        self.assertEqual(sample_frame_indices(300, 96, config)[:4], [54, 56, 58, 60])
+        self.assertEqual(sample_frame_indices(300, 96, config)[-1], 244)
+
+        short = sample_frame_indices(5, 96, config)
+
+        self.assertEqual(short[:3], [0, 2, 4])
+        self.assertEqual(len(short), 96)
+        self.assertEqual(short[-1], 4)
 
     def test_rppg_diff_normalized_preserves_shape_and_matches_formula(self):
         video = torch.tensor(

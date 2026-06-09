@@ -1664,7 +1664,7 @@ def batch_generator_ids(batch: Mapping[str, Any]) -> tuple[str, ...]:
     if len(generator_ids) != len(class_names):
         generator_ids = tuple("" for _ in class_names)
     resolved: list[str] = []
-    for class_name, generator_id in zip(class_names, generator_ids):
+    for class_name, generator_id in zip(class_names, generator_ids, strict=True):
         if class_name == "real":
             resolved.append("real")
         else:
@@ -1683,7 +1683,7 @@ def fake_generator_sample_weights(
     generator_ids = batch_generator_ids(batch)
     values = [
         float(weights.get(generator_id, 1.0)) if class_name == "fake" else 1.0
-        for class_name, generator_id in zip(class_names, generator_ids)
+        for class_name, generator_id in zip(class_names, generator_ids, strict=True)
     ]
     return torch.tensor(values, dtype=torch.float32, device=device).view(-1, 1)
 
@@ -2910,11 +2910,18 @@ def chunk_examples(
 def group_modalities_by_clip_spec(
     modalities: Sequence[str],
     specs: Mapping[str, FeatureCacheSpec],
-) -> dict[tuple[int, int, str | None], tuple[str, ...]]:
-    grouped: dict[tuple[int, int, str | None], list[str]] = defaultdict(list)
+) -> dict[tuple[int, int, str | None, str | None], tuple[str, ...]]:
+    grouped: dict[tuple[int, int, str | None, str | None], list[str]] = defaultdict(list)
     for modality in modalities:
         spec = specs[modality]
-        grouped[(spec.frame_count, spec.image_size, spec.cache_variant)].append(modality)
+        grouped[
+            (
+                spec.frame_count,
+                spec.image_size,
+                spec.cache_variant,
+                spec.frame_sampling_variant,
+            )
+        ].append(modality)
     return {key: tuple(value) for key, value in grouped.items()}
 
 
@@ -2922,23 +2929,25 @@ def extraction_modality_groups(
     modalities: Sequence[str],
     specs: Mapping[str, FeatureCacheSpec],
     group_by_modality: bool = False,
-) -> list[tuple[int, int, str | None, tuple[str, ...]]]:
+) -> list[tuple[int, int, str | None, str | None, tuple[str, ...]]]:
     if group_by_modality:
         return [
             (
                 specs[modality].frame_count,
                 specs[modality].image_size,
                 specs[modality].cache_variant,
+                specs[modality].frame_sampling_variant,
                 (modality,),
             )
             for modality in modalities
         ]
     return [
-        (frame_count, image_size, cache_variant, group_modalities)
+        (frame_count, image_size, cache_variant, frame_sampling_variant, group_modalities)
         for (
             frame_count,
             image_size,
             cache_variant,
+            frame_sampling_variant,
         ), group_modalities in group_modalities_by_clip_spec(modalities, specs).items()
     ]
 
@@ -3465,11 +3474,13 @@ def cache_missing_feature_groups(
         active_modalities = [
             modality for modality in modalities if missing_by_modality.get(modality)
         ]
-        for frame_count, image_size, _cache_variant, group_modalities in extraction_modality_groups(
-            active_modalities,
-            specs,
-            group_by_modality=group_by_modality,
-        ):
+        for (
+            frame_count,
+            image_size,
+            _cache_variant,
+            _frame_sampling_variant,
+            group_modalities,
+        ) in extraction_modality_groups(active_modalities, specs, group_by_modality=group_by_modality):
             group_examples = examples_missing_any_modality(
                 examples=examples,
                 modalities=group_modalities,

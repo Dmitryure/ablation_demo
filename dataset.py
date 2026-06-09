@@ -25,6 +25,11 @@ from face_crop_config import (
     face_crop_cache_variant,
     merged_face_crop_config,
 )
+from frame_sampling import (
+    frame_sampling_cache_variant,
+    resolve_frame_sampling_config,
+    sample_frame_indices,
+)
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
@@ -926,6 +931,7 @@ def load_video_clip(
     image_size: int = 224,
     decode_mode: str = "scan",
     face_crop_config: Mapping[str, Any] | None = None,
+    frame_sampling: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if decode_mode not in VIDEO_DECODE_MODES:
         raise ValueError(f"`decode_mode` must be one of {VIDEO_DECODE_MODES}, got {decode_mode!r}")
@@ -938,12 +944,10 @@ def load_video_clip(
     fps = float(cap.get(cv2.CAP_PROP_FPS))
     if not math.isfinite(fps) or fps <= 0.0:
         fps = RPPG_DEFAULT_FPS
-    if total_frames < num_frames:
-        cap.release()
-        raise RuntimeError(f"Video has only {total_frames} frames, need at least {num_frames}")
-
-    indices = (
-        torch.linspace(0, total_frames - 1, steps=num_frames).round().to(dtype=torch.int64).tolist()
+    indices = sample_frame_indices(
+        total_frames=total_frames,
+        num_frames=num_frames,
+        frame_sampling=frame_sampling,
     )
     rgb_frames: list[np.ndarray] = []
 
@@ -958,7 +962,9 @@ def load_video_clip(
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             rgb_frames.append(frame)
     else:
-        target_by_frame = {int(frame_index): target for target, frame_index in enumerate(indices)}
+        target_by_frame: dict[int, list[int]] = defaultdict(list)
+        for target, frame_index in enumerate(indices):
+            target_by_frame[int(frame_index)].append(target)
         selected_frames: list[np.ndarray | None] = [None] * len(indices)
         max_frame_index = int(indices[-1])
         for frame_index in range(max_frame_index + 1):
@@ -966,8 +972,8 @@ def load_video_clip(
             if not ok:
                 cap.release()
                 raise RuntimeError(f"Failed to read frame {frame_index} from {clip_path}")
-            target = target_by_frame.get(frame_index)
-            if target is not None:
+            targets = target_by_frame.get(frame_index, ())
+            for target in targets:
                 selected_frames[target] = frame
         for target, frame in enumerate(selected_frames):
             if frame is None:
@@ -1254,18 +1260,22 @@ def video_clip_cache_item_path(
     num_frames: int,
     image_size: int,
     cache_variant: str | None = None,
+    frame_sampling_variant: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> Path:
     filename = metadata_filename_for_example(example, dataset_root)
+    root = Path(cache_dir)
+    if frame_sampling_variant is not None:
+        root = root / frame_sampling_variant
     if cache_variant is None:
         return (
-            Path(cache_dir)
+            root
             / f"frames_{int(num_frames)}_size_{int(image_size)}"
             / example.class_name
             / f"{filename}.pt"
         )
     return (
-        Path(cache_dir)
+        root
         / cache_variant
         / f"frames_{int(num_frames)}_size_{int(image_size)}"
         / example.class_name
@@ -1295,6 +1305,7 @@ def _video_clip_cache_header(
     num_frames: int,
     image_size: int,
     cache_variant: str | None = None,
+    frame_sampling_variant: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> dict[str, Any]:
     header = {
@@ -1306,6 +1317,8 @@ def _video_clip_cache_header(
     }
     if cache_variant is not None:
         header["cache_variant"] = cache_variant
+    if frame_sampling_variant is not None:
+        header["frame_sampling_variant"] = frame_sampling_variant
     return header
 
 
@@ -1315,6 +1328,7 @@ def _video_clip_cache_matches(
     num_frames: int,
     image_size: int,
     cache_variant: str | None = None,
+    frame_sampling_variant: str | None = None,
     dataset_root: str | Path | None = None,
 ) -> bool:
     expected = _video_clip_cache_header(
@@ -1322,6 +1336,7 @@ def _video_clip_cache_matches(
         num_frames,
         image_size,
         cache_variant,
+        frame_sampling_variant,
         dataset_root,
     )
     return all(payload.get(key) == value for key, value in expected.items())
@@ -1361,16 +1376,22 @@ def load_video_clip_for_example(
     decode_mode: str = "scan",
     face_crop_config: Mapping[str, Any] | None = None,
     cache_variant: str | None = None,
+    frame_sampling: Mapping[str, Any] | None = None,
+    frame_sampling_variant: str | None = None,
     clip_cache_dir: str | Path | None = None,
     dataset_root: str | Path | None = None,
 ) -> dict[str, Any]:
     if clip_cache_dir is None:
+        kwargs: dict[str, Any] = {}
+        if frame_sampling is not None:
+            kwargs["frame_sampling"] = frame_sampling
         return load_video_clip(
             path=example.path,
             num_frames=num_frames,
             image_size=image_size,
             decode_mode=decode_mode,
             face_crop_config=face_crop_config,
+            **kwargs,
         )
 
     cache_path = video_clip_cache_item_path(
@@ -1379,6 +1400,7 @@ def load_video_clip_for_example(
         num_frames=num_frames,
         image_size=image_size,
         cache_variant=cache_variant,
+        frame_sampling_variant=frame_sampling_variant,
         dataset_root=dataset_root,
     )
     if cache_path.exists():
@@ -1389,6 +1411,7 @@ def load_video_clip_for_example(
             num_frames=num_frames,
             image_size=image_size,
             cache_variant=cache_variant,
+            frame_sampling_variant=frame_sampling_variant,
             dataset_root=dataset_root,
         ):
             video = payload.get("video")
@@ -1410,6 +1433,7 @@ def load_video_clip_for_example(
         image_size=image_size,
         decode_mode=decode_mode,
         face_crop_config=face_crop_config,
+        frame_sampling=frame_sampling,
     )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
@@ -1420,6 +1444,7 @@ def load_video_clip_for_example(
                 num_frames,
                 image_size,
                 cache_variant,
+                frame_sampling_variant,
                 dataset_root,
             ),
             "video": clip["video"].detach().cpu(),
@@ -1543,11 +1568,15 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
         example = self.examples[index]
         if self.frame_counts_by_modality is None:
             load_start = time.perf_counter()
+            frame_sampling = resolve_frame_sampling_config(self.global_config)
+            frame_sampling_variant = frame_sampling_cache_variant(self.global_config)
             clip = load_video_clip_for_example(
                 example=example,
                 num_frames=int(self.num_frames),
                 image_size=self.image_size,
                 decode_mode=self.decode_mode,
+                frame_sampling=frame_sampling,
+                frame_sampling_variant=frame_sampling_variant,
                 clip_cache_dir=self.clip_cache_dir,
                 dataset_root=self.dataset_root,
             )
@@ -1562,8 +1591,8 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
             rppg_face_crop_status_by_modality = None
             load_timings_by_modality = {"default": load_seconds}
         else:
-            clips_by_spec: dict[tuple[str, int, int], dict[str, Any]] = {}
-            load_seconds_by_spec: dict[tuple[str, int, int], float] = {}
+            clips_by_spec: dict[tuple[str, int, int, str | None, str | None], dict[str, Any]] = {}
+            load_seconds_by_spec: dict[tuple[str, int, int, str | None, str | None], float] = {}
             video_by_modality = {}
             video_rgb_frames_by_modality = {}
             video_fps_by_modality = {}
@@ -1577,9 +1606,19 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                     loader_kind = "rppg"
                     cache_variant = RPPG_CACHE_VARIANT
                     face_crop_config = None
+                    frame_sampling = None
+                    frame_sampling_variant = None
                 else:
                     loader_kind = "default"
                     modality_config = self.modality_configs.get(modality_name, {})
+                    frame_sampling = resolve_frame_sampling_config(
+                        self.global_config,
+                        modality_config,
+                    )
+                    frame_sampling_variant = frame_sampling_cache_variant(
+                        self.global_config,
+                        modality_config,
+                    )
                     face_crop_config = merged_face_crop_config(
                         global_config=self.global_config,
                         modality_config=modality_config,
@@ -1590,7 +1629,13 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                         modality_config=modality_config,
                         default_enabled=False,
                     )
-                clip_key = (loader_kind, int(frame_count), modality_image_size, cache_variant)
+                clip_key = (
+                    loader_kind,
+                    int(frame_count),
+                    modality_image_size,
+                    cache_variant,
+                    frame_sampling_variant,
+                )
                 if clip_key not in clips_by_spec:
                     load_start = time.perf_counter()
                     if modality_name == "rppg":
@@ -1612,6 +1657,8 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                             if cache_variant is not None
                             else None,
                             cache_variant=cache_variant,
+                            frame_sampling=frame_sampling,
+                            frame_sampling_variant=frame_sampling_variant,
                             clip_cache_dir=self.clip_cache_dir,
                             dataset_root=self.dataset_root,
                         )
@@ -1648,6 +1695,12 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                             modality_config=self.modality_configs.get(modality_name, {}),
                             default_enabled=False,
                         ),
+                        None
+                        if modality_name == "rppg"
+                        else frame_sampling_cache_variant(
+                            global_config=self.global_config,
+                            modality_config=self.modality_configs.get(modality_name, {}),
+                        ),
                     )
                     == clip_key
                 )
@@ -1666,6 +1719,12 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                             modality_config=self.modality_configs.get(modality_name, {}),
                             default_enabled=False,
                         ),
+                        None
+                        if modality_name == "rppg"
+                        else frame_sampling_cache_variant(
+                            global_config=self.global_config,
+                            modality_config=self.modality_configs.get(modality_name, {}),
+                        ),
                     )
                 ]
                 / count_usage[
@@ -1679,6 +1738,12 @@ class LabeledVideoDataset(Dataset[dict[str, Any]]):
                             global_config=self.global_config,
                             modality_config=self.modality_configs.get(modality_name, {}),
                             default_enabled=False,
+                        ),
+                        None
+                        if modality_name == "rppg"
+                        else frame_sampling_cache_variant(
+                            global_config=self.global_config,
+                            modality_config=self.modality_configs.get(modality_name, {}),
                         ),
                     )
                 ]

@@ -16,7 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset import build_real_fake_examples, format_split_audit, summarize_examples
+from dataset import (
+    VideoExample,
+    build_real_fake_examples,
+    format_split_audit,
+    load_dataset_manifest,
+    summarize_examples,
+)
 from feature_cache import (
     build_feature_cache_specs,
     feature_cache_item_exists,
@@ -30,6 +36,7 @@ from scripts.run_iterative_cached_ablation import (
     read_failure_keys,
     resolve_base_modalities,
     resolve_video_root,
+    training_run_section,
     write_json,
 )
 
@@ -42,6 +49,7 @@ def parse_args() -> argparse.Namespace:
         description="Precompute cached features for configured modalities over dataset splits."
     )
     parser.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
+    parser.add_argument("--dataset-manifest", type=Path, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -143,6 +151,46 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
+
+
+def resolve_dataset_manifest(config: Mapping[str, Any], cli_manifest: Path | None) -> Path | None:
+    if cli_manifest is not None:
+        return cli_manifest
+    run_config = training_run_section(config)
+    value = run_config.get("dataset_manifest")
+    if value is None:
+        return None
+    return Path(str(value))
+
+
+def rebase_manifest_examples(
+    examples: Sequence[VideoExample],
+    dataset_root: Path,
+) -> list[VideoExample]:
+    video_root = resolve_video_root(dataset_root)
+    rebased: list[VideoExample] = []
+    for example in examples:
+        path = example.path
+        if not path.exists() and example.metadata_filename:
+            path = video_root / example.class_name / example.metadata_filename
+        rebased.append(
+            VideoExample(
+                path=path,
+                label=example.label,
+                class_name=example.class_name,
+                source_id=example.source_id,
+                split=example.split,
+                metadata_filename=example.metadata_filename,
+                identity_id=example.identity_id,
+                generator_id=example.generator_id,
+                source_id_kind=example.source_id_kind,
+                age_bin=example.age_bin,
+                gender=example.gender,
+                ethnicity=example.ethnicity,
+                emotion=example.emotion,
+            )
+        )
+    return rebased
 
 
 def require_device(device_name: str) -> None:
@@ -392,6 +440,7 @@ def main() -> None:
     args = parse_args()
     require_device(args.device)
     config = build_config(args.config, args.device)
+    dataset_manifest = resolve_dataset_manifest(config, args.dataset_manifest)
     modality_frame_overrides = parse_modality_frames(args.modality_frames)
     config = apply_cache_variant_overrides(
         config=config,
@@ -410,13 +459,19 @@ def main() -> None:
     specs = build_feature_cache_specs(config, modalities)
     output_dir = args.output_dir / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
 
-    examples = build_real_fake_examples(
-        real_dir=video_root / "real",
-        fake_dir=video_root / "fake",
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-    )
+    if dataset_manifest is None:
+        examples = build_real_fake_examples(
+            real_dir=video_root / "real",
+            fake_dir=video_root / "fake",
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+        )
+    else:
+        examples = rebase_manifest_examples(
+            load_dataset_manifest(dataset_manifest),
+            dataset_root=dataset_root,
+        )
     selected_splits = tuple(args.splits)
     selected_examples = select_precompute_examples(
         examples=examples,
@@ -429,6 +484,10 @@ def main() -> None:
     )
     print(f"output_dir={output_dir}", flush=True)
     print(f"dataset_root={dataset_root}", flush=True)
+    print(
+        f"dataset_manifest={dataset_manifest if dataset_manifest is not None else '<folder_split>'}",
+        flush=True,
+    )
     print(f"video_root={video_root}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(
@@ -473,6 +532,7 @@ def main() -> None:
         output_dir / "run_config.json",
         {
             "dataset_root": str(dataset_root),
+            "dataset_manifest": None if dataset_manifest is None else str(dataset_manifest),
             "cache_dir": str(cache_dir),
             "config": str(args.config),
             "modalities": list(modalities),

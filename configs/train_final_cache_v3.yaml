@@ -1,0 +1,145 @@
+modalities:
+  - rgb
+  - eye_gaze
+  - face_mesh
+  - depth
+frames:
+  default: 96
+frame_sampling:
+  name: center_stride
+  output_frames: 96
+  source_window_frames: 192
+  stride: 2
+  short_video: repeat_pad
+image_size: 224
+face_crop:
+  enabled: true
+  backend: opencv_haar
+  detection_frequency: 16
+  large_box_coef: 1.5
+  fallback: full_frame
+dim: 512
+seed: 0
+device: cuda
+training:
+  run:
+    dataset_root: final_dataset
+    dataset_manifest: shards/final_v2_ffpp_celebdf_domain_70_15_15/manifest.csv
+    cache_dir: final_cache/v3
+    sharded_cache_dir: shards/final_v3_ffpp_celebdf_domain_70_15_15
+    output_dir: runs/final_cache_v3
+    modalities:
+      - rgb
+      - eye_gaze
+      - face_mesh
+      - depth
+    modality_permutations: none
+    round_ladder: large
+    round_targets: null
+    eval_count_per_split: 500
+    balanced_total: null
+    train_ratio: 0.8
+    val_ratio: 0.1
+    batch_size: 8
+    extract_batch_size: 4
+    progress_every: 25
+    epochs: 60
+    lr: 2.0e-05
+    weight_decay: 0.01
+    modality_lr: null
+    modality_dropout:
+      enabled: true
+      probability: 0.15
+      max_drop: 1
+      modalities:
+        - rgb
+        - eye_gaze
+        - face_mesh
+        - depth
+    depth_dropout: null
+    gate_entropy_weight: null
+    device: cuda
+    checkpoint_metric: val_balanced_accuracy
+    early_stopping_patience: 12
+    early_stopping_min_delta: 0.0
+    occlusion_diagnostics: true
+    occlusion_splits:
+      - val
+      - test
+    seed: 0
+    overwrite_cache: false
+    prefer_cached_selection: true
+    warm_start_rounds: false
+    skip_failures: true
+    video_decode_mode: scan
+    clip_cache_dir: null
+    enable_clip_cache: false
+    no_clip_cache: true
+    sanity_count: 300
+    no_sanity_check: false
+    dry_run: false
+  cached_loader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+  modality_dropout:
+    default_probability: 0.0
+    modality_probabilities: {}
+  gate_entropy_weight: 0.0
+fusion:
+  type: token_transformer
+  num_layers: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.1
+  max_time_steps: 64
+  summary_modalities:
+    - rgb
+    - eye_gaze
+    - face_mesh
+    - depth
+  modality_attention_normalization: true
+  checkpoint_path: null
+head:
+  type: modality_gated_mil
+  hidden_dim: 2048
+  dropout: 0.25
+eye_gaze:
+  model_path: models/face_landmarker_v2_with_blendshapes.task
+  slot_count: 8
+  pooling:
+    layers: 3
+    heads: 8
+    mlp_ratio: 4.0
+    position_weight: 1.5
+    anomaly_top_k: 1
+rgb:
+  frames: 96
+  encoder_frames: 16
+  checkpoint_path: checkpoints/mvit_v2_s-ae3be167.pth
+  slot_count: 12
+  pooling:
+    layers: 3
+    heads: 8
+    mlp_ratio: 4.0
+    position_weight: 1.5
+    anomaly_top_k: 1
+face_mesh:
+  slot_count: 16
+  pooling:
+    layers: 3
+    heads: 8
+    mlp_ratio: 4.0
+    position_weight: 1.5
+    anomaly_top_k: 2
+depth:
+  model_id_or_path: models/depth-anything-v2-small-hf
+  feature_dim: 384
+  slot_count: 8
+  pooling:
+    layers: 3
+    heads: 8
+    mlp_ratio: 4.0
+    position_weight: 1.5
+    anomaly_top_k: 1

@@ -46,6 +46,38 @@ class RGBExtractor(FeatureExtractor):
     def required_keys(self) -> tuple[str, ...]:
         return ("video_rgb_frames",)
 
+    def _encode_clip_batch(self, clip: torch.Tensor) -> torch.Tensor:
+        temporal_size = getattr(self.encoder, "temporal_size", None)
+        if temporal_size is None:
+            temporal_size = getattr(self.encoder, "frames", None)
+        if not isinstance(temporal_size, int) or temporal_size <= 0:
+            return self.encoder(clip)
+
+        frames = int(clip.shape[2])
+        if frames == temporal_size:
+            return self.encoder(clip)
+        if frames < temporal_size:
+            raise ValueError(
+                f"RGB clip has only {frames} frames, but encoder needs {temporal_size}."
+            )
+        remainder = frames % temporal_size
+        if remainder != 0:
+            pad = temporal_size - remainder
+            clip = torch.cat([clip, clip[:, :, -1:].expand(-1, -1, pad, -1, -1)], dim=2)
+            frames = int(clip.shape[2])
+
+        batch_size, channels, _, height, width = clip.shape
+        chunks = frames // temporal_size
+        chunked = (
+            clip.reshape(batch_size, channels, chunks, temporal_size, height, width)
+            .permute(0, 2, 1, 3, 4, 5)
+            .reshape(batch_size * chunks, channels, temporal_size, height, width)
+        )
+        encoded = self.encoder(chunked)
+        if encoded.ndim != 3:
+            return encoded
+        return encoded.reshape(batch_size, chunks * encoded.shape[1], encoded.shape[2])
+
     def extract(self, batch: Mapping[str, Any]) -> dict[str, Any]:
         frames_rgb = batch["video_rgb_frames"]
         if _is_clip_batch(frames_rgb):
@@ -67,7 +99,7 @@ class RGBExtractor(FeatureExtractor):
 
         clip = torch.stack(batch_clips, dim=0)
         clip = clip.to(module_device(self.encoder))
-        rgb_features = self.encoder(clip)
+        rgb_features = self._encode_clip_batch(clip)
         if rgb_features.ndim != 3:
             raise ValueError(
                 "RGB encoder must return temporal clip features shaped [B, T, feature_dim], "

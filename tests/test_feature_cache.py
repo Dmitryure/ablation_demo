@@ -202,6 +202,34 @@ class MinimalFeatureCacheTest(unittest.TestCase):
                 / "men____000001.mp4.pt",
             )
 
+    def test_frame_sampling_variant_separates_feature_cache_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            example = build_example(
+                root / "videos" / "real" / "clip.mp4",
+                "real",
+                "clip.mp4",
+                generator_id="real",
+            )
+            specs = build_feature_cache_specs(
+                {
+                    "frames": {"default": 96},
+                    "frame_sampling": {
+                        "name": "center_stride",
+                        "output_frames": 96,
+                        "source_window_frames": 192,
+                        "stride": 2,
+                        "short_video": "repeat_pad",
+                    },
+                    "rgb": {},
+                },
+                ("rgb",),
+            )
+
+            path = feature_cache_item_path(root / "cache", example, specs["rgb"], root)
+
+            self.assertIn("center192_stride2_frames96_repeatpad", path.parts)
+
     def test_duplicate_real_fake_basenames_do_not_collide(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

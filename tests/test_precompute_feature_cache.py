@@ -127,6 +127,7 @@ class PrecomputeFeatureCacheSelectionTest(unittest.TestCase):
             frame_count = 32
             image_size = 224
             cache_variant = None
+            frame_sampling_variant = None
 
         specs = {modality: Spec() for modality in ("rppg", "depth", "fft")}
 
@@ -139,18 +140,23 @@ class PrecomputeFeatureCacheSelectionTest(unittest.TestCase):
         self.assertEqual(
             grouped,
             [
-                (32, 224, None, ("rppg",)),
-                (32, 224, None, ("depth",)),
-                (32, 224, None, ("fft",)),
+                (32, 224, None, None, ("rppg",)),
+                (32, 224, None, None, ("depth",)),
+                (32, 224, None, None, ("fft",)),
             ],
         )
 
     def test_extraction_groups_separate_cache_variants(self):
         class Spec:
-            def __init__(self, cache_variant: str | None):
+            def __init__(
+                self,
+                cache_variant: str | None,
+                frame_sampling_variant: str | None = None,
+            ):
                 self.frame_count = 32
                 self.image_size = 224
                 self.cache_variant = cache_variant
+                self.frame_sampling_variant = frame_sampling_variant
 
         specs = {
             "rgb": Spec("facecrop_v2_opencv_haar"),
@@ -167,8 +173,42 @@ class PrecomputeFeatureCacheSelectionTest(unittest.TestCase):
         self.assertEqual(
             grouped,
             [
-                (32, 224, "facecrop_v2_opencv_haar", ("rgb", "depth")),
-                (32, 224, None, ("fft",)),
+                (32, 224, "facecrop_v2_opencv_haar", None, ("rgb", "depth")),
+                (32, 224, None, None, ("fft",)),
+            ],
+        )
+
+    def test_extraction_groups_separate_frame_sampling_variants(self):
+        class Spec:
+            def __init__(self, frame_sampling_variant: str | None):
+                self.frame_count = 96
+                self.image_size = 224
+                self.cache_variant = "facecrop_v2_opencv_haar"
+                self.frame_sampling_variant = frame_sampling_variant
+
+        specs = {
+            "rgb": Spec("center192_stride2_frames96_repeatpad"),
+            "depth": Spec("center192_stride2_frames96_repeatpad"),
+            "face_mesh": Spec(None),
+        }
+
+        grouped = extraction_modality_groups(
+            ("rgb", "depth", "face_mesh"),
+            specs,
+            group_by_modality=False,
+        )
+
+        self.assertEqual(
+            grouped,
+            [
+                (
+                    96,
+                    224,
+                    "facecrop_v2_opencv_haar",
+                    "center192_stride2_frames96_repeatpad",
+                    ("rgb", "depth"),
+                ),
+                (96, 224, "facecrop_v2_opencv_haar", None, ("face_mesh",)),
             ],
         )
 
