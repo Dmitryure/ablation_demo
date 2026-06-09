@@ -154,12 +154,17 @@ def describe_module(module: nn.Module) -> str:
     if isinstance(module, TemporalLatentQueryPooling):
         return (
             "TemporalLatentQueryPooling("
-            f"output_tokens={module.pool.output_tokens}, positional_bias=sinusoidal)"
+            f"output_tokens={module.pool.output_tokens}, layers={module.pool.num_layers}, "
+            f"heads={module.pool.num_heads}, position=token_plus_bias)"
         )
     if isinstance(module, TemporalPositionEncoding):
         return f"TemporalPositionEncoding(dim={module.dim}, scale=learned)"
     if isinstance(module, LatentQueryPooling):
-        return f"LatentQueryPooling(output_tokens={module.output_tokens})"
+        return (
+            "LatentQueryPooling("
+            f"output_tokens={module.output_tokens}, layers={module.num_layers}, "
+            f"heads={module.num_heads})"
+        )
     if isinstance(module, nn.Embedding):
         return f"Embedding(num_embeddings={module.num_embeddings}, dim={module.embedding_dim})"
     if isinstance(module, nn.LayerNorm):

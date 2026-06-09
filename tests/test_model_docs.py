@@ -97,7 +97,9 @@ class ModelDocsTest(unittest.TestCase):
         self.assertIn("Project: MLP(8->256->256)", markdown)
         self.assertIn("rppg_signal_features [B, 6]", markdown)
         self.assertIn("signal_slots=1, temporal_slots=23, final_slots=24", markdown)
-        self.assertIn("Point Pool: LatentQueryPooling(output_tokens=1)", markdown)
+        self.assertIn(
+            "Point Pool: LatentQueryPooling(output_tokens=1, layers=2, heads=8)", markdown
+        )
         self.assertIn(
             "Transformer Encoder: TransformerEncoderLayer x4 (heads=8, hidden=1024)", markdown
         )

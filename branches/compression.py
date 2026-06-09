@@ -129,14 +129,35 @@ class TemporalPositionEncoding(nn.Module):
 
 
 class LatentQueryPooling(nn.Module):
-    def __init__(self, dim: int, output_tokens: int) -> None:
+    def __init__(
+        self,
+        dim: int,
+        output_tokens: int,
+        num_layers: int = 2,
+        num_heads: int | None = None,
+        mlp_ratio: float = 4.0,
+    ) -> None:
         super().__init__()
         validate_positive_int(dim, "dim")
         self.dim = dim
         self.output_tokens = validate_positive_int(output_tokens, "output_tokens")
-        self.input_norm = nn.LayerNorm(dim)
+        self.num_layers = validate_positive_int(num_layers, "num_layers")
+        if mlp_ratio <= 0.0:
+            raise ValueError("`mlp_ratio` must be positive.")
+        self.num_heads = resolve_attention_heads(dim, num_heads)
+        self.mlp_ratio = float(mlp_ratio)
         self.output_norm = nn.LayerNorm(dim)
         self.latent_queries = nn.Parameter(torch.empty(self.output_tokens, dim))
+        self.blocks = nn.ModuleList(
+            [
+                LatentQueryPoolingBlock(
+                    dim=dim,
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
         nn.init.normal_(self.latent_queries, mean=0.0, std=0.02)
 
     def forward(
@@ -158,16 +179,92 @@ class LatentQueryPooling(nn.Module):
                 f"[B, {self.output_tokens}, {tokens.shape[1]}], got {tuple(attention_bias.shape)}"
             )
 
-        normalized_tokens = self.input_norm(tokens)
-        queries = self.latent_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)
-        attention_scores = torch.matmul(queries, normalized_tokens.transpose(1, 2)) / math.sqrt(
-            self.dim
-        )
-        if attention_bias is not None:
-            attention_scores = attention_scores + attention_bias
-        attention_weights = attention_scores.softmax(dim=-1)
-        pooled_tokens = torch.matmul(attention_weights, normalized_tokens)
+        pooled_tokens = self.latent_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)
+        for block in self.blocks:
+            pooled_tokens = block(
+                slots=pooled_tokens,
+                tokens=tokens,
+                attention_bias=attention_bias,
+            )
         return self.output_norm(pooled_tokens)
+
+
+def resolve_attention_heads(dim: int, num_heads: int | None) -> int:
+    if num_heads is not None:
+        heads = validate_positive_int(num_heads, "num_heads")
+        if dim % heads != 0:
+            raise ValueError(f"`dim`={dim} must be divisible by `num_heads`={heads}.")
+        return heads
+
+    for candidate in (8, 4, 2, 1):
+        if dim % candidate == 0:
+            return candidate
+    return 1
+
+
+def expand_attention_bias(
+    attention_bias: torch.Tensor | None,
+    num_heads: int,
+) -> torch.Tensor | None:
+    if attention_bias is None:
+        return None
+    return attention_bias.repeat_interleave(num_heads, dim=0)
+
+
+class LatentQueryPoolingBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float) -> None:
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        if hidden_dim <= 0:
+            raise ValueError("`mlp_ratio` produced a non-positive hidden dimension.")
+
+        self.num_heads = validate_positive_int(num_heads, "num_heads")
+        self.slot_cross_norm = nn.LayerNorm(dim)
+        self.input_cross_norm = nn.LayerNorm(dim)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+        )
+        self.slot_self_norm = nn.LayerNorm(dim)
+        self.self_attention = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(
+        self,
+        slots: torch.Tensor,
+        tokens: torch.Tensor,
+        attention_bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        normalized_slots = self.slot_cross_norm(slots)
+        normalized_tokens = self.input_cross_norm(tokens)
+        cross_attention_output, _ = self.cross_attention(
+            query=normalized_slots,
+            key=normalized_tokens,
+            value=normalized_tokens,
+            attn_mask=expand_attention_bias(attention_bias, self.num_heads),
+            need_weights=False,
+        )
+        slots = slots + cross_attention_output
+
+        normalized_slots = self.slot_self_norm(slots)
+        self_attention_output, _ = self.self_attention(
+            query=normalized_slots,
+            key=normalized_slots,
+            value=normalized_slots,
+            need_weights=False,
+        )
+        slots = slots + self_attention_output
+        return slots + self.ffn(self.ffn_norm(slots))
 
 
 class TemporalLatentQueryPooling(nn.Module):
@@ -186,8 +283,9 @@ class TemporalLatentQueryPooling(nn.Module):
             dtype=tokens.dtype,
         )
         queries = self.pool.latent_queries.to(device=tokens.device, dtype=tokens.dtype)
+        position_aware_tokens = tokens + position_tokens.unsqueeze(0)
         attention_bias = torch.matmul(queries, position_tokens.transpose(0, 1)) / math.sqrt(
             self.pool.dim
         )
         attention_bias = attention_bias.unsqueeze(0).expand(tokens.shape[0], -1, -1)
-        return self.pool(tokens, attention_bias=attention_bias)
+        return self.pool(position_aware_tokens, attention_bias=attention_bias)
