@@ -56,12 +56,14 @@ class DepthExtractor(FeatureExtractor):
         encoder: nn.Module,
         processor: Any | None = None,
         model_id_or_path: str = DEFAULT_DEPTH_MODEL_ID,
+        extractor_batch_size: int | None = None,
     ):
         self.encoder = encoder
         self.processor = (
             processor if processor is not None else _load_depth_processor(model_id_or_path)
         )
         self.model_id_or_path = model_id_or_path
+        self.extractor_batch_size = extractor_batch_size
 
     def required_keys(self) -> tuple[str, ...]:
         return ("video_rgb_frames",)
@@ -95,7 +97,16 @@ class DepthExtractor(FeatureExtractor):
             )
 
         pixel_values = pixel_values.to(module_device(self.encoder))
-        flat_features = self.encoder(pixel_values)
+        if self.extractor_batch_size is None:
+            flat_features = self.encoder(pixel_values)
+        else:
+            flat_features = torch.cat(
+                [
+                    self.encoder(chunk)
+                    for chunk in pixel_values.split(self.extractor_batch_size, dim=0)
+                ],
+                dim=0,
+            )
         if flat_features.ndim != 2:
             raise ValueError(
                 "Depth encoder must return pooled frame features shaped [B*T, feature_dim], "

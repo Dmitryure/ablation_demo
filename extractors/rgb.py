@@ -39,9 +39,15 @@ def _is_clip_batch(value: object) -> bool:
 class RGBExtractor(FeatureExtractor):
     name = "rgb"
 
-    def __init__(self, encoder: nn.Module, image_size: int = 224):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        image_size: int = 224,
+        encoder_chunk_batch_size: int | None = None,
+    ):
         self.encoder = encoder
         self.image_size = image_size
+        self.encoder_chunk_batch_size = encoder_chunk_batch_size
 
     def required_keys(self) -> tuple[str, ...]:
         return ("video_rgb_frames",)
@@ -73,7 +79,16 @@ class RGBExtractor(FeatureExtractor):
             .permute(0, 2, 1, 3, 4, 5)
             .reshape(batch_size * chunks, channels, temporal_size, height, width)
         )
-        encoded = self.encoder(chunked)
+        if self.encoder_chunk_batch_size is None:
+            encoded = self.encoder(chunked)
+        else:
+            encoded = torch.cat(
+                [
+                    self.encoder(chunk)
+                    for chunk in chunked.split(self.encoder_chunk_batch_size, dim=0)
+                ],
+                dim=0,
+            )
         if encoded.ndim != 3:
             return encoded
         return encoded.reshape(batch_size, chunks * encoded.shape[1], encoded.shape[2])

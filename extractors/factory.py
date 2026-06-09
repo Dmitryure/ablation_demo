@@ -57,12 +57,17 @@ def _bool_value(value: Any, name: str) -> bool:
 
 
 def _build_rgb_extractor(config: Mapping[str, Any], encoder_result: Any) -> FeatureExtractor:
+    rgb_config = _config_mapping(config, "rgb")
     return RGBExtractor(
         _require_encoder(
             encoder_result.rgb_encoder,
             "RGB encoder was not built for the selected modalities.",
         ),
         image_size=int(config.get("image_size", 224)),
+        encoder_chunk_batch_size=_optional_positive_int(
+            rgb_config.get("encoder_chunk_batch_size"),
+            "rgb.encoder_chunk_batch_size",
+        ),
     )
 
 
@@ -107,6 +112,10 @@ def _build_depth_extractor(config: Mapping[str, Any], encoder_result: Any) -> Fe
             "Depth encoder was not built for the selected modalities.",
         ),
         model_id_or_path=model_id_or_path.strip(),
+        extractor_batch_size=_optional_positive_int(
+            depth_config.get("extractor_batch_size"),
+            "depth.extractor_batch_size",
+        ),
     )
 
 

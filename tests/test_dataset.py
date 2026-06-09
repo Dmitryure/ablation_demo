@@ -30,6 +30,7 @@ from dataset import (
     summarize_split_audit,
     write_dataset_manifest,
 )
+from extractors.depth import DepthExtractor
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
 from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.rgb import RGBExtractor
@@ -421,6 +422,27 @@ class DatasetTest(unittest.TestCase):
 
         self.assertEqual(tuple(output["rgb_features"].shape), (1, 9, 4))
 
+    def test_rgb_extractor_microbatches_long_clip_chunks(self):
+        class ChunkedRGBEncoder(torch.nn.Module):
+            temporal_size = 2
+
+            def __init__(self):
+                super().__init__()
+                self.batch_sizes: list[int] = []
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                self.batch_sizes.append(int(x.shape[0]))
+                return torch.ones(x.shape[0], 1, 4)
+
+        encoder = ChunkedRGBEncoder()
+        extractor = RGBExtractor(encoder, image_size=4, encoder_chunk_batch_size=1)
+        clip = [np.full((4, 4, 3), index, dtype=np.uint8) for index in range(6)]
+
+        output = extractor.extract({"video_rgb_frames": [clip]})
+
+        self.assertEqual(tuple(output["rgb_features"].shape), (1, 3, 4))
+        self.assertEqual(encoder.batch_sizes, [1, 1, 1])
+
     def test_eye_gaze_extractor_supports_batched_clip_sequences(self):
         extractor = EyeGazeExtractor(detect_features_fn=fake_eye_gaze_detector)
         clip = [np.zeros((6, 6, 3), dtype=np.uint8) for _ in range(4)]
@@ -428,6 +450,34 @@ class DatasetTest(unittest.TestCase):
         output = extractor.extract({"video_rgb_frames": [clip, clip]})
 
         self.assertEqual(tuple(output["eye_gaze"].shape), (2, 4, 8))
+
+    def test_depth_extractor_microbatches_frames(self):
+        class FakeDepthProcessor:
+            def __call__(self, images, return_tensors, keep_aspect_ratio):
+                del return_tensors, keep_aspect_ratio
+                return {"pixel_values": torch.zeros(len(images), 3, 4, 4)}
+
+        class FakeDepthEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.batch_sizes: list[int] = []
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                self.batch_sizes.append(int(x.shape[0]))
+                return torch.ones(x.shape[0], 5)
+
+        encoder = FakeDepthEncoder()
+        extractor = DepthExtractor(
+            encoder,
+            processor=FakeDepthProcessor(),
+            extractor_batch_size=3,
+        )
+        clip = [np.zeros((6, 6, 3), dtype=np.uint8) for _ in range(8)]
+
+        output = extractor.extract({"video_rgb_frames": [clip]})
+
+        self.assertEqual(tuple(output["depth_features"].shape), (1, 8, 5))
+        self.assertEqual(encoder.batch_sizes, [3, 3, 2])
 
     def test_face_mesh_extractor_supports_batched_clip_sequences(self):
         extractor = FaceMeshExtractor(detect_landmarks_fn=fake_face_mesh_detector)
