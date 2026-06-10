@@ -23,7 +23,7 @@ seed: 0
 device: cuda
 training:
   run:
-    dataset_root: final_dataset
+    dataset_root: /home/ubuntu/mnt/tank/scratch/dstoronkin/dutkin_faigc/final_dataset
     dataset_manifest: shards/final_v2_ffpp_celebdf_domain_70_15_15/manifest.csv
     cache_dir: final_cache/v3
     sharded_cache_dir: shards/final_v3_ffpp_celebdf_domain_70_15_15
