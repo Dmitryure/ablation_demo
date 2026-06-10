@@ -210,6 +210,38 @@ class PipelineTest(unittest.TestCase):
         self.assertIs(features["rgb_features"], batch["rgb_features"])
         self.assertEqual(pipeline.last_feature_timings, {"rgb": 0.0})
 
+    def test_prepare_features_uses_shared_extractor_once_for_multiple_modalities(self):
+        pipeline = build_test_pipeline(enabled_modalities=("eye_gaze", "face_mesh"))
+
+        class SharedFaceExtractor:
+            def __init__(self):
+                self.calls = 0
+
+            def extract(self, batch):
+                self.calls += 1
+                frames = batch["video_rgb_frames"]
+                return {
+                    "eye_gaze": torch.ones(1, len(frames), 8),
+                    "face_mesh": torch.ones(1, len(frames), len(FACE_MESH_CONTOUR_INDICES), 3),
+                }
+
+            def close(self):
+                pass
+
+        shared_extractor = SharedFaceExtractor()
+        pipeline.extractors["eye_gaze"] = shared_extractor
+        pipeline.extractors["face_mesh"] = shared_extractor
+
+        features = pipeline.prepare_features(build_raw_batch(num_frames=4))
+
+        self.assertEqual(shared_extractor.calls, 1)
+        self.assertEqual(tuple(features["eye_gaze"].shape), (1, 4, 8))
+        self.assertEqual(
+            tuple(features["face_mesh"].shape),
+            (1, 4, len(FACE_MESH_CONTOUR_INDICES), 3),
+        )
+        self.assertEqual(set(pipeline.last_feature_timings), {"eye_gaze", "face_mesh"})
+
     def test_prepare_features_uses_modality_specific_raw_batches(self):
         pipeline = build_test_pipeline(enabled_modalities=("rgb", "rppg"))
         batch = {

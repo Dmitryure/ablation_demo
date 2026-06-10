@@ -7,6 +7,10 @@ from extractors.eye_gaze import (
     EyeGazeExtractor,
     build_eye_gaze_extractor,
 )
+from extractors.face_landmarker_combined import (
+    FaceLandmarkerCombinedExtractor,
+    build_face_landmarker_combined_extractor,
+)
 from extractors.face_mesh import (
     FACE_MESH_CONTOUR_INDICES,
     FaceMeshExtractor,
@@ -33,6 +37,7 @@ __all__ = [
     "EyeGazeExtractor",
     "FAUExtractor",
     "FFTExtractor",
+    "FaceLandmarkerCombinedExtractor",
     "FaceMeshExtractor",
     "FeatureExtractor",
     "RGBExtractor",
@@ -41,5 +46,6 @@ __all__ = [
     "build_extractors",
     "build_extractors_from_encoders",
     "build_eye_gaze_extractor",
+    "build_face_landmarker_combined_extractor",
     "build_face_mesh_extractor",
 ]

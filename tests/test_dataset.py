@@ -4,6 +4,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import cv2
@@ -32,6 +33,7 @@ from dataset import (
 )
 from extractors.depth import DepthExtractor
 from extractors.eye_gaze import EYE_GAZE_COLUMNS, EyeGazeExtractor
+from extractors.face_landmarker_combined import FaceLandmarkerCombinedExtractor
 from extractors.face_mesh import FACE_MESH_CONTOUR_INDICES, FaceMeshExtractor
 from extractors.rgb import RGBExtractor
 from frame_sampling import resolve_frame_sampling_config, sample_frame_indices
@@ -47,6 +49,20 @@ def fake_face_mesh_detector(_: np.ndarray) -> np.ndarray:
     for index in range(points.shape[0]):
         points[index] = (index / 100.0, index / 200.0, -index / 300.0)
     return points
+
+
+def fake_face_landmarker_result() -> SimpleNamespace:
+    landmarks = [
+        SimpleNamespace(x=index / 1000.0, y=index / 2000.0, z=-index / 3000.0)
+        for index in range(478)
+    ]
+    blendshapes = [
+        [
+            SimpleNamespace(category_name=name, score=index / 10.0)
+            for index, name in enumerate(EYE_GAZE_COLUMNS, start=1)
+        ]
+    ]
+    return SimpleNamespace(face_blendshapes=blendshapes, face_landmarks=[landmarks])
 
 
 class FakeHaarDetector:
@@ -453,8 +469,12 @@ class DatasetTest(unittest.TestCase):
 
     def test_depth_extractor_microbatches_frames(self):
         class FakeDepthProcessor:
+            def __init__(self):
+                self.batch_sizes: list[int] = []
+
             def __call__(self, images, return_tensors, keep_aspect_ratio):
                 del return_tensors, keep_aspect_ratio
+                self.batch_sizes.append(len(images))
                 return {"pixel_values": torch.zeros(len(images), 3, 4, 4)}
 
         class FakeDepthEncoder(torch.nn.Module):
@@ -467,9 +487,10 @@ class DatasetTest(unittest.TestCase):
                 return torch.ones(x.shape[0], 5)
 
         encoder = FakeDepthEncoder()
+        processor = FakeDepthProcessor()
         extractor = DepthExtractor(
             encoder,
-            processor=FakeDepthProcessor(),
+            processor=processor,
             extractor_batch_size=3,
         )
         clip = [np.zeros((6, 6, 3), dtype=np.uint8) for _ in range(8)]
@@ -477,6 +498,7 @@ class DatasetTest(unittest.TestCase):
         output = extractor.extract({"video_rgb_frames": [clip]})
 
         self.assertEqual(tuple(output["depth_features"].shape), (1, 8, 5))
+        self.assertEqual(processor.batch_sizes, [3, 3, 2])
         self.assertEqual(encoder.batch_sizes, [3, 3, 2])
 
     def test_face_mesh_extractor_supports_batched_clip_sequences(self):
@@ -489,6 +511,27 @@ class DatasetTest(unittest.TestCase):
             tuple(output["face_mesh"].shape),
             (2, 4, len(FACE_MESH_CONTOUR_INDICES), 3),
         )
+
+    def test_combined_face_landmarker_extracts_gaze_and_mesh_once_per_frame(self):
+        calls = 0
+
+        def detect_result_fn(_frame: np.ndarray) -> SimpleNamespace:
+            nonlocal calls
+            calls += 1
+            return fake_face_landmarker_result()
+
+        extractor = FaceLandmarkerCombinedExtractor(detect_result_fn=detect_result_fn)
+        clip = [np.zeros((6, 6, 3), dtype=np.uint8) for _ in range(4)]
+
+        output = extractor.extract({"video_rgb_frames": [clip, clip]})
+
+        self.assertEqual(tuple(output["eye_gaze"].shape), (2, 4, 8))
+        self.assertEqual(
+            tuple(output["face_mesh"].shape),
+            (2, 4, len(FACE_MESH_CONTOUR_INDICES), 3),
+        )
+        self.assertEqual(calls, 8)
+        self.assertAlmostEqual(float(output["eye_gaze"][0, 0, 0]), 0.1, places=6)
 
     def test_dataset_can_use_stubbed_video_loader(self):
         dataset = LabeledVideoDataset(

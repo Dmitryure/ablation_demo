@@ -223,6 +223,9 @@ class ClipFusionPipeline(nn.Module):
     def _has_precomputed_features(self, batch: Mapping[str, Any], modality_name: str) -> bool:
         return all(key in batch for key in self.registry[modality_name].required_keys())
 
+    def _has_prepared_features(self, feature_batch: Mapping[str, Any], modality_name: str) -> bool:
+        return all(key in feature_batch for key in self.registry[modality_name].required_keys())
+
     def _copy_feature_keys(
         self,
         batch: Mapping[str, Any],
@@ -268,6 +271,9 @@ class ClipFusionPipeline(nn.Module):
         feature_batch: dict[str, Any] = {}
         feature_timings: dict[str, float] = {}
         for name in enabled_modalities or self.enabled_modalities:
+            if self._has_prepared_features(feature_batch, name):
+                feature_timings[name] = 0.0
+                continue
             if self._has_precomputed_features(batch, name):
                 self._copy_feature_keys(batch, feature_batch, name)
                 feature_timings[name] = 0.0
@@ -300,7 +306,12 @@ class ClipFusionPipeline(nn.Module):
         return self.fuse(batch)
 
     def close(self) -> None:
+        closed: set[int] = set()
         for extractor in self.extractors.values():
+            extractor_id = id(extractor)
+            if extractor_id in closed:
+                continue
+            closed.add(extractor_id)
             extractor.close()
 
 

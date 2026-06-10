@@ -48,6 +48,17 @@ def _normalize_clips(frames_rgb: object) -> Sequence[Sequence[np.ndarray]]:
     )
 
 
+def _frame_chunks(
+    frames_rgb: Sequence[np.ndarray],
+    chunk_size: int | None,
+) -> Sequence[Sequence[np.ndarray]]:
+    if chunk_size is None:
+        return (frames_rgb,)
+    return tuple(
+        frames_rgb[start : start + chunk_size] for start in range(0, len(frames_rgb), chunk_size)
+    )
+
+
 class DepthExtractor(FeatureExtractor):
     name = "depth"
 
@@ -84,29 +95,13 @@ class DepthExtractor(FeatureExtractor):
                 "All clips in `video_rgb_frames` batch must have the same frame count."
             )
 
-        processed = self.processor(
-            images=flat_frames,
-            return_tensors="pt",
-            keep_aspect_ratio=False,
+        flat_features = torch.cat(
+            [
+                self._extract_frame_chunk(chunk)
+                for chunk in _frame_chunks(flat_frames, self.extractor_batch_size)
+            ],
+            dim=0,
         )
-        pixel_values = processed["pixel_values"]
-        if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 4:
-            raise ValueError(
-                "Depth image processor must return `pixel_values` shaped [B*T, 3, H, W], "
-                f"got {tuple(pixel_values.shape) if isinstance(pixel_values, torch.Tensor) else type(pixel_values)}"
-            )
-
-        pixel_values = pixel_values.to(module_device(self.encoder))
-        if self.extractor_batch_size is None:
-            flat_features = self.encoder(pixel_values)
-        else:
-            flat_features = torch.cat(
-                [
-                    self.encoder(chunk)
-                    for chunk in pixel_values.split(self.extractor_batch_size, dim=0)
-                ],
-                dim=0,
-            )
         if flat_features.ndim != 2:
             raise ValueError(
                 "Depth encoder must return pooled frame features shaped [B*T, feature_dim], "
@@ -117,3 +112,17 @@ class DepthExtractor(FeatureExtractor):
         frames = clip_lengths[0]
         depth_features = flat_features.reshape(batch_size, frames, -1)
         return {"depth_features": depth_features}
+
+    def _extract_frame_chunk(self, frames_rgb: Sequence[np.ndarray]) -> torch.Tensor:
+        processed = self.processor(
+            images=frames_rgb,
+            return_tensors="pt",
+            keep_aspect_ratio=False,
+        )
+        pixel_values = processed["pixel_values"]
+        if not isinstance(pixel_values, torch.Tensor) or pixel_values.ndim != 4:
+            raise ValueError(
+                "Depth image processor must return `pixel_values` shaped [B*T, 3, H, W], "
+                f"got {tuple(pixel_values.shape) if isinstance(pixel_values, torch.Tensor) else type(pixel_values)}"
+            )
+        return self.encoder(pixel_values.to(module_device(self.encoder)))

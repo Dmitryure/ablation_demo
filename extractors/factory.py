@@ -9,6 +9,7 @@ from encoders.depth import DEFAULT_DEPTH_MODEL_ID
 from extractors.base import FeatureExtractor
 from extractors.depth import DepthExtractor
 from extractors.eye_gaze import build_eye_gaze_extractor
+from extractors.face_landmarker_combined import build_face_landmarker_combined_extractor
 from extractors.face_mesh import build_face_mesh_extractor
 from extractors.fau import FAUExtractor
 from extractors.fft import FFTExtractor
@@ -160,7 +161,14 @@ def _build_extractors_from_encoder_result(
     encoder_result,
 ) -> dict[str, FeatureExtractor]:
     extractors: dict[str, FeatureExtractor] = {}
+    enabled_set = set(enabled)
+    if {"eye_gaze", "face_mesh"}.issubset(enabled_set):
+        combined_extractor = build_face_landmarker_combined_extractor(config)
+        extractors["eye_gaze"] = combined_extractor
+        extractors["face_mesh"] = combined_extractor
     for modality in enabled:
+        if modality in extractors:
+            continue
         builder = _EXTRACTOR_BUILDERS.get(modality)
         if builder is not None:
             extractors[modality] = builder(config, encoder_result)

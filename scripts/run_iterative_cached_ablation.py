@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+import cv2
 import torch
 from torch.utils.data import DataLoader, Sampler
 from tqdm import tqdm
@@ -298,9 +299,7 @@ def parse_args() -> argparse.Namespace:
         "--train-balance-mode",
         choices=TRAIN_BALANCE_MODES,
         default=None,
-        help=(
-            "Training-only balancing mode. Keeps validation/test selection unchanged."
-        ),
+        help=("Training-only balancing mode. Keeps validation/test selection unchanged."),
     )
     parser.add_argument(
         "--fake-generator-cap-multiplier",
@@ -519,9 +518,7 @@ def _coerce_fake_generator_loss_weights(value: Any) -> dict[str, float] | list[s
         return parsed
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [str(item) for item in value]
-    raise ValueError(
-        "`training.run.fake_generator_loss_weights` must be a mapping, list, or null."
-    )
+    raise ValueError("`training.run.fake_generator_loss_weights` must be a mapping, list, or null.")
 
 
 def coerce_training_run_value(field_name: str, value: Any) -> Any:
@@ -1478,14 +1475,10 @@ def parse_fake_generator_loss_weights(
         generator_id, raw_weight = value.split("=", 1)
         generator_id = generator_id.strip()
         if not generator_id:
-            raise ValueError(
-                f"`--fake-generator-loss-weights` has empty generator in {value!r}."
-            )
+            raise ValueError(f"`--fake-generator-loss-weights` has empty generator in {value!r}.")
         weight = float(raw_weight)
         if weight <= 0.0:
-            raise ValueError(
-                f"`--fake-generator-loss-weights` must be positive, got {value!r}."
-            )
+            raise ValueError(f"`--fake-generator-loss-weights` must be positive, got {value!r}.")
         parsed[generator_id] = weight
     return parsed
 
@@ -3016,6 +3009,46 @@ def append_cache_failure(
     progress[spec.modality]["failed"] += 1
 
 
+def video_container_opens(path: Path) -> bool:
+    capture = cv2.VideoCapture(str(path))
+    try:
+        return bool(capture.isOpened())
+    finally:
+        capture.release()
+
+
+def skip_unopenable_cache_examples(
+    examples: Sequence[VideoExample],
+    modalities: Sequence[str],
+    specs: Mapping[str, FeatureCacheSpec],
+    missing_by_modality: Mapping[str, list[VideoExample]],
+    progress: dict[str, Any],
+    failure_rows: list[dict[str, Any]],
+) -> list[VideoExample]:
+    missing_sets = {modality: set(missing_by_modality.get(modality, ())) for modality in modalities}
+    openable_examples: list[VideoExample] = []
+    for example in examples:
+        missing_modalities = [
+            modality for modality in modalities if example in missing_sets[modality]
+        ]
+        if not missing_modalities:
+            openable_examples.append(example)
+            continue
+        if video_container_opens(example.path):
+            openable_examples.append(example)
+            continue
+        error = RuntimeError(f"Could not open video before extraction: {example.path}")
+        for modality in missing_modalities:
+            append_cache_failure(
+                failure_rows=failure_rows,
+                progress=progress,
+                spec=specs[modality],
+                example=example,
+                exc=error,
+            )
+    return openable_examples
+
+
 def write_cached_feature_items(
     cache_dir: Path,
     specs: Mapping[str, FeatureCacheSpec],
@@ -3474,15 +3507,25 @@ def cache_missing_feature_groups(
         active_modalities = [
             modality for modality in modalities if missing_by_modality.get(modality)
         ]
+        cacheable_examples = skip_unopenable_cache_examples(
+            examples=examples,
+            modalities=active_modalities,
+            specs=specs,
+            missing_by_modality=missing_by_modality,
+            progress=progress,
+            failure_rows=failure_rows,
+        )
         for (
             frame_count,
             image_size,
             _cache_variant,
             _frame_sampling_variant,
             group_modalities,
-        ) in extraction_modality_groups(active_modalities, specs, group_by_modality=group_by_modality):
+        ) in extraction_modality_groups(
+            active_modalities, specs, group_by_modality=group_by_modality
+        ):
             group_examples = examples_missing_any_modality(
-                examples=examples,
+                examples=cacheable_examples,
                 modalities=group_modalities,
                 missing_by_modality=missing_by_modality,
             )
