@@ -14,6 +14,7 @@ from torch.utils.data import Dataset, Sampler
 from dataset import VideoExample
 from face_crop_config import modality_cache_variant
 from frame_config import resolve_modality_frame_count
+from frame_sampling import frame_sampling_cache_variant
 
 FEATURE_CACHE_VERSION = 3
 SHARDED_CACHE_SCHEMA_VERSION = 2
@@ -52,6 +53,7 @@ class FeatureCacheSpec:
     image_size: int
     extractor_config: dict[str, Any]
     cache_variant: str | None = None
+    frame_sampling_variant: str | None = None
 
 
 def _jsonable(value: Any) -> Any:
@@ -106,6 +108,10 @@ def build_feature_cache_spec(
         image_size=_resolve_modality_image_size(config, modality),
         extractor_config=_modality_extractor_config(config, modality),
         cache_variant=modality_cache_variant(config, modality),
+        frame_sampling_variant=frame_sampling_cache_variant(
+            config,
+            config.get(modality, {}) if isinstance(config.get(modality, {}), Mapping) else {},
+        ),
     )
 
 
@@ -130,6 +136,8 @@ def build_feature_cache_specs(
 
 def feature_cache_spec_id(spec: FeatureCacheSpec) -> str:
     parts = [spec.modality, f"frames_{spec.frame_count}"]
+    if spec.frame_sampling_variant is not None:
+        parts.append(spec.frame_sampling_variant)
     if spec.cache_variant is not None:
         parts.append(f"size_{spec.image_size}")
         parts.append(spec.cache_variant)
@@ -172,14 +180,12 @@ def metadata_filename_for_example(
 
 
 def feature_cache_spec_dir(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
+    root = Path(cache_dir) / spec.modality
+    if spec.frame_sampling_variant is not None:
+        root = root / spec.frame_sampling_variant
     if spec.cache_variant is None:
-        return Path(cache_dir) / spec.modality / f"frames_{spec.frame_count}"
-    return (
-        Path(cache_dir)
-        / spec.modality
-        / spec.cache_variant
-        / f"frames_{spec.frame_count}_size_{spec.image_size}"
-    )
+        return root / f"frames_{spec.frame_count}"
+    return root / spec.cache_variant / f"frames_{spec.frame_count}_size_{spec.image_size}"
 
 
 def feature_cache_manifest_path(cache_dir: str | Path, spec: FeatureCacheSpec) -> Path:
