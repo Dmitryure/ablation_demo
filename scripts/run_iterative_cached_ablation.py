@@ -27,6 +27,7 @@ from dataset import (
     build_real_fake_examples,
     collate_labeled_video_batch,
     format_split_audit,
+    load_dataset_manifest,
     summarize_examples,
     summarize_split_audit,
     write_dataset_manifest,
@@ -298,9 +299,7 @@ def parse_args() -> argparse.Namespace:
         "--train-balance-mode",
         choices=TRAIN_BALANCE_MODES,
         default=None,
-        help=(
-            "Training-only balancing mode. Keeps validation/test selection unchanged."
-        ),
+        help=("Training-only balancing mode. Keeps validation/test selection unchanged."),
     )
     parser.add_argument(
         "--fake-generator-cap-multiplier",
@@ -519,9 +518,7 @@ def _coerce_fake_generator_loss_weights(value: Any) -> dict[str, float] | list[s
         return parsed
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         return [str(item) for item in value]
-    raise ValueError(
-        "`training.run.fake_generator_loss_weights` must be a mapping, list, or null."
-    )
+    raise ValueError("`training.run.fake_generator_loss_weights` must be a mapping, list, or null.")
 
 
 def coerce_training_run_value(field_name: str, value: Any) -> Any:
@@ -1478,14 +1475,10 @@ def parse_fake_generator_loss_weights(
         generator_id, raw_weight = value.split("=", 1)
         generator_id = generator_id.strip()
         if not generator_id:
-            raise ValueError(
-                f"`--fake-generator-loss-weights` has empty generator in {value!r}."
-            )
+            raise ValueError(f"`--fake-generator-loss-weights` has empty generator in {value!r}.")
         weight = float(raw_weight)
         if weight <= 0.0:
-            raise ValueError(
-                f"`--fake-generator-loss-weights` must be positive, got {value!r}."
-            )
+            raise ValueError(f"`--fake-generator-loss-weights` must be positive, got {value!r}.")
         parsed[generator_id] = weight
     return parsed
 
@@ -4477,6 +4470,30 @@ def modality_set_name(modalities: Sequence[str]) -> str:
     return "plus".join(modalities)
 
 
+def load_training_examples_from_config(
+    config: Mapping[str, Any],
+    dataset_root: Path,
+    train_ratio: float,
+    val_ratio: float,
+    seed: int,
+) -> list[VideoExample]:
+    run_config = training_run_section(config)
+    dataset_manifest = run_config.get("dataset_manifest")
+    if dataset_manifest is not None:
+        manifest_path = Path(str(dataset_manifest))
+        print(f"dataset selection: manifest={manifest_path}", flush=True)
+        return load_dataset_manifest(manifest_path)
+
+    video_root = resolve_video_root(dataset_root)
+    return build_real_fake_examples(
+        real_dir=video_root / "real",
+        fake_dir=video_root / "fake",
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+    )
+
+
 def main() -> None:
     args = parse_args()
     config = load_pipeline_yaml(args.config)
@@ -4485,7 +4502,6 @@ def main() -> None:
         config["device"] = args.device
     torch.manual_seed(args.seed)
     dataset_root = args.dataset_root
-    video_root = resolve_video_root(dataset_root)
     cache_dir = args.cache_dir or (dataset_root / "feature_cache")
     clip_cache_dir = None
     if args.clip_cache_dir is not None:
@@ -4504,9 +4520,9 @@ def main() -> None:
     )
 
     print("dataset selection: loading examples", flush=True)
-    examples = build_real_fake_examples(
-        real_dir=video_root / "real",
-        fake_dir=video_root / "fake",
+    examples = load_training_examples_from_config(
+        config=config,
+        dataset_root=dataset_root,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         seed=args.seed,
