@@ -4616,7 +4616,11 @@ def main() -> None:
 
     print(f"output_dir={output_dir}", flush=True)
     print(f"dataset_root={dataset_root}", flush=True)
-    print(f"video_root={video_root}", flush=True)
+    dataset_manifest = training_run_section(config).get("dataset_manifest")
+    if dataset_manifest is not None:
+        print(f"dataset_manifest={dataset_manifest}", flush=True)
+    else:
+        print(f"video_root={resolve_video_root(dataset_root)}", flush=True)
     print(f"cache_dir={cache_dir}", flush=True)
     print(
         f"sharded_cache_dir={args.sharded_cache_dir if args.sharded_cache_dir is not None else '<disabled>'}",

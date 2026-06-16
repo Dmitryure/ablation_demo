@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -544,6 +545,24 @@ class RegistryTest(unittest.TestCase):
             resolve_modality_frame_counts(config, ("rgb", "rppg")),
             {"rgb": 8, "rppg": 32},
         )
+
+    def test_rgb_encoder_frames_override_does_not_change_cache_frame_count(self):
+        config = {
+            "modalities": ["rgb"],
+            "frames": {"default": 96},
+            "image_size": 224,
+            "rgb": {
+                "frames": 96,
+                "encoder_frames": 16,
+                "checkpoint_path": "checkpoints/mvit_v2_s-ae3be167.pth",
+            },
+        }
+
+        with patch("encoders.factory.RGBEncoder") as rgb_encoder:
+            build_local_encoders(config, modalities=("rgb",))
+
+        self.assertEqual(resolve_modality_frame_count(config, "rgb"), 96)
+        self.assertEqual(rgb_encoder.call_args.kwargs["frames"], 16)
 
     def test_validate_branch_token_config_rejects_fusion_time_step_mismatch(self):
         config = {

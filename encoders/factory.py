@@ -37,6 +37,15 @@ def _require_int(config: Mapping[str, Any], key: str) -> int:
     return value
 
 
+def _optional_positive_int(config: Mapping[str, Any], key: str) -> int | None:
+    value = config.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"`{key}` must be a positive integer.")
+    return value
+
+
 def _require_str(config: Mapping[str, Any], key: str) -> str:
     value = config.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -92,8 +101,9 @@ def build_local_encoders(
     if "rgb" in enabled:
         if rgb_checkpoint_path is None:
             raise ValueError("RGB checkpoint_path is required when `rgb` modality is enabled.")
+        rgb_encoder_frames = _optional_positive_int(rgb_config, "encoder_frames")
         rgb_encoder = RGBEncoder(
-            frames=resolve_modality_frame_count(config, "rgb"),
+            frames=rgb_encoder_frames or resolve_modality_frame_count(config, "rgb"),
             image_size=_require_int(config, "image_size"),
             checkpoint_path=rgb_checkpoint_path,
         )
